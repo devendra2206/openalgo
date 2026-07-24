@@ -246,7 +246,16 @@ def get_option_chain(
     try:
         # Step 1: Parse underlying symbol
         base_symbol, embedded_expiry = parse_underlying_symbol(underlying)
-        final_expiry = embedded_expiry or expiry_date
+        # expiry_date is a required, caller-supplied param (restx_api/option_chain.py
+        # does data["expiry_date"], no default) -- it must win over embedded_expiry.
+        # Needed for MCX: the options expiry can differ from the futures expiry
+        # (e.g. CRUDEOIL options settle 17-AUG, the future settles 19-AUG), and
+        # `underlying` there is the FUTURES symbol (used only to get a quotable
+        # LTP anchor, see get_option_exchange/quote_symbol below) -- its embedded
+        # expiry must not silently override the options expiry the caller asked
+        # for. Harmless for NFO/BFO, where the embedded and explicit expiry are
+        # normally the same value anyway.
+        final_expiry = expiry_date or embedded_expiry
 
         if not final_expiry:
             return False, {"status": "error", "message": "Expiry date is required."}, 400
@@ -282,8 +291,20 @@ def get_option_chain(
             quote_symbol = _perp[0]["symbol"]
 
         if exchange.upper() not in CRYPTO_EXCHANGES:
-            # Use base symbol for index quotes (non-Delta)
-            quote_symbol = base_symbol if embedded_expiry else underlying
+            if exchange.upper() == "MCX" and embedded_expiry:
+                # MCX commodities (CRUDEOIL, GOLD, ...) have no bare quotable
+                # spot/index the way NIFTY/SENSEX do -- the FUTURES contract
+                # itself is the only quotable proxy for spot. Reducing to the
+                # bare base_symbol here (as done below for NFO/BFO, where the
+                # bare name IS a real quotable index/stock) would try to
+                # quote a non-existent plain symbol (e.g. "CRUDEOIL" alone)
+                # and fail with "Symbol not found" regardless of what the
+                # caller passed in. Keep the caller's exact futures symbol
+                # (e.g. "CRUDEOIL19AUG26FUT") instead.
+                quote_symbol = underlying
+            else:
+                # Use base symbol for index quotes (non-Delta)
+                quote_symbol = base_symbol if embedded_expiry else underlying
 
         # Step 3: Fetch underlying LTP
         logger.info(f"Fetching LTP for {quote_symbol} on {quote_exchange}")

@@ -1,11 +1,16 @@
 import type {
   EnvironmentVariables,
+  ExecutionsResponse,
+  LegAction,
+  LegErrorsResponse,
   LogContent,
   LogFile,
   MasterContractStatus,
+  PnlSnapshot,
   PythonStrategy,
   PythonStrategyContent,
   ScheduleConfig,
+  TradesResponse,
 } from '@/types/python-strategy'
 import type { ApiResponse } from '@/types/trading'
 import { webClient } from './client'
@@ -192,6 +197,78 @@ export const pythonStrategyApi = {
     variables: EnvironmentVariables
   ): Promise<ApiResponse<void>> => {
     const response = await webClient.post<ApiResponse<void>>(`/python/env/${strategyId}`, variables)
+    return response.data
+  },
+
+  /**
+   * Get the last-pushed PnL snapshot for a strategy
+   */
+  getPnl: async (strategyId: string): Promise<PnlSnapshot> => {
+    const response = await webClient.get<PnlSnapshot>(`/python/api/strategy/${strategyId}/pnl`)
+    return response.data
+  },
+
+  /**
+   * Get today's closed trades for a strategy
+   */
+  getTrades: async (strategyId: string, executionId?: string): Promise<TradesResponse> => {
+    const response = await webClient.get<TradesResponse>(
+      `/python/api/strategy/${strategyId}/trades`,
+      { params: executionId ? { execution_id: executionId } : undefined }
+    )
+    return response.data
+  },
+
+  /**
+   * List execution runs for a strategy (for the Trades page's dropdown)
+   */
+  getExecutions: async (strategyId: string): Promise<ExecutionsResponse> => {
+    const response = await webClient.get<ExecutionsResponse>(
+      `/python/api/strategy/${strategyId}/executions`
+    )
+    return response.data
+  },
+
+  /**
+   * Get legs currently in error mode for a strategy (Retry/Cancel/Manually
+   * Completed page). See docs/prd/python-strategies-order-error-recovery.md.
+   */
+  getErrors: async (strategyId: string): Promise<LegErrorsResponse> => {
+    const response = await webClient.get<LegErrorsResponse>(
+      `/python/api/strategy/${strategyId}/errors`
+    )
+    return response.data
+  },
+
+  /**
+   * Resolve a leg's error mode: Retry, Cancel, or Mark as Manually Completed
+   * (fill_price required for "manual"). Returns immediately -- the strategy
+   * picks this up on its own next cycle; watch for the error_update SSE
+   * event (or re-poll getErrors) to see it actually resolved.
+   */
+  postLegAction: async (
+    strategyId: string,
+    legKey: string,
+    action: LegAction,
+    fillPrice?: number
+  ): Promise<ApiResponse<void>> => {
+    const response = await webClient.post<ApiResponse<void>>(
+      `/python/api/strategy/${strategyId}/action`,
+      { leg_key: legKey, action, fill_price: fillPrice }
+    )
+    return response.data
+  },
+
+  /**
+   * Force-close every open position for a running strategy (short legs
+   * before long legs where both exist), then stop it. Returns immediately --
+   * the strategy picks this up on its own next cycle; watch for the
+   * status_update SSE event (or re-poll getStrategies) to see it stopped.
+   */
+  forceExitStrategy: async (strategyId: string): Promise<ApiResponse<void>> => {
+    const response = await webClient.post<ApiResponse<void>>(
+      `/python/api/strategy/${strategyId}/force_exit`
+    )
     return response.data
   },
 

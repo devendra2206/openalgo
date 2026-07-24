@@ -84,6 +84,9 @@ const PythonStrategyIndex = lazy(() => import('@/pages/python-strategy/PythonStr
 const NewPythonStrategy = lazy(() => import('@/pages/python-strategy/NewPythonStrategy'))
 const EditPythonStrategy = lazy(() => import('@/pages/python-strategy/EditPythonStrategy'))
 const PythonStrategyLogs = lazy(() => import('@/pages/python-strategy/PythonStrategyLogs'))
+const PythonStrategyPnl = lazy(() => import('@/pages/python-strategy/PythonStrategyPnl'))
+const PythonStrategyTrades = lazy(() => import('@/pages/python-strategy/PythonStrategyTrades'))
+const PythonStrategyErrors = lazy(() => import('@/pages/python-strategy/PythonStrategyErrors'))
 const SchedulePythonStrategy = lazy(() => import('@/pages/python-strategy/SchedulePythonStrategy'))
 const PythonStrategyGuide = lazy(() => import('@/pages/python-strategy/PythonStrategyGuide'))
 
@@ -236,6 +239,9 @@ function App() {
                 <Route path="/python/new" element={<NewPythonStrategy />} />
                 <Route path="/python/:strategyId/edit" element={<EditPythonStrategy />} />
                 <Route path="/python/:strategyId/logs" element={<PythonStrategyLogs />} />
+                <Route path="/python/:strategyId/pnl" element={<PythonStrategyPnl />} />
+                <Route path="/python/:strategyId/trades" element={<PythonStrategyTrades />} />
+                <Route path="/python/:strategyId/errors" element={<PythonStrategyErrors />} />
                 <Route path="/python/:strategyId/schedule" element={<SchedulePythonStrategy />} />
                 <Route path="/python/guide" element={<PythonStrategyGuide />} />
                 {/* Phase 6: Chartink Strategies */}

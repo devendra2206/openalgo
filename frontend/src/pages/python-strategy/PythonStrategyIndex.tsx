@@ -7,12 +7,15 @@ import {
   FileText,
   HelpCircle,
   MoreVertical,
+  OctagonX,
   Pencil,
   Play,
   Plus,
+  Receipt,
   RefreshCw,
   Square,
   Trash2,
+  Wallet,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
@@ -38,18 +41,22 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import type { MasterContractStatus, PythonStrategy } from '@/types/python-strategy'
+import type { MasterContractStatus, PnlSnapshot, PythonStrategy } from '@/types/python-strategy'
 import { SCHEDULE_DAYS, STATUS_COLORS, STATUS_LABELS } from '@/types/python-strategy'
 import { showToast } from '@/utils/toast'
 
 export default function PythonStrategyIndex() {
   const navigate = useNavigate()
   const [strategies, setStrategies] = useState<PythonStrategy[]>([])
+  const [pnlByStrategy, setPnlByStrategy] = useState<Record<string, PnlSnapshot>>({})
+  const [errorCountByStrategy, setErrorCountByStrategy] = useState<Record<string, number>>({})
   const [masterStatus, setMasterStatus] = useState<MasterContractStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [actionLoading, setActionLoading] = useState<string | null>(null)
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [strategyToDelete, setStrategyToDelete] = useState<PythonStrategy | null>(null)
+  const [forceExitDialogOpen, setForceExitDialogOpen] = useState(false)
+  const [strategyToForceExit, setStrategyToForceExit] = useState<PythonStrategy | null>(null)
   const [currentTime, setCurrentTime] = useState(new Date())
 
   const fetchData = async (silent = false) => {
@@ -61,6 +68,41 @@ export default function PythonStrategyIndex() {
       ])
       setStrategies(strategiesData)
       setMasterStatus(statusData)
+
+      // Fetch PnL snapshots for running strategies only -- a stopped
+      // strategy isn't pushing updates, so its last-known snapshot (if any)
+      // stays as-is rather than being re-fetched every refresh.
+      const running = strategiesData.filter((s) => s.status === 'running')
+      const pnlResults = await Promise.allSettled(
+        running.map((s) => pythonStrategyApi.getPnl(s.id))
+      )
+      setPnlByStrategy((prev) => {
+        const next = { ...prev }
+        running.forEach((s, i) => {
+          const result = pnlResults[i]
+          if (result.status === 'fulfilled') {
+            next[s.id] = result.value
+          }
+        })
+        return next
+      })
+
+      // Same pattern for error-mode legs -- only running strategies can have
+      // one, and this doubles as the initial load for a badge that's
+      // otherwise kept live via the error_update SSE event below.
+      const errorResults = await Promise.allSettled(
+        running.map((s) => pythonStrategyApi.getErrors(s.id))
+      )
+      setErrorCountByStrategy((prev) => {
+        const next = { ...prev }
+        running.forEach((s, i) => {
+          const result = errorResults[i]
+          if (result.status === 'fulfilled') {
+            next[s.id] = result.value.errors.length
+          }
+        })
+        return next
+      })
     } catch (_error) {
       if (!silent) showToast.error('Failed to load strategies', 'pythonStrategy')
     } finally {
@@ -81,6 +123,38 @@ export default function PythonStrategyIndex() {
       try {
         const data = JSON.parse(event.data)
         if (data.type === 'connected') {
+          return
+        }
+
+        // Live PnL push -- update just this strategy's snapshot in place,
+        // no full refetch (a status change still triggers the branch below).
+        if (data.type === 'pnl_update' && data.strategy_id) {
+          setPnlByStrategy((prev) => ({
+            ...prev,
+            [data.strategy_id]: {
+              realized_pnl: data.realized_pnl,
+              unrealized_pnl: data.unrealized_pnl,
+              total_pnl: data.total_pnl,
+              open_positions: data.open_positions,
+              updated_at: data.updated_at,
+            },
+          }))
+          return
+        }
+
+        // A leg entered/left error mode -- re-fetch just this strategy's
+        // error count rather than trying to reconstruct it from the partial
+        // per-leg event payload.
+        if (data.type === 'error_update' && data.strategy_id) {
+          pythonStrategyApi
+            .getErrors(data.strategy_id)
+            .then((res) => {
+              setErrorCountByStrategy((prev) => ({
+                ...prev,
+                [data.strategy_id]: res.errors.length,
+              }))
+            })
+            .catch(() => {})
           return
         }
 
@@ -177,6 +251,30 @@ export default function PythonStrategyIndex() {
     }
   }
 
+  const handleForceExit = async () => {
+    if (!strategyToForceExit) return
+    try {
+      setActionLoading(strategyToForceExit.id)
+      const response = await pythonStrategyApi.forceExitStrategy(strategyToForceExit.id)
+      if (response.status === 'success') {
+        showToast.success(
+          'Force exit requested -- closing all open positions, then stopping',
+          'pythonStrategy'
+        )
+      } else {
+        showToast.error(response.message || 'Failed to request force exit', 'pythonStrategy')
+      }
+    } catch (error: unknown) {
+      const axiosError = error as { response?: { data?: { message?: string } } }
+      const errorMessage = axiosError.response?.data?.message || 'Failed to request force exit'
+      showToast.error(errorMessage, 'pythonStrategy')
+    } finally {
+      setActionLoading(null)
+      setForceExitDialogOpen(false)
+      setStrategyToForceExit(null)
+    }
+  }
+
   const handleExport = async (strategy: PythonStrategy) => {
     try {
       const blob = await pythonStrategyApi.exportStrategy(strategy.id)
@@ -236,6 +334,13 @@ export default function PythonStrategyIndex() {
     total: strategies.length,
     running: strategies.filter((s) => s.status === 'running').length,
     scheduled: strategies.filter((s) => s.is_scheduled).length,
+    // Sum of live PnL across currently-running strategies only -- a stopped
+    // strategy's last-known snapshot isn't included, since it's no longer
+    // contributing to today's live total. Same values already shown on each
+    // card's PNL button, just aggregated here.
+    totalPnl: strategies
+      .filter((s) => s.status === 'running')
+      .reduce((sum, s) => sum + (pnlByStrategy[s.id]?.total_pnl ?? 0), 0),
   }
 
   if (loading) {
@@ -250,7 +355,7 @@ export default function PythonStrategyIndex() {
             <Skeleton key={i} className="h-24" />
           ))}
         </div>
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+        <div className="grid gap-4 grid-cols-1">
           {[1, 2, 3].map((i) => (
             <Skeleton key={i} className="h-64" />
           ))}
@@ -284,7 +389,7 @@ export default function PythonStrategyIndex() {
       </div>
 
       {/* Stats Bar */}
-      <div className="grid gap-4 grid-cols-2 md:grid-cols-4">
+      <div className="grid gap-4 grid-cols-2 md:grid-cols-5">
         <Card>
           <CardContent className="pt-4">
             <div className="flex items-center justify-between">
@@ -340,6 +445,25 @@ export default function PythonStrategyIndex() {
             </div>
           </CardContent>
         </Card>
+        <Card>
+          <CardContent className="pt-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">Total PNL</p>
+                <p
+                  className={`text-2xl font-bold ${stats.totalPnl >= 0 ? 'text-green-500' : 'text-red-500'}`}
+                >
+                  {stats.totalPnl >= 0 ? '+' : ''}
+                  {'₹'}
+                  {stats.totalPnl.toFixed(0)}
+                </p>
+              </div>
+              <Wallet
+                className={`h-8 w-8 ${stats.totalPnl >= 0 ? 'text-green-500' : 'text-red-500'}`}
+              />
+            </div>
+          </CardContent>
+        </Card>
       </div>
 
       {/* Current Time */}
@@ -364,7 +488,7 @@ export default function PythonStrategyIndex() {
           </CardContent>
         </Card>
       ) : (
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 items-start">
+        <div className="grid gap-4 grid-cols-1 items-start">
           {strategies.map((strategy) => (
             <Card key={strategy.id} className="relative overflow-hidden flex flex-col">
               {/* Status bar */}
@@ -479,7 +603,7 @@ export default function PythonStrategyIndex() {
                 </div>
 
                 {/* Action Buttons */}
-                <div className="flex gap-2 pt-2 mt-auto">
+                <div className="flex flex-wrap gap-2 pt-2 mt-auto">
                   {strategy.status === 'running' || strategy.status === 'scheduled' ? (
                     <Tooltip>
                       <TooltipTrigger asChild>
@@ -501,6 +625,33 @@ export default function PythonStrategyIndex() {
                       </TooltipContent>
                     </Tooltip>
                   ) : (
+                    <></>
+                  )}
+
+                  {strategy.status === 'running' && (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          className="flex-1 border border-red-800"
+                          onClick={() => {
+                            setStrategyToForceExit(strategy)
+                            setForceExitDialogOpen(true)
+                          }}
+                          disabled={actionLoading === strategy.id}
+                        >
+                          <OctagonX className="h-4 w-4 mr-1" />
+                          <span className="text-xs">Force Exit</span>
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        Close every open position (short legs first, then long) and stop
+                      </TooltipContent>
+                    </Tooltip>
+                  )}
+
+                  {strategy.status !== 'running' && strategy.status !== 'scheduled' && (
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <Button
@@ -523,7 +674,7 @@ export default function PythonStrategyIndex() {
                       <Button
                         variant="outline"
                         size="sm"
-                        className="border-blue-500 text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-950"
+                        className="flex-1 border-blue-500 text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-950"
                         asChild
                         disabled={strategy.status === 'running'}
                       >
@@ -539,6 +690,71 @@ export default function PythonStrategyIndex() {
                         : 'Edit schedule'}
                     </TooltipContent>
                   </Tooltip>
+
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        asChild
+                        className={`flex-1 ${
+                          pnlByStrategy[strategy.id]
+                            ? pnlByStrategy[strategy.id].total_pnl >= 0
+                              ? 'border-green-500 text-green-600 hover:bg-green-50 dark:text-green-400 dark:hover:bg-green-950'
+                              : 'border-red-500 text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950'
+                            : ''
+                        }`}
+                      >
+                        <Link to={`/python/${strategy.id}/pnl`}>
+                          <Wallet className="h-4 w-4 mr-1" />
+                          <span className="text-xs">
+                            {pnlByStrategy[strategy.id]
+                              ? `₹${pnlByStrategy[strategy.id].total_pnl.toFixed(0)}`
+                              : 'PNL'}
+                          </span>
+                        </Link>
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      {pnlByStrategy[strategy.id]
+                        ? `Realized ₹${pnlByStrategy[strategy.id].realized_pnl.toFixed(0)} + Unrealized ₹${pnlByStrategy[strategy.id].unrealized_pnl.toFixed(0)}`
+                        : 'View PnL'}
+                    </TooltipContent>
+                  </Tooltip>
+
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button variant="outline" size="sm" asChild>
+                        <Link to={`/python/${strategy.id}/trades`}>
+                          <Receipt className="h-4 w-4" />
+                        </Link>
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Today's trades</TooltipContent>
+                  </Tooltip>
+
+                  {!!errorCountByStrategy[strategy.id] && (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          asChild
+                          className="flex-1 animate-pulse"
+                        >
+                          <Link to={`/python/${strategy.id}/errors`}>
+                            <AlertTriangle className="h-4 w-4 mr-1" />
+                            <span className="text-xs">
+                              {errorCountByStrategy[strategy.id]} needs attention
+                            </span>
+                          </Link>
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        An order failed and needs Retry/Cancel/Manually Completed
+                      </TooltipContent>
+                    </Tooltip>
+                  )}
 
                   <Tooltip>
                     <TooltipTrigger asChild>
@@ -584,6 +800,28 @@ export default function PythonStrategyIndex() {
             </Button>
             <Button variant="destructive" onClick={handleDelete}>
               Delete Strategy
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Force Exit Dialog */}
+      <Dialog open={forceExitDialogOpen} onOpenChange={setForceExitDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Force Exit "{strategyToForceExit?.name}"?</DialogTitle>
+            <DialogDescription>
+              This will immediately close every open position for this strategy at the current
+              market price -- short legs first, then long legs -- and stop it. This cannot be
+              undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setForceExitDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={handleForceExit}>
+              Force Exit All Positions
             </Button>
           </DialogFooter>
         </DialogContent>

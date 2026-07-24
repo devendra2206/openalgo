@@ -44,6 +44,83 @@ export interface LogContent {
   last_updated: string
 }
 
+export interface OpenPosition {
+  leg_key: string
+  symbol: string
+  direction: 'LONG' | 'SHORT'
+  quantity: number
+  entry_price: number
+  current_price: number
+  pnl: number
+}
+
+export interface PnlSnapshot {
+  realized_pnl: number
+  unrealized_pnl: number
+  total_pnl: number
+  open_positions: OpenPosition[]
+  updated_at: string | null
+}
+
+// Row shape from trades_{strategy_id}.csv, read generically -- column set
+// can drift slightly between the 5 strategy scripts, so only the fields
+// every script's trade-log writer guarantees are typed strictly; anything
+// else passes through as an optional string.
+export interface Trade {
+  leg: string
+  symbol: string
+  quantity: string
+  direction?: string
+  entry_time: string
+  entry_px: string
+  exit_time: string
+  exit_px: string
+  pnl_points: string
+  pnl_rupees: string
+  exit_reason: string
+  execution_id: string
+  status?: 'OPEN' | 'CLOSED'
+  [key: string]: string | undefined
+}
+
+export interface TradesResponse {
+  trades: Trade[]
+  total_pnl: number
+}
+
+// One process run of the strategy -- every trade is tagged with whichever
+// run OPENED it (see execution_id on Trade). "legacy" groups trades logged
+// before this tracking existed.
+export interface Execution {
+  execution_id: string
+  start_time: string | null
+  trade_count: number
+  total_pnl: number
+}
+
+export interface ExecutionsResponse {
+  executions: Execution[]
+}
+
+// A leg the strategy has pushed into error mode -- poll_fill() exhausted its
+// automatic retries. See docs/prd/python-strategies-order-error-recovery.md.
+export interface LegError {
+  leg_key: string
+  error_state: 'entry_failed' | 'exit_failed' | ''
+  error_kind: 'terminal' | 'resting' | ''
+  error_message: string
+  error_since: string
+  symbol: string
+  quantity: number
+  action: string // BUY/SELL the leg was attempting when it failed
+}
+
+export interface LegErrorsResponse {
+  errors: LegError[]
+}
+
+export type LegAction = 'retry' | 'cancel' | 'manual'
+
 export interface EnvironmentVariables {
   regular: Record<string, string>
   secure: Record<string, string>

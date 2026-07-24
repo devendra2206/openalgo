@@ -437,6 +437,27 @@ def create_app():
         csrf.exempt(app.view_functions["health_bp.simple_health"])
         csrf.exempt(app.view_functions["health_bp.detailed_health_check"])
 
+        # Exempt the strategy PnL push endpoint from CSRF protection: it's
+        # called by a hosted Python strategy SUBPROCESS via plain urllib
+        # (report_pnl_to_platform), which has no OpenAlgo session cookie and
+        # can't carry a CSRF token. Authentication is via API key instead
+        # (verify_api_key + verify_strategy_ownership in the view itself),
+        # same rationale as the MCP/webhook exemptions above.
+        csrf.exempt(app.view_functions["python_strategy_bp.api_push_pnl"])
+
+        # Same rationale as above -- these are all called by a hosted Python
+        # strategy SUBPROCESS via plain urllib (push_leg_error, check_pending_action,
+        # ack_pending_action), authenticated via API key, not a session cookie.
+        # See docs/prd/python-strategies-order-error-recovery.md.
+        csrf.exempt(app.view_functions["python_strategy_bp.api_push_leg_error"])
+        csrf.exempt(app.view_functions["python_strategy_bp.api_check_pending_action"])
+        csrf.exempt(app.view_functions["python_strategy_bp.api_ack_pending_action"])
+
+        # Same rationale -- called by a hosted Python strategy SUBPROCESS via
+        # plain urllib (api_complete_force_exit), authenticated via API key,
+        # not a session cookie.
+        csrf.exempt(app.view_functions["python_strategy_bp.api_complete_force_exit"])
+
         # Initialize latency monitoring (after registering API blueprint)
         init_latency_monitoring(app)
 
