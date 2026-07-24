@@ -1,0 +1,2080 @@
+"""
+===============================================================================
+Nifty & Sensex Expiry-Day Straddle + Repair ("Batman")
+===============================================================================
+Version     : 1.3.0
+Platform    : OpenAlgo Hosted Strategy
+OpenAlgo    : >= 2.0.1.5
+Python      : >= 3.11
+Ported from : Tradetron export "Nifty_sensex_Expiry_batman (1).json"
+              -- see Nifty_Sensex_Expiry_Batman_ANALYSIS.md for the full
+              decoded-logic writeup and the open design decision below.
+
+*** THIS STRATEGY IS NOT A NAKED SELLER LIKE THE OTHER THREE IN THIS
+PROJECT. IT BUYS A LONG STRADDLE, THEN CONVERTS PART OF IT INTO A NAKED
+SHORT POSITION VIA A "REPAIR" LEG. RISK PROFILE CHANGES MID-TRADE. ***
+
+Description
+-----------
+Runs ONLY on the underlying's own expiry day (NIFTY Thursday-ish weekly,
+SENSEX its own weekly expiry -- whatever `client.expiry()` resolves as the
+nearest upcoming expiry, checked against today's date). Two independent
+instrument tracks (NIFTY, SENSEX), each entering/exiting once per day:
+
+1. ENTRY (once/day/instrument, after 09:25, only if today == that
+   instrument's own current-week expiry date): BUY 1 lot ATM PE + 1 lot ATM
+   CE (a long straddle), NRML. The CONTRACT actually traded is the CURRENT
+   (expiring-today) week's expiry -- per explicit instruction, reverting an
+   earlier next-week-roll choice for this strategy specifically. That
+   earlier choice existed because a same-day-expiring contract has minimal
+   time value left and an extreme gamma/theta cliff in its final hours,
+   and next week's contract backtested a smaller worst-day/max-drawdown at
+   a modest cost to total return (see ANALYSIS.md) -- that finding still
+   stands, this is a deliberate choice to trade the current contract
+   anyway. `resolve_current_week_expiry()` now serves both roles: gating
+   entry (is today this instrument's own expiry day?) AND resolving the
+   actual traded contract -- the separate `resolve_next_week_expiry()`
+   helper has been removed since nothing calls it anymore.
+
+2. REPAIR (once per SIDE per day, PE and CE independently): the CYCLE
+   right after the straddle leg on that side fills (no artificial delay --
+   per explicit instruction, the short leg goes on immediately, not after
+   any wait), search the (current-week-expiry) option chain for whichever
+   strike is CURRENTLY trading closest to `entry_price / repair_n`
+   (repair_n = 4 for NIFTY, 3 for SENSEX) and SELL `repair_n` lots of it.
+   The source JSON's "Repair Once" block has NO explicit trigger condition
+   -- see the ANALYSIS.md design-decision section for the full history of
+   this choice.
+   This is a real options "repair" technique: N lots at ~1/N the original
+   premium collects roughly the FULL original premium back, but the moment
+   it fires, that side's risk profile changes from "long option, risk
+   capped at premium paid" to "long 1 lot + short N lots at a further OTM
+   strike" -- i.e. a ratio spread with UNDEFINED risk on continued adverse
+   moves past the short strike. Fires at most once per side per day.
+
+3. UNIVERSAL EXIT (per instrument, force-closes EVERY open leg -- both
+   straddle legs and any fired repair legs): aggregate unrealized PnL across
+   all of that instrument's open legs <= -Rs 5,000, OR time >= 15:25.
+
+Live price feed: WebSocket, not REST polling (v1.3.0)
+------------------------------------------------------------------------
+Same rationale as the other three strategies (see Pivot+Supertrend's
+module docstring for the full writeup of why Shoonya's `multiquotes()` in
+this OpenAlgo installation is NOT a true batch call). Batman needs BOTH a
+fixed and a dynamic subscription set, unlike either of the other patterns
+used elsewhere in this project:
+  - The 2 underlyings' LTP is needed continuously, EVERY cycle, all day,
+    on every non-expiry day too (used only for ATM strike selection at
+    entry, but the old REST fetch ran unconditionally every cycle while
+    `not inst_state.traded_today` -- which is true all day on a non-expiry
+    day, since entry never fires). This was actually the single most
+    wasteful REST-polling spot in this whole project family: continuous
+    per-cycle polling with a payoff of "maybe used once, on 1-in-5ish
+    days." `PriceStream.add_instruments()` is called once at startup for
+    both underlyings, same fixed-list treatment as Pivot+Supertrend.
+  - The option legs' own LTP (needed live for the aggregate unrealized-PnL
+    universal-exit check) is NOT known until each leg's symbol is actually
+    resolved at runtime -- the straddle PE/CE symbols at entry
+    (`_enter_straddle`), the repair PE/CE symbols only if/when repair
+    fires (`_maybe_fire_repair`) -- so those are added dynamically,
+    exactly like the VWAP strategy's ATM-lock pattern. A same-day restart
+    resuming mid-session (any leg already `entry_filled` and not `closed`
+    in the loaded state) also gets its symbol added at startup, same
+    resumability guarantee as VWAP.
+  - Closed legs are NOT explicitly unsubscribed intraday (a deliberate
+    simplification -- at most 6 symbols total per day across both
+    instruments, the overhead of a stale subscription still flowing
+    ignored ticks is negligible, and the process is expected to restart
+    daily per this project's convention anyway).
+  - Same per-symbol staleness detection/resubscribe and SDK
+    `auto_reconnect` handling as the other three strategies.
+
+Order placement robustness (v1.3.0)
+------------------------------------------------------------------------
+Same underlying bug as the other three strategies, but Batman has THREE
+separate entry/exit code paths (straddle entry, repair entry, force-close
+exit), each with its own instance of it -- and the repair-entry case was
+actually WORSE than a simple infinite-repoll loop:
+  - `_maybe_fire_repair` set `repair_leg.fired = True` BEFORE placing the
+    order. Its own guard is `if repair_leg.fired or not
+    straddle_leg.entry_filled: return` -- so a rejected/cancelled repair
+    order used to PERMANENTLY disable that side's repair for the rest of
+    the day (the function would never even be called again), not just
+    loop on a dead order id. Fixed: on rejection, the whole `repair_leg`
+    resets to a blank `RepairLeg()` (fired=False included) so the NEXT
+    cycle's `_maybe_fire_repair` call re-attempts search-and-sell from
+    scratch.
+  - `_enter_straddle`: a rejected/cancelled entry order now resets JUST
+    that side's leg (`inst_state.pe` or `inst_state.ce`) to blank, so the
+    next cycle re-picks the ATM strike and places a fresh order for that
+    side specifically -- the OTHER side's already-filled leg (if only one
+    side was rejected) is left untouched.
+  - `_close_open_leg` (used for both universal-exit paths, and both LONG
+    straddle legs and SHORT repair legs): a rejected/cancelled exit order
+    clears only `exit_order_id` (the position is still open at the
+    broker) so the next cycle places a brand-new close order, with a new
+    `OptionLeg.exit_reject_count` (inherited by `RepairLeg`) escalating to
+    an ERROR log after 3 consecutive failures -- same highest-risk-failure
+    treatment as the other three strategies' naked short legs, here
+    applying to BOTH the long straddle legs and the short repair legs.
+  - `place()` retries up to 3 attempts (1.5s apart) before raising. A
+    `TimeoutError` from `poll_fill` now means it already tried RE-PRICING
+    the stale order (via `modifyorder()`, to the current LTP) up to
+    `config.reprice_max_attempts` times, then cancelled it -- so it's
+    treated the same as a rejection (clear and retry fresh). See
+    `poll_fill`'s own docstring for the full mechanism.
+
+Persistent trade log (state.json intentionally left minimal)
+------------------------------------------------------------------
+Same pattern as the other three strategies: `state.json` tracks each leg's
+CURRENTLY open position only. `append_trade_log()` writes one row per
+closed leg to `trades_{STRATEGY_ID}.csv` via a background thread. Unlike
+the other three (all naked SHORT sellers), this strategy has a MIX of long
+(straddle) and short (repair) legs, so the trade log now carries an
+explicit `direction` column ("LONG"/"SHORT") so PnL sign is computed
+correctly for both (`exit_px - entry_px` for LONG, `entry_px - exit_px`
+for SHORT).
+
+Design notes carried over from the other three strategies in this family
+------------------------------------------------------------------------
+  - Resumable, leg-by-leg entry/exit via persisted order IDs.
+  - State file unique per strategy_tag (STRATEGY_ID), anchored to this
+    script's own directory.
+  - `client.history()`/`quotes()`/`optionchain()` can return an error dict
+    instead of the expected shape on a bad broker session -- handled
+    explicitly.
+
+Notes / Assumptions (please verify against your installed `openalgo` SDK):
+  * `client.expiry(symbol=, exchange=, instrumenttype='options')` returns
+    dates in "DD-MMM-YY" format; the nearest upcoming one is treated as
+    "this instrument's current week expiry" for both the entry-day gate
+    and the option leg's own expiry.
+  * `client.optionchain(underlying=, exchange=, expiry_date=, strike_count=)`
+    -> chain with per-strike PE/CE `symbol`/`ltp`/`lotsize`. The repair
+    leg's chain fetch uses a wider `strike_count` than the entry's ATM
+    fetch, since a strike trading at ~1/4 of ATM premium is typically much
+    further OTM than the default ATM window.
+  * `client.placeorder(...)` uses `price_type` per the official Python
+    library docs/README.
+
+Author
+------
+<Project Owner>
+===============================================================================
+"""
+
+import csv
+import json
+import logging
+import os
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import http.client
+import socket
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, asdict, field
+from datetime import datetime, time, timedelta
+from pathlib import Path
+from typing import Optional
+
+import pytz
+from dotenv import load_dotenv
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from openalgo import api
+
+load_dotenv()
+
+print("🔁 OpenAlgo Python Bot is running.")
+
+###############################################################################
+# CONFIGURATION
+###############################################################################
+@dataclass
+class InstrumentConfig:
+    name: str                    # "NIFTY" / "SENSEX"
+    underlying_exchange: str     # NSE_INDEX / BSE_INDEX
+    options_exchange: str        # NFO / BFO
+    repair_n: int                # lots sold in repair AND the divisor for entry_px/N target
+                                  # (4 for NIFTY, 3 for SENSEX, per source)
+
+
+INSTRUMENTS = [
+    InstrumentConfig(name="NIFTY", underlying_exchange="NSE_INDEX", options_exchange="NFO", repair_n=4),
+    InstrumentConfig(name="SENSEX", underlying_exchange="BSE_INDEX", options_exchange="BFO", repair_n=3),
+]
+
+
+@dataclass
+class Config:
+    strategy_name: str = "Nifty & Sensex Expiry-Day Straddle + Repair (Batman)"
+    version: str = "1.2.0"
+
+    entry_start: time = time(9, 25)             # entry fires only if now > this (strict, per source)
+    universal_exit_time: time = time(15, 25)    # force-close everything at/after this
+    universal_exit_pnl: float = -5000.0         # aggregate unrealized PnL floor per instrument
+    market_close: time = time(15, 30)
+
+    # The source JSON's "Repair Once" block has NO explicit trigger
+    # condition. Per explicit instruction, the repair (short) leg fires the
+    # very first cycle after the straddle leg on that side is fully filled
+    # -- no artificial delay. See ANALYSIS.md for the design-decision history.
+    repair_chain_strike_count: int = 30   # wider than the ATM entry's chain fetch -- a strike
+                                           # priced at ~1/N of ATM premium is usually much further OTM
+
+    entry_chain_strike_count: int = 10    # kept wide (unlike the other 4 strategies' entry
+                                           # chain fetches) -- _enter_straddle fires only ONCE
+                                           # per instrument per day, so the latency win from a
+                                           # narrower chain is negligible here, while a wider
+                                           # window gives pick_atm_leg's own min(|strike-spot|)
+                                           # room to self-correct if this strategy's `spot`
+                                           # snapshot is slightly stale vs. the backend's live
+                                           # underlying LTP anchor at request time.
+
+    lot_multiplier: int = 1           # lots per straddle leg (repair leg quantity = repair_n lots)
+
+    product: str = "NRML"
+    price_type: str = "MARKET"
+
+    scheduler_interval: int = 10
+    pnl_tick_interval: int = 1                   # seconds between PnL pushes -- runs on its OWN scheduler
+                                                  # job (see report_pnl_tick), decoupled from
+                                                  # scheduler_interval, since it's cache-only/read-only and
+                                                  # doesn't share the blocking-call risk that interval guards
+
+    # WebSocket LTP cache: a tick older than this is treated as stale and
+    # falls back to a one-off REST client.quotes() call for that symbol.
+    ws_stale_seconds: float = 20.0
+    ws_watchdog_interval: float = 15.0       # how often the reconnect watchdog checks staleness
+    # Consecutive stale watchdog cycles (same symbol, in a row) before giving
+    # up on the cheap per-symbol resubscribe and escalating to a full
+    # reconnect -- confirmed in production that per-symbol resubscribe alone
+    # can retry 30+ times with zero recovery while the connection stays
+    # reported connected/authenticated, so something in the connection's own
+    # state needs a clean reset, not another poke at the same symbol.
+    ws_stale_reconnect_after: int = 3
+
+    fill_poll_interval: float = 2.0
+    fill_poll_timeout: float = 60.0
+    reprice_max_attempts: int = 2    # times poll_fill() re-prices a stale unfilled order to LTP before giving up
+
+    place_order_max_attempts: int = 3
+    place_order_retry_delay: float = 1.5
+
+    state_file: str = "strategy_state.json"
+    log_level: int = logging.INFO
+
+    test_mode: bool = os.getenv("STRATEGY_TEST_MODE", "0") == "1"
+
+
+config = Config()
+IST = pytz.timezone("Asia/Kolkata")
+
+
+###############################################################################
+# LOGGER
+###############################################################################
+class Log:
+    logger = logging.getLogger("OpenAlgoStrategy")
+    logger.setLevel(config.log_level)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    @staticmethod
+    def info(message):
+        Log.logger.info(message)
+
+    @staticmethod
+    def warning(message):
+        Log.logger.warning(message)
+
+    @staticmethod
+    def error(message):
+        Log.logger.error(message)
+
+    @staticmethod
+    def exception(message):
+        """Use inside an `except` block instead of manually building a
+        traceback string (import traceback / traceback.format_exc()) -- this
+        captures the current exception's traceback via the standard logging
+        exc_info mechanism instead of jamming it into the message text."""
+        Log.logger.exception(message)
+
+
+###############################################################################
+# MODELS
+###############################################################################
+@dataclass
+class OptionLeg:
+    symbol: str = ""
+    quantity: int = 0
+    entry_time: str = ""
+    entry_px: float = 0.0
+    entry_order_id: str = ""
+    entry_filled: bool = False
+    exit_order_id: str = ""
+    exit_filled: bool = False
+    closed: bool = False
+    exit_reject_count: int = 0     # consecutive rejected/cancelled exit orders for THIS open position
+    execution_id: int = 0          # which process run OPENED this leg -- captured at entry so a
+                                    # mid-position restart still tags the eventual close correctly
+    # Order error recovery (see docs/prd/python-strategies-order-error-recovery.md) --
+    # set when poll_fill() exhausts its automatic retries. Kept on the leg (not a
+    # separate structure) so it survives a strategy restart via state.json, same as
+    # entry_order_id etc. Cleared once the user resolves it via Retry/Cancel/Manual.
+    error_state: str = ""           # "" | "entry_failed" | "exit_failed"
+    error_kind: str = ""            # "" | "terminal" (order already dead) | "resting" (still live, unfilled)
+    error_order_id: str = ""        # the order id Retry/Cancel act on when error_kind == "resting"
+    error_message: str = ""         # last exception text, for display
+    error_since: str = ""           # ISO timestamp this error (or its latest re-entry) began
+    manual_exit_px: Optional[float] = None  # set only by a "manual" resolution on an exit
+
+
+@dataclass
+class RepairLeg(OptionLeg):
+    fired: bool = False   # search-and-sell has executed (at most once per side per day)
+
+
+@dataclass
+class InstrumentState:
+    traded_today: bool = False
+    exited_today: bool = False
+    pe: OptionLeg = field(default_factory=OptionLeg)
+    ce: OptionLeg = field(default_factory=OptionLeg)
+    pe_repair: RepairLeg = field(default_factory=RepairLeg)
+    ce_repair: RepairLeg = field(default_factory=RepairLeg)
+
+
+@dataclass
+class StrategyState:
+    current_day: str = ""
+    instruments: dict = field(default_factory=lambda: {i.name: InstrumentState() for i in INSTRUMENTS})
+    last_updated: str = ""
+    today_realized_pnl: float = 0.0  # sum of closed legs' pnl_rupees today -- pushed via report_pnl_to_platform
+    last_execution_id: int = 0       # incremented once per process start (see main()) -- the Trades UI's
+                                      # execution dropdown groups trades_{id}.csv rows by this number
+
+
+###############################################################################
+# ENVIRONMENT
+###############################################################################
+class Environment:
+    def __init__(self):
+        self.api_key = os.getenv("OPENALGO_API_KEY")
+        self.host = (
+            os.getenv("HOST_SERVER")
+            or os.getenv("OPENALGO_HOST")
+            or "http://127.0.0.1:5000"
+        )
+        self.version = "v1"
+        # Was 120.0 -- far too long for a call made synchronously inside
+        # run_cycle() (indicator/chain refresh, LTP fallback). A single broker
+        # hiccup could block the whole scheduler for up to 2 minutes PER call,
+        # and several such calls stacking in one cycle caused a real ~11-minute
+        # stall in production (2026-07-24). Order placement/poll_fill already
+        # have their own retry/reprice loops on top of this, so a short
+        # per-call ceiling just makes a stuck call fail fast instead of
+        # hanging -- it doesn't change normal-case behavior at all.
+        self.timeout = 10.0
+        # A single-symbol quotes() call (the WS-stale LTP fallback used
+        # directly in run_cycle's main-thread loop) should never legitimately
+        # need anywhere near 10s -- a healthy broker answers it in well under
+        # a second. Giving it its own short ceiling (via a second lightweight
+        # client, see Broker.connect_ltp_client) bounds run_cycle's own
+        # worst-case wall-clock time much tighter than sharing the 10s
+        # history()/optionchain() timeout would. This matters most here --
+        # up to 8 legs (2 instruments x straddle+repair x PE/CE) can each
+        # need their own fallback call in the same cycle.
+        self.ltp_timeout = 3.0
+        self.ws_url = os.getenv("WEBSOCKET_URL")
+        self.strategy_tag = (
+            os.getenv("OPENALGO_STRATEGY_TAG")
+            or os.getenv("STRATEGY_ID")
+            or "nifty_sensex_expiry_batman"
+        )
+
+    def validate(self):
+        if not self.api_key:
+            raise ValueError("OPENALGO_API_KEY environment variable not found.")
+
+
+def _within_market_hours() -> bool:
+    """Shared by StrategyEngine and PriceStream's reconnect watchdog -- the
+    feed goes silent outside market hours by design, so staleness checks
+    must not fire (and force pointless reconnects) overnight."""
+    if config.test_mode:
+        return True
+    now = datetime.now(IST).time()
+    return time(9, 15) <= now <= config.market_close
+
+
+###############################################################################
+# BROKER
+###############################################################################
+class Broker:
+    def __init__(self, env: Environment):
+        self.env = env
+        self.client: Optional[api] = None
+
+    def connect(self):
+        self.env.validate()
+        self.client = api(
+            api_key=self.env.api_key,
+            host=self.env.host,
+            version=self.env.version,
+            timeout=self.env.timeout,
+            ws_url=self.env.ws_url,
+        )
+        Log.info("Connected to OpenAlgo")
+        return self.client
+
+    def connect_ltp_client(self):
+        """A second, independent client used ONLY for the WS-stale LTP
+        fallback (quotes()) -- deliberately NOT sharing self.client's
+        self.timeout attribute, since that's a plain mutable instance
+        attribute read at call-time; mutating it around one call while a
+        background thread is mid-flight on the same client would race. A
+        second lightweight httpx-backed client is cheap (no auth handshake,
+        just a pooled HTTP client) and avoids that entirely."""
+        return api(
+            api_key=self.env.api_key,
+            host=self.env.host,
+            version=self.env.version,
+            timeout=self.env.ltp_timeout,
+            ws_url=self.env.ws_url,
+        )
+
+    @property
+    def connected(self):
+        return self.client is not None
+
+
+###############################################################################
+# LIVE PRICE STREAM (WebSocket, replaces per-cycle REST quotes -- see the
+# module docstring's "Live price feed" section). Subscribes to a mix of a
+# FIXED set (the 2 underlyings, added once at startup) and a DYNAMICALLY
+# growing set (each straddle/repair leg's option symbol, added the moment
+# it's resolved at runtime) -- the same `add_instruments()` design as the
+# VWAP strategy handles both cases identically.
+###############################################################################
+class PriceStream:
+    """Subscribes to LTP mode for a growing set of instruments over
+    OpenAlgo's shared WebSocket proxy. Keeps an in-memory, thread-safe
+    {(symbol, exchange): (ltp, tick_time)} cache updated by the push
+    callback. A background watchdog thread detects a stale/silent feed
+    during market hours and reconnects -- fully if the connection itself
+    is down, or per-symbol (leaving a healthy symbol's feed undisturbed)
+    if only some symbol(s) are stale while the connection is otherwise
+    healthy. If a symbol stays stale across several consecutive cycles
+    despite that per-symbol resubscribe, escalates to a full reconnect
+    instead (see _watchdog_loop) -- confirmed in production that the
+    per-symbol path alone can retry 30+ times with zero recovery while the
+    connection itself stays reported connected/authenticated the whole
+    time, so something in that connection's own state needs a clean reset,
+    not another poke at the same symbol."""
+
+    def __init__(self, client):
+        self.client = client
+        self._lock = threading.Lock()
+        self._cache: dict[tuple, tuple] = {}
+        self._instruments: dict[tuple, dict] = {}  # (symbol, exchange) -> {"symbol":.., "exchange":..}
+        self._stop = threading.Event()
+        self._watchdog_thread: Optional[threading.Thread] = None
+        # Consecutive watchdog cycles a given (symbol, exchange) has been
+        # found stale IN A ROW -- see _watchdog_loop's escalation policy.
+        self._stale_streak: dict[tuple, int] = {}
+
+    def _on_tick(self, msg):
+        try:
+            symbol = msg["symbol"]
+            exchange = msg.get("exchange", "")
+            ltp = float(msg["data"]["ltp"])
+        except (KeyError, TypeError, ValueError) as exc:
+            Log.warning(f"[PriceStream] malformed tick ignored: {exc} ({msg})")
+            return
+        with self._lock:
+            self._cache[(symbol, exchange)] = (ltp, datetime.now(IST))
+
+    def get_ltp(self, symbol: str, exchange: str, max_age: float) -> Optional[float]:
+        with self._lock:
+            entry = self._cache.get((symbol, exchange))
+        if entry is None:
+            return None
+        ltp, ts = entry
+        if (datetime.now(IST) - ts).total_seconds() > max_age:
+            return None
+        return ltp
+
+    def add_instruments(self, instruments: list):
+        """Subscribe to new (symbol, exchange) pairs not already tracked --
+        safe to call repeatedly / with overlapping entries. Used at startup
+        (both underlyings, plus any leg already open on a same-day restart)
+        and live, the moment each straddle/repair leg's symbol is resolved."""
+        new_ones = []
+        with self._lock:
+            for inst in instruments:
+                key = (inst["symbol"], inst["exchange"])
+                if key not in self._instruments:
+                    self._instruments[key] = inst
+                    new_ones.append(inst)
+        if not new_ones:
+            return
+        try:
+            self.client.subscribe_ltp(new_ones, on_data_received=self._on_tick)
+            Log.info(f"[PriceStream] subscribed: {new_ones}")
+        except Exception as exc:
+            Log.warning(f"[PriceStream] subscribe failed for {new_ones}: {exc}")
+
+    def _connect(self):
+        self.client.connect()
+        with self._lock:
+            all_instruments = list(self._instruments.values())
+        if all_instruments:
+            self.client.subscribe_ltp(all_instruments, on_data_received=self._on_tick)
+        Log.info(f"[PriceStream] connected"
+                 + (f" and (re)subscribed: {all_instruments}" if all_instruments else " (no symbols yet)"))
+
+    def _teardown(self):
+        try:
+            with self._lock:
+                all_instruments = list(self._instruments.values())
+            if all_instruments:
+                self.client.unsubscribe_ltp(all_instruments)
+        except Exception:
+            pass
+        try:
+            self.client.disconnect()
+        except Exception:
+            pass
+
+    def _watchdog_loop(self):
+        backoffs = (1, 2, 5, 10, 30)
+        failures = 0
+        try:
+            self._connect()
+        except Exception as exc:
+            Log.warning(f"[PriceStream] initial connect failed: {exc}")
+
+        while not self._stop.is_set():
+            self._stop.wait(config.ws_watchdog_interval)
+            if self._stop.is_set():
+                break
+            if not _within_market_hours():
+                continue
+
+            if not (getattr(self.client, "connected", False)
+                    and getattr(self.client, "authenticated", False)):
+                failures += 1
+                wait = backoffs[min(failures - 1, len(backoffs) - 1)]
+                Log.warning(
+                    f"[PriceStream] connection down (attempt {failures}) -- "
+                    f"reconnecting fully, then waiting {wait}s."
+                )
+                self._teardown()
+                try:
+                    self._connect()
+                except Exception as exc:
+                    Log.warning(f"[PriceStream] reconnect failed: {exc}")
+                self._stop.wait(wait)
+                continue
+
+            now = datetime.now(IST)
+            with self._lock:
+                tracked = list(self._instruments.items())
+            stale_instruments = []
+            for key, inst in tracked:
+                with self._lock:
+                    entry = self._cache.get(key)
+                if entry is None or (now - entry[1]).total_seconds() > config.ws_stale_seconds:
+                    stale_instruments.append(inst)
+
+            all_keys = {key for key, _ in tracked}
+            stale_keys = {(i["symbol"], i["exchange"]) for i in stale_instruments}
+            for key in all_keys:
+                self._stale_streak[key] = self._stale_streak.get(key, 0) + 1 if key in stale_keys else 0
+
+            if not stale_instruments:
+                failures = 0
+                continue
+
+            failures += 1
+            wait = backoffs[min(failures - 1, len(backoffs) - 1)]
+            names = ", ".join(f"{i['symbol']}.{i['exchange']}" for i in stale_instruments)
+
+            # A symbol stuck stale for several consecutive cycles despite
+            # repeated per-symbol resubscribes means whatever's wrong isn't
+            # fixable by resubscribing on the SAME connection -- escalate to
+            # a full reconnect instead of retrying the same narrow fix
+            # forever. This briefly disrupts every OTHER instrument on this
+            # connection too (unavoidable -- the whole connection is being
+            # torn down), but only for this one process; other strategy
+            # processes' own connections are unaffected.
+            if max(self._stale_streak[k] for k in stale_keys) >= config.ws_stale_reconnect_after:
+                Log.warning(
+                    f"[PriceStream] {names} stale for {config.ws_stale_reconnect_after}+ "
+                    f"consecutive cycles despite per-symbol resubscribe -- escalating to a "
+                    f"full reconnect."
+                )
+                self._teardown()
+                try:
+                    self._connect()
+                except Exception as exc:
+                    Log.warning(f"[PriceStream] full reconnect (escalation) failed: {exc}")
+                for key in all_keys:
+                    self._stale_streak[key] = 0
+                self._stop.wait(wait)
+                continue
+
+            Log.warning(
+                f"[PriceStream] stale/missing ticks for: {names} "
+                f"(attempt {failures}) -- resubscribing just this/these symbol(s), "
+                f"then waiting {wait}s."
+            )
+            try:
+                self.client.unsubscribe_ltp(stale_instruments)
+            except Exception as exc:
+                Log.warning(f"[PriceStream] unsubscribe (stale symbols) failed: {exc}")
+            try:
+                self.client.subscribe_ltp(stale_instruments, on_data_received=self._on_tick)
+            except Exception as exc:
+                Log.warning(f"[PriceStream] resubscribe (stale symbols) failed: {exc}")
+            self._stop.wait(wait)
+
+    def start(self):
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, name="price-stream-watchdog", daemon=True
+        )
+        self._watchdog_thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._teardown()
+
+
+###############################################################################
+# STATE STORE
+###############################################################################
+class StateStore:
+    def __init__(self, env: Environment):
+        base_name = Path(config.state_file).stem
+        self.path = Path(__file__).resolve().parent / f"{base_name}_{env.strategy_tag}.json"
+        self.state = StrategyState()
+
+    def load(self):
+        if not self.path.exists():
+            self.save()
+            return self.state
+        with self.path.open("r") as fp:
+            data = json.load(fp)
+        self.state = StrategyState()
+        self.state.current_day = data.get("current_day", "")
+        self.state.last_updated = data.get("last_updated", "")
+        self.state.today_realized_pnl = data.get("today_realized_pnl", 0.0)
+        self.state.last_execution_id = data.get("last_execution_id", 0)
+        insts_data = data.get("instruments", {})
+        for inst in INSTRUMENTS:
+            raw = insts_data.get(inst.name, {})
+            inst_state = InstrumentState()
+            inst_state.traded_today = raw.get("traded_today", False)
+            inst_state.exited_today = raw.get("exited_today", False)
+            inst_state.pe = OptionLeg(**{**asdict(OptionLeg()), **raw.get("pe", {})})
+            inst_state.ce = OptionLeg(**{**asdict(OptionLeg()), **raw.get("ce", {})})
+            inst_state.pe_repair = RepairLeg(**{**asdict(RepairLeg()), **raw.get("pe_repair", {})})
+            inst_state.ce_repair = RepairLeg(**{**asdict(RepairLeg()), **raw.get("ce_repair", {})})
+            self.state.instruments[inst.name] = inst_state
+        Log.info(f"State loaded from {self.path}")
+        return self.state
+
+    def save(self):
+        self.state.last_updated = datetime.now(IST).isoformat()
+        payload = {
+            "current_day": self.state.current_day,
+            "last_updated": self.state.last_updated,
+            "today_realized_pnl": self.state.today_realized_pnl,
+            "last_execution_id": self.state.last_execution_id,
+            "instruments": {
+                name: {
+                    "traded_today": inst.traded_today,
+                    "exited_today": inst.exited_today,
+                    "pe": asdict(inst.pe),
+                    "ce": asdict(inst.ce),
+                    "pe_repair": asdict(inst.pe_repair),
+                    "ce_repair": asdict(inst.ce_repair),
+                }
+                for name, inst in self.state.instruments.items()
+            },
+        }
+        with self.path.open("w") as fp:
+            json.dump(payload, fp, indent=4)
+
+
+###############################################################################
+# HELPERS
+###############################################################################
+def _compact_expiry(expiry_ddmmmyy_dash: str) -> str:
+    return expiry_ddmmmyy_dash.replace("-", "").upper()
+
+
+def resolve_current_week_expiry(client, inst: InstrumentConfig):
+    """Returns (compact_symbol_str, date) for the nearest upcoming expiry.
+    Used both to gate entry (is today this instrument's own expiry day?)
+    and, per explicit instruction, as the actual contract the straddle and
+    repair legs trade -- always the current/expiring-today contract, not
+    next week's (see module docstring for the tradeoff this reverses)."""
+    resp = client.expiry(symbol=inst.name, exchange=inst.options_exchange, instrumenttype="options")
+    if resp.get("status") != "success" or not resp.get("data"):
+        raise RuntimeError(f"Could not resolve expiry for {inst.name}: {resp}")
+    today = datetime.now(IST).date()
+    for raw in resp["data"]:
+        d = datetime.strptime(raw, "%d-%b-%y").date()
+        if d >= today:
+            return _compact_expiry(raw), d
+    last = resp["data"][-1]
+    return _compact_expiry(last), datetime.strptime(last, "%d-%b-%y").date()
+
+
+def _is_error_response(obj) -> bool:
+    return isinstance(obj, dict)
+
+
+def fetch_symbol_ltp(client, symbol: str, exchange: str) -> Optional[float]:
+    try:
+        resp = client.quotes(symbol=symbol, exchange=exchange)
+    except Exception as exc:
+        Log.warning(f"quotes() failed for {symbol}: {exc}")
+        return None
+    if _is_error_response(resp) and resp.get("status") != "success":
+        Log.warning(f"quotes() error response for {symbol}: {resp}")
+        return None
+    data = resp.get("data", resp) if isinstance(resp, dict) else resp
+    ltp = data.get("ltp") if isinstance(data, dict) else None
+    return float(ltp) if ltp is not None else None
+
+
+def fetch_ltp(client, inst: InstrumentConfig) -> Optional[float]:
+    return fetch_symbol_ltp(client, inst.name, inst.underlying_exchange)
+
+
+
+def fetch_chain(client, inst: InstrumentConfig, expiry: str, strike_count: int):
+    resp = client.optionchain(
+        underlying=inst.name, exchange=inst.underlying_exchange,
+        expiry_date=expiry, strike_count=strike_count,
+    )
+    if resp.get("status") != "success":
+        raise RuntimeError(f"optionchain failed for {inst.name}: {resp}")
+    return resp
+
+
+def _legs_with_strike(chain: dict, option_type: str) -> list:
+    key = option_type.lower()
+    legs = []
+    for row in chain["chain"]:
+        leg = row.get(key)
+        if leg:
+            merged = dict(leg)
+            merged["strike"] = row["strike"]
+            legs.append(merged)
+    return legs
+
+
+def pick_atm_leg(chain: dict, option_type: str, spot: float) -> dict:
+    legs = _legs_with_strike(chain, option_type)
+    if not legs:
+        raise RuntimeError(f"No {option_type} legs found in chain (spot={spot})")
+    return min(legs, key=lambda l: abs(l["strike"] - spot))
+
+
+def pick_leg_by_target_ltp(chain: dict, option_type: str, target_price: float) -> Optional[dict]:
+    """Repair leg's strike selection: whichever strike is CURRENTLY trading
+    closest to target_price (entry_px / repair_n) -- the OpenAlgo analogue
+    of the source's `find_strike(..., 'ltp', target, ...)`."""
+    legs = [l for l in _legs_with_strike(chain, option_type) if l.get("ltp") is not None and l["ltp"] > 0]
+    if not legs:
+        return None
+    return min(legs, key=lambda l: abs(l["ltp"] - target_price))
+
+
+class OrderNeedsAttention(Exception):
+    """poll_fill() exhausted its automatic reprice attempts but the order is
+    still resting, UNFILLED, at the broker -- not cancelled. Distinguishes
+    "nothing left to act on" (order_id is dead -- a genuine broker rejection
+    or cancellation, still raised as a plain RuntimeError immediately,
+    unchanged) from "still live, needs a human decision" (this). See
+    docs/prd/python-strategies-order-error-recovery.md."""
+    def __init__(self, order_id: str, message: str):
+        super().__init__(message)
+        self.order_id = order_id
+
+
+def _reprice_and_wait_once(client, order_id: str, strategy: str, symbol: str, exchange: str,
+                            action: str, quantity: int) -> Optional[dict]:
+    """One reprice-to-current-LTP (modifyorder(), keeping the same order
+    id/queue position) + one fill_poll_timeout-bounded wait. Returns the fill
+    data if it completed, None if still unfilled (order left resting either
+    way -- this never cancels). Shared by poll_fill()'s own reprice loop AND
+    by Entry-Cancel's one-last-chance flow (_watch_entry_cancel), so this
+    "give it a fair price, then wait" behavior only exists in one place."""
+    import time as _time
+
+    fresh_ltp = fetch_symbol_ltp(client, symbol, exchange)
+    if fresh_ltp is None:
+        Log.warning(f"Order {order_id}: no fresh quote available to re-price -- skipping this attempt.")
+        return None
+    try:
+        client.modifyorder(
+            order_id=order_id, strategy=strategy, symbol=symbol, action=action,
+            exchange=exchange, price_type="LIMIT", product=config.product,
+            quantity=str(quantity), price=str(fresh_ltp),
+            disclosed_quantity="0", trigger_price="0",
+        )
+        Log.warning(f"Order {order_id}: re-priced to {fresh_ltp}.")
+    except Exception as exc:
+        Log.warning(f"Order {order_id}: modify (reprice) failed: {exc}.")
+        return None
+
+    deadline_ts = datetime.now(IST).timestamp() + config.fill_poll_timeout
+    while datetime.now(IST).timestamp() < deadline_ts:
+        resp = client.orderstatus(order_id=order_id, strategy=strategy)
+        data = resp.get("data", {})
+        status = str(data.get("order_status", "")).lower()
+        if status in {"complete", "rejected", "cancelled", "canceled"}:
+            if status != "complete":
+                raise RuntimeError(f"Order {order_id} ended in status '{status}': {data}")
+            return data
+        _time.sleep(config.fill_poll_interval)
+    return None  # still resting, unfilled
+
+
+def poll_fill(client, orderid: str, strategy: str, symbol: str, exchange: str,
+              action: str, quantity: int) -> dict:
+    """Polls order status until a terminal state or config.fill_poll_timeout.
+    On timeout, actively RE-PRICES the same order (via _reprice_and_wait_once,
+    keeping its order id/queue position) to the current LTP -- up to
+    config.reprice_max_attempts times. If it's STILL resting after all of
+    those, raises OrderNeedsAttention WITHOUT cancelling it -- entering error
+    mode is now a user decision (Retry/Cancel/Manually Completed), not an
+    automatic cancel. A genuine broker rejection/cancellation (order never
+    became fillable at all) still raises RuntimeError immediately, unchanged.
+    See docs/prd/python-strategies-order-error-recovery.md."""
+    import time as _time
+
+    def _poll_until(deadline_ts) -> Optional[dict]:
+        while datetime.now(IST).timestamp() < deadline_ts:
+            resp = client.orderstatus(order_id=orderid, strategy=strategy)
+            data = resp.get("data", {})
+            status = str(data.get("order_status", "")).lower()
+            if status in {"complete", "rejected", "cancelled", "canceled"}:
+                if status != "complete":
+                    raise RuntimeError(f"Order {orderid} ended in status '{status}': {data}")
+                return data
+            _time.sleep(config.fill_poll_interval)
+        return None  # timed out, not yet terminal
+
+    result = _poll_until(datetime.now(IST).timestamp() + config.fill_poll_timeout)
+    if result is not None:
+        return result
+
+    for reprice_attempt in range(1, config.reprice_max_attempts + 1):
+        result = _reprice_and_wait_once(client, orderid, strategy, symbol, exchange, action, quantity)
+        if result is not None:
+            return result
+        Log.warning(f"Order {orderid}: still unfilled after reprice attempt "
+                    f"{reprice_attempt}/{config.reprice_max_attempts}.")
+
+    raise OrderNeedsAttention(
+        orderid,
+        f"Order {orderid} still unfilled after {config.reprice_max_attempts} reprice "
+        f"attempt(s) -- resting at broker, needs manual action.",
+    )
+
+
+def place(client, strategy: str, symbol: str, exchange: str, action: str, quantity: int) -> str:
+    """Places an order. Only retries a CLEAN rejection response (the broker
+    explicitly returned a non-"success" status -- nothing was placed, safe
+    to retry) up to config.place_order_max_attempts times. Deliberately does
+    NOT retry a raised exception (network timeout, connection reset, etc.)
+    -- that case is ambiguous: the request may have already reached the
+    broker and succeeded even though the client never got the response, so
+    retrying could place a genuine DUPLICATE order. No idempotency key
+    exists anywhere in this stack (confirmed against the openalgo SDK's
+    placeorder() signature and services/place_order_service.py), so
+    surfacing the exception immediately -- exactly once, no retry -- is the
+    only safe choice. A genuine persistent rejection still raises after the
+    last retry, and is handled by the caller (see the module docstring's
+    "Order placement robustness" section)."""
+    import time as _time
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, config.place_order_max_attempts + 1):
+        try:
+            resp = client.placeorder(
+                strategy=strategy, symbol=symbol, exchange=exchange, action=action,
+                product=config.product, price_type=config.price_type,
+                quantity=str(quantity), price="0", trigger_price="0", disclosed_quantity="0",
+            )
+        except Exception as exc:
+            Log.warning(f"placeorder raised for {symbol} {action} (not retried -- "
+                        f"outcome ambiguous, could duplicate a real order): {exc}")
+            raise
+        if resp.get("status") == "success":
+            return resp["orderid"]
+        last_exc = RuntimeError(f"placeorder failed for {symbol} {action}: {resp}")
+        Log.warning(f"placeorder attempt {attempt}/{config.place_order_max_attempts} "
+                    f"rejected for {symbol} {action}: {resp}")
+        if attempt < config.place_order_max_attempts:
+            _time.sleep(config.place_order_retry_delay)
+    raise last_exc
+
+
+###############################################################################
+# TRADE LOG (background thread -- see append_trade_log)
+###############################################################################
+_trade_log_queue: "queue.Queue" = queue.Queue()
+_trade_log_thread: Optional[threading.Thread] = None
+_trade_log_thread_lock = threading.Lock()
+
+_TRADE_LOG_HEADER = ["leg", "symbol", "quantity", "direction", "entry_time", "entry_px",
+                     "exit_time", "exit_px", "pnl_points", "pnl_rupees",
+                     "exit_reason", "execution_id"]
+
+
+def _migrate_trade_log_if_needed(strategy_tag: str):
+    """One-time migration: a trades_{strategy_tag}.csv written before
+    execution_id tracking existed has a header missing that column.
+    Rewrite the file ONCE -- add the column, backfill every existing row
+    with execution_id="legacy" -- so old and new rows share one consistent
+    schema going forward. Safe to call on every startup: a no-op once the
+    header already matches (checked BEFORE the trade-log writer thread
+    starts, so there's no concurrent-write race with this rewrite)."""
+    log_path = Path(__file__).resolve().parent / f"trades_{strategy_tag}.csv"
+    if not log_path.exists():
+        return
+    with log_path.open("r", newline="") as fp:
+        rows = list(csv.reader(fp))
+    if not rows or "execution_id" in rows[0]:
+        return  # empty file, or already migrated
+    Log.info(f"Migrating {log_path.name}: adding execution_id column (existing rows -> \"legacy\").")
+    migrated = [_TRADE_LOG_HEADER] + [row + ["legacy"] for row in rows[1:]]
+    with log_path.open("w", newline="") as fp:
+        csv.writer(fp).writerows(migrated)
+
+
+def _trade_log_writer_loop():
+    while True:
+        item = _trade_log_queue.get()
+        try:
+            if item is None:
+                break
+            (strategy_tag, leg_key, symbol, quantity, direction,
+             entry_time, entry_px, exit_time, exit_px, exit_reason, execution_id) = item
+            log_path = Path(__file__).resolve().parent / f"trades_{strategy_tag}.csv"
+            is_new = not log_path.exists()
+            # LONG: sell high, bought low = profit. SHORT: sell high, buy back low = profit.
+            pnl_points = (exit_px - entry_px) if direction == "LONG" else (entry_px - exit_px)
+            pnl_rupees = pnl_points * quantity
+            with log_path.open("a", newline="") as fp:
+                writer = csv.writer(fp)
+                if is_new:
+                    writer.writerow(_TRADE_LOG_HEADER)
+                writer.writerow([leg_key, symbol, quantity, direction, entry_time, round(entry_px, 2),
+                                  exit_time, round(exit_px, 2), round(pnl_points, 2),
+                                  round(pnl_rupees, 2), exit_reason, execution_id])
+        except Exception as exc:
+            Log.warning(f"Trade log writer failed: {exc}")
+        finally:
+            _trade_log_queue.task_done()
+
+
+def _ensure_trade_log_thread():
+    global _trade_log_thread
+    with _trade_log_thread_lock:
+        if _trade_log_thread is None or not _trade_log_thread.is_alive():
+            _trade_log_thread = threading.Thread(
+                target=_trade_log_writer_loop, name="trade-log-writer", daemon=True
+            )
+            _trade_log_thread.start()
+
+
+def append_trade_log(strategy_tag: str, leg_key: str, symbol: str, quantity: int, direction: str,
+                      entry_time: str, entry_px: float, exit_time: str, exit_px: float,
+                      exit_reason: str, execution_id: int):
+    _ensure_trade_log_thread()
+    _trade_log_queue.put((strategy_tag, leg_key, symbol, quantity, direction,
+                          entry_time, entry_px, exit_time, exit_px, exit_reason, execution_id))
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    """Minimal stdlib-only HTTP-over-Unix-domain-socket client. Needed
+    because gunicorn can be bound via `--bind unix:/path/to/openalgo.sock`
+    (common in multi-instance deployments, confirmed in production on this
+    project) instead of a TCP port -- in that case there is NO TCP listener
+    on 127.0.0.1 at all, so a plain urllib request gets "Connection
+    refused" no matter what port is guessed."""
+
+    def __init__(self, socket_path: str, timeout: float = 3.0):
+        super().__init__("localhost", timeout=timeout)
+        self._socket_path = socket_path
+
+    def connect(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self._socket_path)
+        self.sock = sock
+
+
+def _post_json_local(env: "Environment", path: str, payload: bytes, timeout: float = 3.0):
+    """POST to the local OpenAlgo instance, trying in order: (1) a Unix
+    domain socket at <repo_root>/openalgo.sock -- gunicorn's bind target in
+    this project's multi-instance/socket-based deployments; (2) plain TCP
+    loopback on FLASK_PORT -- default single-instance deployments; (3)
+    env.host (HOST_SERVER/OPENALGO_HOST, i.e. the public domain) as a last
+    resort only, since routing this internal call through a reverse
+    proxy/WAF is what caused the original 403 in production. Raises if
+    every transport fails; caller logs and swallows."""
+    headers = {"Content-Type": "application/json"}
+
+    socket_path = Path(__file__).resolve().parents[2] / "openalgo.sock"
+    if socket_path.exists():
+        conn = _UnixHTTPConnection(str(socket_path), timeout=timeout)
+        try:
+            conn.request("POST", path, body=payload, headers=headers)
+            conn.getresponse().read()
+            return
+        finally:
+            conn.close()
+
+    last_exc: Optional[Exception] = None
+    for base in (f"http://127.0.0.1:{os.getenv('FLASK_PORT', '5000')}", env.host.rstrip("/")):
+        try:
+            req = urllib.request.Request(f"{base}{path}", data=payload, method="POST", headers=headers)
+            urllib.request.urlopen(req, timeout=timeout).close()
+            return
+        except Exception as exc:
+            last_exc = exc
+    raise last_exc
+
+
+def report_pnl_to_platform(env: "Environment", realized_pnl: float, open_positions: list):
+    """Push a PnL snapshot to the OpenAlgo Python Strategy Host so the UI's
+    PNL button can show live PnL without the platform having to poll/parse
+    this process's logs. Fire-and-forget: stdlib-only (no new dependency),
+    short timeout, any failure is logged and swallowed -- must never block
+    or crash the main scheduler loop over a reporting hiccup.
+
+    `open_positions`: list of dicts, each {leg_key, symbol, direction
+    ("LONG" for a straddle leg, "SHORT" for a fired repair leg), quantity,
+    entry_price, current_price, pnl} -- pnl per leg already signed correctly
+    by the caller (see _aggregate_unrealized_pnl's LONG/SHORT handling), so
+    this function just sums them for unrealized_pnl."""
+    unrealized_pnl = sum(p.get("pnl", 0.0) for p in open_positions)
+    payload = json.dumps({
+        "apikey": env.api_key,
+        "realized_pnl": realized_pnl,
+        "unrealized_pnl": unrealized_pnl,
+        "open_positions": open_positions,
+    }).encode("utf-8")
+    path = f"/python/api/strategy/{env.strategy_tag}/pnl"
+    try:
+        _post_json_local(env, path, payload)
+    except Exception as exc:
+        Log.warning(f"report_pnl_to_platform failed: {exc}")
+
+
+def _get_json_local(env: "Environment", path: str, timeout: float = 3.0) -> dict:
+    """GET counterpart to _post_json_local -- same Unix-socket -> TCP loopback
+    -> env.host fallback chain, for check_pending_action's pull. Raises if
+    every transport fails; caller logs and treats it as "no action pending"
+    rather than crashing the scheduler loop over a reporting hiccup."""
+    socket_path = Path(__file__).resolve().parents[2] / "openalgo.sock"
+    if socket_path.exists():
+        conn = _UnixHTTPConnection(str(socket_path), timeout=timeout)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            return json.loads(resp.read())
+        finally:
+            conn.close()
+
+    last_exc: Optional[Exception] = None
+    for base in (f"http://127.0.0.1:{os.getenv('FLASK_PORT', '5000')}", env.host.rstrip("/")):
+        try:
+            with urllib.request.urlopen(f"{base}{path}", timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except Exception as exc:
+            last_exc = exc
+    raise last_exc
+
+
+def push_leg_error(env: "Environment", leg_key: str, leg: "OptionLeg",
+                    action: str = "", clear: bool = False):
+    """Push (or clear) this leg's error-mode state to the platform so the UI's
+    error badge/page reflects it live, without polling this process's logs.
+    Fire-and-forget, same style as report_pnl_to_platform -- must never block
+    or crash the scheduler loop over a reporting hiccup. `clear=True` is used
+    once a Retry/Cancel/Manual action has actually resolved the leg (leg's
+    error_state is already "" by then), so the platform drops the alert.
+    See docs/prd/python-strategies-order-error-recovery.md."""
+    payload = json.dumps({
+        "apikey": env.api_key,
+        "leg_key": leg_key,
+        "error_state": leg.error_state,
+        "error_kind": leg.error_kind,
+        "error_message": leg.error_message,
+        "error_since": leg.error_since,
+        "symbol": leg.symbol,
+        "quantity": leg.quantity,
+        "action": action,
+        "clear": clear,
+    }).encode("utf-8")
+    path = f"/python/api/strategy/{env.strategy_tag}/errors"
+    try:
+        _post_json_local(env, path, payload)
+    except Exception as exc:
+        Log.warning(f"push_leg_error failed for {leg_key}: {exc}")
+
+
+def check_pending_action(env: "Environment", leg_key: str) -> Optional[dict]:
+    """Pull whether the user has issued a Retry/Cancel/Manual action for this
+    leg from the platform. Only ever called for a leg currently in error mode
+    (near-zero legs, near-zero overhead on the normal per-cycle path). Returns
+    None on any failure (transport error, or genuinely nothing pending) --
+    degrades to "nothing pending yet, try again next cycle" rather than
+    raising, matching report_pnl_to_platform's best-effort style."""
+    # apikey MUST be in the query string -- api_check_pending_action requires
+    # it and returns 401 without it (this was missing entirely until now,
+    # which meant every call silently 401'd and this function always
+    # reported "nothing pending", regardless of what the user submitted).
+    path = f"/python/api/strategy/{env.strategy_tag}/pending_action?leg_key={leg_key}&apikey={env.api_key}"
+    try:
+        data = _get_json_local(env, path)
+    except Exception as exc:
+        Log.warning(f"check_pending_action failed for {leg_key}: {exc}")
+        return None
+    return data if data.get("action") else None
+
+
+def ack_pending_action(env: "Environment", leg_key: str):
+    """Tell the platform this leg's pending action has been consumed, so a
+    stale action can't be re-applied on a later, unrelated error for the same
+    leg. Fire-and-forget, same style as report_pnl_to_platform."""
+    payload = json.dumps({"apikey": env.api_key, "leg_key": leg_key}).encode("utf-8")
+    path = f"/python/api/strategy/{env.strategy_tag}/pending_action/ack"
+    try:
+        _post_json_local(env, path, payload)
+    except Exception as exc:
+        Log.warning(f"ack_pending_action failed for {leg_key}: {exc}")
+
+
+def check_force_exit(env: "Environment") -> bool:
+    """Pull whether the user has clicked the Force Exit button for this
+    strategy. Called once per cycle (near-zero overhead) -- returns False on
+    any transport failure, matching check_pending_action's best-effort
+    style (degrades to "not requested" rather than raising)."""
+    path = f"/python/api/strategy/{env.strategy_tag}/force_exit?apikey={env.api_key}"
+    try:
+        data = _get_json_local(env, path)
+    except Exception as exc:
+        Log.warning(f"check_force_exit failed: {exc}")
+        return False
+    return bool(data.get("requested"))
+
+
+def ack_force_exit_complete(env: "Environment"):
+    """Tell the platform every open leg has been force-closed and confirmed
+    flat -- this is what actually stops the strategy process (see
+    api_complete_force_exit). Fire-and-forget, same style as
+    report_pnl_to_platform."""
+    payload = json.dumps({"apikey": env.api_key}).encode("utf-8")
+    path = f"/python/api/strategy/{env.strategy_tag}/force_exit/complete"
+    try:
+        _post_json_local(env, path, payload)
+    except Exception as exc:
+        Log.warning(f"ack_force_exit_complete failed: {exc}")
+
+
+###############################################################################
+# STRATEGY ENGINE
+###############################################################################
+class StrategyEngine:
+    def __init__(self, client, store: StateStore, env: Environment, price_stream: "PriceStream",
+                 execution_id: int = 0, ltp_client=None):
+        self.client = client
+        # Short-timeout client used for the WS-stale LTP fallback calls made
+        # directly in run_cycle -- see Broker.connect_ltp_client(). Falls
+        # back to the main client if not supplied (e.g. a test harness
+        # constructing StrategyEngine directly) so this stays optional.
+        self.ltp_client = ltp_client if ltp_client is not None else client
+        self.store = store
+        self.env = env
+        self.price_stream = price_stream
+        self.execution_id = execution_id  # this process run's number -- see main()
+        # The current week's expiry only rolls at week boundaries, not intraday --
+        # resolving it fresh via client.expiry() on every cycle's gating check
+        # (and again at entry, and again at repair) added 3 REST round-trips per
+        # cycle for a value that can't change all day. Cached per instrument,
+        # cleared in _reset_day_if_needed alongside other daily state.
+        self._expiry_cache: dict[str, tuple] = {}
+        # poll_fill() can block for up to fill_poll_timeout * (1 + reprice_max_attempts)
+        # seconds (a stale/stuck order re-pricing against a moving market) -- doing that
+        # INSIDE run_cycle would stall every other instrument/leg's entry/exit check for
+        # the same duration. Order confirmation now happens on a per-leg background task
+        # instead (see _watch_entry_fill/_watch_exit_fill), submitted to one shared,
+        # module-instance-lifetime executor rather than a raw thread per order (FD
+        # hygiene: threads/executors are shared singletons, never spun up per-call).
+        # _state_lock serializes every self.store.save() call (main thread and
+        # background tasks alike) -- StateStore.save() writes the whole state to one
+        # shared JSON file, so two concurrent writers could corrupt it even though each
+        # leg's own fields are only ever touched by one thread at a time (guarded by
+        # _pending_fills below). _pending_fills tracks which leg_keys already have an
+        # active watcher so run_cycle doesn't submit a duplicate one next cycle.
+        self._state_lock = threading.Lock()
+        self._pending_fills: set[str] = set()
+        self._fill_executor = ThreadPoolExecutor(
+            max_workers=len(INSTRUMENTS) * 4, thread_name_prefix="fillwatch"
+        )
+
+    def _save_state(self):
+        """Every self.store.save() call in this engine goes through here --
+        StateStore.save() writes the entire state to one shared JSON file, so
+        concurrent writers (run_cycle vs. a background fill-watch task) could
+        otherwise corrupt it or drop an update."""
+        with self._state_lock:
+            self.store.save()
+
+    def _get_week_expiry(self, inst: InstrumentConfig) -> tuple:
+        cached = self._expiry_cache.get(inst.name)
+        if cached is None:
+            cached = resolve_current_week_expiry(self.client, inst)
+            self._expiry_cache[inst.name] = cached
+        return cached
+
+    # ---- state helpers -----------------------------------------------------
+    def _reset_day_if_needed(self):
+        today_key = datetime.now(IST).date().isoformat()
+        if self.store.state.current_day != today_key:
+            # Don't wipe an unresolved error -- a leg still frozen awaiting
+            # Retry/Cancel/Manually Completed may have a genuinely open
+            # position at the broker that this reset would otherwise silently
+            # orphan. Defer the whole day-rollover (same pattern MCX uses when
+            # its own daily resolution isn't ready yet) until every leg is clear.
+            for inst_state in self.store.state.instruments.values():
+                for leg in (inst_state.pe, inst_state.ce, inst_state.pe_repair, inst_state.ce_repair):
+                    if leg.error_state:
+                        Log.error("Day rollover deferred -- at least one leg is still in "
+                                  "error mode and needs Retry/Cancel/Manually Completed first.")
+                        return
+            Log.info(f"New day detected ({today_key}); resetting daily state.")
+            self.store.state.current_day = today_key
+            self.store.state.today_realized_pnl = 0.0
+            self.store.state.instruments = {i.name: InstrumentState() for i in INSTRUMENTS}
+            self._expiry_cache.clear()
+            self._save_state()
+
+    def _within_market_hours(self) -> bool:
+        return _within_market_hours()
+
+    def _past_universal_exit_time(self) -> bool:
+        if config.test_mode:
+            return False
+        return datetime.now(IST).time() >= config.universal_exit_time
+
+    # ---- entry (long straddle, once/day/instrument) -------------------------
+    def _enter_straddle(self, inst: InstrumentConfig, inst_state: InstrumentState, spot: float):
+        strategy_tag = self.env.strategy_tag
+        # The CURRENT (expiring-today) week's expiry -- per explicit
+        # instruction, reverting the earlier next-week-roll choice for this
+        # strategy specifically. See module docstring for the tradeoff this
+        # reverses (a same-day-expiring contract has an extreme gamma/theta
+        # cliff in its final hours; the backtested ANALYSIS.md sweep found
+        # next-week's contract gave a smaller worst-day/max-drawdown at a
+        # modest cost to total return -- that finding still stands, this is
+        # a deliberate choice to trade the current contract anyway).
+        expiry_str, _ = self._get_week_expiry(inst)
+        chain = fetch_chain(self.client, inst, expiry_str, config.entry_chain_strike_count)
+
+        for option_type, leg in (("PE", inst_state.pe), ("CE", inst_state.ce)):
+            if not leg.symbol:
+                atm_leg = pick_atm_leg(chain, option_type, spot)
+                quantity = config.lot_multiplier * atm_leg["lotsize"]
+                Log.info(f"[{inst.name}_{option_type}] Straddle entry: "
+                         f"strike={atm_leg['strike']} symbol={atm_leg['symbol']}@{atm_leg['ltp']} qty={quantity}")
+                new_leg = OptionLeg(
+                    symbol=atm_leg["symbol"], quantity=quantity,
+                    entry_time=datetime.now(IST).isoformat(), entry_px=float(atm_leg["ltp"]),
+                    execution_id=self.execution_id,
+                )
+                if option_type == "PE":
+                    inst_state.pe = new_leg
+                else:
+                    inst_state.ce = new_leg
+                self._save_state()
+                self.price_stream.add_instruments(
+                    [{"symbol": atm_leg["symbol"], "exchange": inst.options_exchange}]
+                )
+
+        for option_type, attr in (("PE", "pe"), ("CE", "ce")):
+            leg_key = f"{inst.name}_{option_type}"
+            leg = getattr(inst_state, attr)
+            if leg.entry_filled or leg.error_state or leg_key in self._pending_fills:
+                continue
+            if not leg.entry_order_id:
+                leg.entry_order_id = place(self.client, strategy_tag, leg.symbol,
+                                            inst.options_exchange, "BUY", leg.quantity)
+                self._save_state()
+            # Fill confirmation happens off this thread -- see module-level note
+            # on _state_lock/_pending_fills/_fill_executor. place() above is the
+            # only REST call left on the signal-to-order critical path.
+            self._pending_fills.add(leg_key)
+            self._fill_executor.submit(self._watch_entry_fill, leg_key, leg.entry_order_id)
+
+    def _watch_entry_fill(self, leg_key: str, order_id: str):
+        """Generic across all 4 leg types (straddle PE/CE = LONG entry=BUY,
+        repair PE/CE = SHORT entry=SELL) -- _resolve_leg_key looks up which one
+        leg_key refers to and its BUY/SELL direction."""
+        inst, leg, direction = self._resolve_leg_key(leg_key)
+        strategy_tag = self.env.strategy_tag
+        entry_action = "BUY" if direction == "LONG" else "SELL"
+        try:
+            poll_fill(self.client, order_id, strategy_tag, leg.symbol, inst.options_exchange,
+                      entry_action, leg.quantity)
+            inst, leg, _ = self._resolve_leg_key(leg_key)  # re-fetch: may have changed while polling
+            if leg.entry_order_id == order_id:  # guard vs. a superseded/stale order
+                leg.entry_filled = True
+                inst_state = self.store.state.instruments[inst.name]
+                if inst_state.pe.entry_filled and inst_state.ce.entry_filled:
+                    inst_state.traded_today = True
+                self._save_state()
+                Log.info(f"[{leg_key}] Entry filled: {leg.symbol}")
+        except OrderNeedsAttention as exc:
+            self._enter_error_mode(leg_key, "entry_failed", "resting", exc.order_id, str(exc))
+        except (RuntimeError, TimeoutError) as exc:
+            self._enter_error_mode(leg_key, "entry_failed", "terminal", "", str(exc))
+        except Exception as exc:
+            # Anything unexpected (malformed broker response, unhandled SDK
+            # exception, etc.) -- without this, the executor would silently
+            # drop it (nobody calls .result() on this future), leaving the
+            # leg stuck with no log line and no error-state entry. Treated as
+            # "resting" (not "terminal") since we don't actually know the
+            # order's true fate -- safer to let the user Retry/Cancel it
+            # explicitly than to assume it's dead.
+            Log.exception(f"[{leg_key}] Unexpected error while watching entry fill: {exc}")
+            self._enter_error_mode(leg_key, "entry_failed", "resting", order_id, str(exc))
+        finally:
+            self._pending_fills.discard(leg_key)
+
+    def _resolve_leg_key(self, leg_key: str):
+        """Maps a leg_key string back to (inst, leg, direction) -- leg_key
+        format: '{INST}_{PE|CE}' (straddle, LONG, entry=BUY/exit=SELL) or
+        '{INST}_{PE|CE}_repair' (repair, SHORT, entry=SELL/exit=BUY)."""
+        is_repair = leg_key.endswith("_repair")
+        base = leg_key[: -len("_repair")] if is_repair else leg_key
+        inst_name, option_type = base.rsplit("_", 1)
+        inst = next(i for i in INSTRUMENTS if i.name == inst_name)
+        inst_state = self.store.state.instruments[inst.name]
+        if is_repair:
+            leg = inst_state.pe_repair if option_type == "PE" else inst_state.ce_repair
+            direction = "SHORT"
+        else:
+            leg = inst_state.pe if option_type == "PE" else inst_state.ce
+            direction = "LONG"
+        return inst, leg, direction
+
+    def _enter_error_mode(self, leg_key: str, error_state: str, error_kind: str,
+                          error_order_id: str, message: str):
+        """See docs/prd/python-strategies-order-error-recovery.md. Called
+        from every watcher's exception handler -- and, by construction, will
+        be called AGAIN on the same leg if a subsequent Retry/Cancel-driven
+        attempt also fails, since it's the normal failure path, not a
+        one-shot special case. error_since is overwritten every time so the
+        UI shows how long the CURRENT attempt has been stuck."""
+        inst, leg, direction = self._resolve_leg_key(leg_key)
+        leg.error_state = error_state
+        leg.error_kind = error_kind
+        leg.error_order_id = error_order_id
+        leg.error_message = message
+        leg.error_since = datetime.now(IST).isoformat()
+        self._save_state()
+        Log.error(f"[{leg_key}] {error_state} ({error_kind}): {message}")
+        entry_action = "BUY" if direction == "LONG" else "SELL"
+        exit_action = "SELL" if direction == "LONG" else "BUY"
+        action = entry_action if error_state == "entry_failed" else exit_action
+        push_leg_error(self.env, leg_key, leg, action=action)
+
+    # ---- repair (search-and-sell, at most once per side per day) -----------
+    def _maybe_fire_repair(self, inst: InstrumentConfig, inst_state: InstrumentState,
+                            option_type: str, straddle_leg: OptionLeg, repair_leg: RepairLeg):
+        # Fires the very first cycle after the straddle leg is fully filled --
+        # no artificial delay, per explicit instruction (the short repair
+        # leg goes on immediately, not after any wait).
+        if repair_leg.fired or not straddle_leg.entry_filled:
+            return
+
+        target_price = straddle_leg.entry_px / inst.repair_n
+        try:
+            # The CURRENT week's expiry, matching the straddle leg's own
+            # contract (see _enter_straddle for the rationale reversal).
+            expiry_str, _ = self._get_week_expiry(inst)
+            chain = fetch_chain(self.client, inst, expiry_str, config.repair_chain_strike_count)
+        except Exception as exc:
+            Log.warning(f"[{inst.name}_{option_type}_repair] chain fetch failed: {exc}")
+            return
+
+        match = pick_leg_by_target_ltp(chain, option_type, target_price)
+        if match is None:
+            Log.warning(f"[{inst.name}_{option_type}_repair] no strike found near target={target_price:.2f}")
+            return
+
+        quantity = inst.repair_n * match["lotsize"]
+        Log.info(f"[{inst.name}_{option_type}_repair] Repair fired: target={target_price:.2f} "
+                  f"strike={match['strike']} symbol={match['symbol']}@{match['ltp']} qty={quantity}")
+
+        repair_leg.symbol = match["symbol"]
+        repair_leg.quantity = quantity
+        repair_leg.entry_time = datetime.now(IST).isoformat()
+        repair_leg.entry_px = float(match["ltp"])
+        repair_leg.fired = True
+        repair_leg.execution_id = self.execution_id
+        self._save_state()
+        self.price_stream.add_instruments(
+            [{"symbol": match["symbol"], "exchange": inst.options_exchange}]
+        )
+
+        strategy_tag = self.env.strategy_tag
+        leg_key = f"{inst.name}_{option_type}_repair"
+        if not repair_leg.entry_order_id:
+            repair_leg.entry_order_id = place(self.client, strategy_tag, repair_leg.symbol,
+                                               inst.options_exchange, "SELL", repair_leg.quantity)
+            self._save_state()
+        # Fill confirmation happens off this thread (see _enter_straddle's note
+        # on _state_lock/_pending_fills/_fill_executor). On a genuine failure,
+        # _enter_error_mode sets error_state -- NOT the old "reset every field
+        # back to a fresh RepairLeg()" behavior, since repair_leg.fired staying
+        # True (this function's own "if repair_leg.fired: return" guard at the
+        # top) is now exactly what keeps this leg frozen until the user
+        # resolves it via Retry/Cancel/Manually Completed, instead of silently
+        # retrying search-and-sell from scratch.
+        self._pending_fills.add(leg_key)
+        self._fill_executor.submit(self._watch_entry_fill, leg_key, repair_leg.entry_order_id)
+
+    # ---- universal exit (aggregate PnL or time, per instrument) -------------
+    def _close_open_leg(self, inst: InstrumentConfig, leg_key: str, leg: OptionLeg,
+                         direction: str, reason: str):
+        strategy_tag = self.env.strategy_tag
+        if leg.closed:
+            return
+        if leg.error_state:
+            # Frozen awaiting a Retry/Cancel/Manual decision -- do NOT auto-force
+            # a close through an errored leg (see run_cycle's per-leg error check,
+            # which is what actually drives this leg's resolution). Other legs on
+            # this same instrument are unaffected -- _force_close_instrument calls
+            # this once per leg independently.
+            Log.error(f"[{leg_key}] Force-close requested but this leg is still in "
+                      f"error mode ({leg.error_state}) -- resolve it via "
+                      f"Retry/Cancel/Manually Completed NOW.")
+            return
+        if leg.exit_filled:
+            self._finalize_close(inst, leg_key, leg, direction, reason)
+            return
+        if leg_key in self._pending_fills:
+            return  # exit order already in flight -- background watcher will resolve it
+
+        exit_action = "SELL" if direction == "LONG" else "BUY"
+        if not leg.exit_order_id:
+            leg.exit_order_id = place(self.client, strategy_tag, leg.symbol,
+                                       inst.options_exchange, exit_action, leg.quantity)
+            self._save_state()
+
+        # Fill confirmation happens off this thread -- see _enter_straddle's
+        # note on _state_lock/_pending_fills/_fill_executor. place() above is
+        # the only REST call left on the exit-signal-to-order path.
+        self._pending_fills.add(leg_key)
+        self._fill_executor.submit(self._watch_exit_fill, leg_key, leg.exit_order_id)
+
+    def _watch_exit_fill(self, leg_key: str, order_id: str):
+        inst, leg, direction = self._resolve_leg_key(leg_key)
+        strategy_tag = self.env.strategy_tag
+        exit_action = "SELL" if direction == "LONG" else "BUY"
+        try:
+            poll_fill(self.client, order_id, strategy_tag, leg.symbol, inst.options_exchange,
+                      exit_action, leg.quantity)
+            inst, leg, _ = self._resolve_leg_key(leg_key)  # re-fetch: may have changed while polling
+            if leg.exit_order_id == order_id:  # guard vs. a superseded/stale order
+                leg.exit_filled = True
+                self._save_state()
+        except OrderNeedsAttention as exc:
+            self._enter_error_mode(leg_key, "exit_failed", "resting", exc.order_id, str(exc))
+        except (RuntimeError, TimeoutError) as exc:
+            self._enter_error_mode(leg_key, "exit_failed", "terminal", "", str(exc))
+        except Exception as exc:
+            Log.exception(f"[{leg_key}] Unexpected error while watching exit fill: {exc}")
+            self._enter_error_mode(leg_key, "exit_failed", "resting", order_id, str(exc))
+        finally:
+            self._pending_fills.discard(leg_key)
+
+    def _finalize_close(self, inst: InstrumentConfig, leg_key: str, leg: OptionLeg,
+                         direction: str, reason: str):
+        """Runs on the main thread's next run_cycle tick once _watch_exit_fill
+        has set leg.exit_filled -- the trade-log write and today_realized_pnl
+        update don't need to be on the background thread's own critical path,
+        and keeping them here means the watcher thread's body stays minimal."""
+        strategy_tag = self.env.strategy_tag
+        Log.info(f"[{leg_key}] Position closed: {leg.symbol} ({direction})")
+
+        # A "Manually Completed" exit resolution sets manual_exit_px -- the
+        # user's real fill price is authoritative there, not a fresh quote
+        # (see docs/prd/python-strategies-order-error-recovery.md).
+        exit_px = (leg.manual_exit_px if leg.manual_exit_px is not None
+                   else fetch_symbol_ltp(self.ltp_client, leg.symbol, inst.options_exchange))
+        if exit_px is not None:
+            # LONG: bought low (entry), sell high (exit) = profit. SHORT:
+            # sell high (entry), buy back low (exit) = profit -- same
+            # formula the async trade-log writer uses, kept in sync here so
+            # today_realized_pnl (pushed via report_pnl_to_platform)
+            # updates immediately rather than waiting on that thread.
+            pnl_points = (exit_px - leg.entry_px) if direction == "LONG" else (leg.entry_px - exit_px)
+            self.store.state.today_realized_pnl += pnl_points * leg.quantity
+            self._save_state()
+            try:
+                append_trade_log(strategy_tag, leg_key, leg.symbol, leg.quantity, direction,
+                                  leg.entry_time, leg.entry_px,
+                                  datetime.now(IST).isoformat(), exit_px, reason,
+                                  leg.execution_id)
+            except Exception as exc:
+                Log.warning(f"[{leg_key}] Failed to append trade log: {exc}")
+        else:
+            Log.warning(f"[{leg_key}] Could not fetch exit LTP for trade log -- skipping this row.")
+
+        leg.closed = True
+        self._save_state()
+
+    # ---- order error recovery (Retry / Cancel / Manually Completed) --------
+    # See docs/prd/python-strategies-order-error-recovery.md for the full
+    # design rationale behind every branch here. Direction-aware throughout:
+    # the straddle's LONG legs enter via BUY/exit via SELL, the repair leg's
+    # SHORT legs are the reverse -- _resolve_leg_key supplies `direction`.
+    def _resolve_leg_error(self, leg_key: str, inst: InstrumentConfig, action: dict):
+        _, leg, direction = self._resolve_leg_key(leg_key)
+        was_exit = leg.error_state == "exit_failed"
+        kind = leg.error_kind
+        entry_action = "BUY" if direction == "LONG" else "SELL"
+        exit_action = "SELL" if direction == "LONG" else "BUY"
+
+        if action["action"] == "retry":
+            if was_exit:
+                # _close_open_leg IS reliably called again on a later cycle
+                # (run_cycle's per-instrument error-check pass above, plus the
+                # universal-exit-time/aggregate-PnL branches while they're
+                # active) -- and its body unconditionally resumes watching
+                # whatever exit_order_id is currently set. So the exit side
+                # only needs the reprice (if resting) + clearing the error
+                # fields; the normal flow does the rest.
+                if kind == "resting":
+                    fresh_ltp = fetch_symbol_ltp(self.ltp_client, leg.symbol, inst.options_exchange)
+                    if fresh_ltp is not None:
+                        try:
+                            self.client.modifyorder(
+                                order_id=leg.error_order_id, strategy=self.env.strategy_tag,
+                                symbol=leg.symbol, action=exit_action,
+                                exchange=inst.options_exchange, price_type="LIMIT",
+                                product=config.product, quantity=str(leg.quantity),
+                                price=str(fresh_ltp), disclosed_quantity="0", trigger_price="0",
+                            )
+                        except Exception as exc:
+                            Log.warning(f"[{leg_key}] Retry's reprice failed ({exc}) -- "
+                                        f"resuming the watcher on the order as-is anyway.")
+                else:  # kind == "terminal" -- nothing resting, must place fresh
+                    leg.exit_order_id = ""  # _close_open_leg places a brand-new close order next cycle
+                leg.error_state = ""
+                leg.error_kind = ""
+                leg.error_order_id = ""
+                self._save_state()
+                push_leg_error(self.env, leg_key, leg, clear=True)
+                ack_pending_action(self.env, leg_key)
+                return
+
+            # Entry side: unlike exit, nothing in run_cycle calls
+            # _enter_straddle/_maybe_fire_repair again for a leg that already
+            # has a symbol (has_position-equivalent is already true) --
+            # Retry has to directly (re)submit the watcher itself.
+            if kind == "resting":
+                fresh_ltp = fetch_symbol_ltp(self.ltp_client, leg.symbol, inst.options_exchange)
+                if fresh_ltp is not None:
+                    try:
+                        self.client.modifyorder(
+                            order_id=leg.error_order_id, strategy=self.env.strategy_tag,
+                            symbol=leg.symbol, action=entry_action,
+                            exchange=inst.options_exchange, price_type="LIMIT",
+                            product=config.product, quantity=str(leg.quantity),
+                            price=str(fresh_ltp), disclosed_quantity="0", trigger_price="0",
+                        )
+                    except Exception as exc:
+                        Log.warning(f"[{leg_key}] Retry's reprice failed ({exc}) -- resuming "
+                                    f"the watcher on the order as-is anyway.")
+                resume_order_id = leg.error_order_id
+            else:  # kind == "terminal" -- nothing resting, place a genuinely new order
+                resume_order_id = place(self.client, self.env.strategy_tag, leg.symbol,
+                                         inst.options_exchange, entry_action, leg.quantity)
+                leg.entry_order_id = resume_order_id
+            leg.error_state = ""
+            leg.error_kind = ""
+            leg.error_order_id = ""
+            self._save_state()
+            push_leg_error(self.env, leg_key, leg, clear=True)
+            ack_pending_action(self.env, leg_key)
+            self._pending_fills.add(leg_key)
+            self._fill_executor.submit(self._watch_entry_fill, leg_key, resume_order_id)
+            return
+
+        if action["action"] == "cancel":
+            if was_exit:
+                # Ignore the failed attempt entirely -- no broker-side action,
+                # no further re-pricing, regardless of error_kind. Position
+                # stays open; a fresh force-close pass places a brand-new
+                # order normally later (see run_cycle's per-instrument checks).
+                leg.exit_order_id = ""
+                leg.error_state = ""
+                leg.error_kind = ""
+                leg.error_order_id = ""
+                self._save_state()
+                push_leg_error(self.env, leg_key, leg, clear=True)
+                ack_pending_action(self.env, leg_key)
+                return
+            if kind == "terminal":
+                # Nothing resting -- no broker call needed. Unlike the other 4
+                # strategies' single-naked-leg shape, resetting this leg back
+                # to blank (rather than clearing just the position) matches
+                # this file's own original terminal-rejection behavior for
+                # straddle/repair entries -- next cycle re-picks the strike
+                # (straddle) or re-runs search-and-sell (repair) from scratch.
+                if leg_key.endswith("_repair"):
+                    for field_name, value in asdict(RepairLeg()).items():
+                        setattr(leg, field_name, value)
+                else:
+                    setattr(self.store.state.instruments[inst.name],
+                            "pe" if leg_key.endswith("_PE") else "ce", OptionLeg())
+                self._save_state()
+                push_leg_error(self.env, leg_key, leg, clear=True)
+                ack_pending_action(self.env, leg_key)
+                return
+            # kind == "resting": one last honest re-price + bounded wait, then
+            # an explicit cancelorder() if it still didn't fill -- never
+            # silently abandoned (an untracked entry order filling later would
+            # create a position from nothing). Can take up to one
+            # fill_poll_timeout window, so runs on _fill_executor, not inline.
+            self._pending_fills.add(leg_key)
+            self._fill_executor.submit(
+                self._watch_entry_cancel, leg_key, leg.error_order_id
+            )
+            return  # _watch_entry_cancel does its own save/push/ack once resolved
+
+        if action["action"] == "manual":
+            fill_price = action["fill_price"]
+            if was_exit:
+                leg.exit_filled = True
+                leg.manual_exit_px = fill_price
+                # _close_open_leg's normal `if leg.exit_filled: self._finalize_close(...)`
+                # path runs next cycle (or the per-instrument error-check pass
+                # above) and uses manual_exit_px (see _finalize_close).
+            else:
+                leg.entry_filled = True
+                leg.entry_px = fill_price
+                if leg_key.endswith("_repair"):
+                    pass  # no trade_count/traded_today concept for the repair leg itself
+                else:
+                    inst_state = self.store.state.instruments[inst.name]
+                    if inst_state.pe.entry_filled and inst_state.ce.entry_filled:
+                        inst_state.traded_today = True
+            leg.error_state = ""
+            leg.error_kind = ""
+            leg.error_order_id = ""
+            self._save_state()
+            push_leg_error(self.env, leg_key, leg, clear=True)
+            ack_pending_action(self.env, leg_key)
+
+    def _watch_entry_cancel(self, leg_key: str, order_id: str):
+        """Entry-Cancel's one-last-chance flow for a still-`resting` order --
+        never silently abandoned. Deliberately self-terminating (unlike the
+        other watchers): ends in exactly one of two definitive outcomes, never
+        back in error mode."""
+        inst, leg, direction = self._resolve_leg_key(leg_key)
+        strategy_tag = self.env.strategy_tag
+        entry_action = "BUY" if direction == "LONG" else "SELL"
+        result = _reprice_and_wait_once(self.client, order_id, strategy_tag,
+                                         leg.symbol, inst.options_exchange, entry_action, leg.quantity)
+        inst, leg, direction = self._resolve_leg_key(leg_key)  # re-fetch: may have changed while polling
+        if leg.error_order_id != order_id:
+            self._pending_fills.discard(leg_key)
+            return  # superseded by a newer action/order in the meantime -- do nothing
+        if result is not None:
+            leg.entry_filled = True
+            if leg_key.endswith("_repair"):
+                pass
+            else:
+                inst_state = self.store.state.instruments[inst.name]
+                if inst_state.pe.entry_filled and inst_state.ce.entry_filled:
+                    inst_state.traded_today = True
+            leg.error_state = ""
+            leg.error_kind = ""
+            leg.error_order_id = ""
+            self._save_state()
+            Log.info(f"[{leg_key}] Entry filled during Cancel's final chance: {leg.symbol}")
+        else:
+            try:
+                self.client.cancelorder(order_id=order_id, strategy=strategy_tag)
+            except Exception as exc:
+                Log.warning(f"[{leg_key}] cancelorder failed while abandoning entry "
+                            f"({exc}) -- clearing local position anyway; verify "
+                            f"manually at the broker that nothing is resting.")
+            if leg_key.endswith("_repair"):
+                for field_name, value in asdict(RepairLeg()).items():
+                    setattr(leg, field_name, value)
+            else:
+                setattr(self.store.state.instruments[inst.name],
+                        "pe" if leg_key.endswith("_PE") else "ce", OptionLeg())
+            self._save_state()
+        self._pending_fills.discard(leg_key)
+        _, fresh_leg, _ = self._resolve_leg_key(leg_key)
+        push_leg_error(self.env, leg_key, fresh_leg, clear=True)
+        ack_pending_action(self.env, leg_key)
+
+    def _force_close_instrument(self, inst: InstrumentConfig, inst_state: InstrumentState, reason: str):
+        if inst_state.pe.entry_filled:
+            self._close_open_leg(inst, f"{inst.name}_PE", inst_state.pe, "LONG", reason)
+        if inst_state.ce.entry_filled:
+            self._close_open_leg(inst, f"{inst.name}_CE", inst_state.ce, "LONG", reason)
+        if inst_state.pe_repair.entry_filled:
+            self._close_open_leg(inst, f"{inst.name}_PE_repair", inst_state.pe_repair, "SHORT", reason)
+        if inst_state.ce_repair.entry_filled:
+            self._close_open_leg(inst, f"{inst.name}_CE_repair", inst_state.ce_repair, "SHORT", reason)
+
+        # Only mark this instrument fully exited once every entry_filled leg
+        # actually closed. _close_open_leg now catches a rejected/cancelled
+        # exit order and returns cleanly (rather than raising) so a stuck
+        # leg doesn't abort the whole cycle -- but that means this function
+        # always reaches this point regardless of whether a leg's close
+        # actually succeeded. Setting exited_today=True unconditionally here
+        # would permanently stop retrying a leg that's still open at the
+        # broker (run_cycle skips any instrument with exited_today=True).
+        # Checking .closed on every entry_filled leg keeps the retry alive
+        # next cycle for whichever leg(s) didn't finish.
+        all_closed = all(
+            leg.closed for leg in
+            (inst_state.pe, inst_state.ce, inst_state.pe_repair, inst_state.ce_repair)
+            if leg.entry_filled
+        )
+        if all_closed:
+            inst_state.exited_today = True
+        self._save_state()
+
+    def _aggregate_unrealized_pnl(self, inst: InstrumentConfig,
+                                   inst_state: InstrumentState) -> Optional[float]:
+        total = 0.0
+        any_open = False
+        for leg, direction in ((inst_state.pe, "LONG"), (inst_state.ce, "LONG"),
+                                (inst_state.pe_repair, "SHORT"), (inst_state.ce_repair, "SHORT")):
+            if not leg.entry_filled or leg.closed:
+                continue
+            any_open = True
+            # Live option LTP from the WebSocket cache (pushed, not polled)
+            # -- falls back to a single one-off REST quotes() call for
+            # just this symbol if the feed is stale/missing.
+            ltp = self.price_stream.get_ltp(leg.symbol, inst.options_exchange, max_age=config.ws_stale_seconds)
+            if ltp is None:
+                ltp = fetch_symbol_ltp(self.ltp_client, leg.symbol, inst.options_exchange)
+            if ltp is None:
+                return None  # can't compute a trustworthy aggregate this cycle
+            total += (ltp - leg.entry_px) * leg.quantity if direction == "LONG" else (leg.entry_px - ltp) * leg.quantity
+        return total if any_open else None
+
+    def report_pnl_tick(self):
+        """Runs on its OWN scheduler job at config.pnl_tick_interval (1s),
+        completely decoupled from run_cycle's scheduler_interval (10s). PnL
+        is purely observational -- it never feeds a trading decision (the
+        real decision-affecting aggregate, used for the universal_exit_pnl
+        breach check, stays in _aggregate_unrealized_pnl, untouched) -- so
+        this can refresh far more often than the main cycle without any of
+        the blocking-call risk scheduler_interval exists to protect
+        against. Reads ONLY the WebSocket price cache (price_stream.get_ltp)
+        -- deliberately NEVER a REST fallback here, since a 1-second job
+        doing a REST quotes() call per open leg would spam the broker all
+        day. If a leg's feed is momentarily stale, its PnL just holds at
+        its last-known value for this tick rather than making a network
+        call from this job."""
+        try:
+            open_positions = []
+            for inst in INSTRUMENTS:
+                inst_state = self.store.state.instruments[inst.name]
+                for leg_key_suffix, leg, direction in (
+                    ("PE", inst_state.pe, "LONG"), ("CE", inst_state.ce, "LONG"),
+                    ("PE_repair", inst_state.pe_repair, "SHORT"), ("CE_repair", inst_state.ce_repair, "SHORT"),
+                ):
+                    if not leg.entry_filled or leg.closed:
+                        continue
+                    ltp = self.price_stream.get_ltp(
+                        leg.symbol, inst.options_exchange, max_age=config.ws_stale_seconds
+                    )
+                    if ltp is None:
+                        continue
+                    pnl = ((ltp - leg.entry_px) * leg.quantity if direction == "LONG"
+                           else (leg.entry_px - ltp) * leg.quantity)
+                    open_positions.append({
+                        "leg_key": f"{inst.name}_{leg_key_suffix}", "symbol": leg.symbol, "direction": direction,
+                        "quantity": leg.quantity, "entry_price": leg.entry_px, "current_price": ltp, "pnl": pnl,
+                        "entry_time": leg.entry_time, "execution_id": leg.execution_id,
+                    })
+            report_pnl_to_platform(self.env, self.store.state.today_realized_pnl, open_positions)
+        except Exception as exc:
+            Log.exception(f"report_pnl_tick failed: {exc}")
+
+    # ---- main cycle -----------------------------------------------------
+    def _handle_force_exit(self) -> bool:
+        """Force-closes every leg currently holding a position, regardless of
+        the strategy's own signal/exit logic -- called from run_cycle while a
+        Force Exit is pending (see check_force_exit). SHORT (repair) legs are
+        closed BEFORE LONG (straddle) legs, per explicit requirement for this
+        button -- distinct from _force_close_instrument's LONG-then-SHORT
+        order (used by the universal-exit-time/aggregate-pnl-breach
+        triggers), which is left unchanged. Reuses _close_open_leg, so it's
+        idempotent/resumable across cycles and a leg already in error mode is
+        left untouched (the user must resolve it via Retry/Cancel/Manual
+        first). Returns True only once every leg is fully flat, which is
+        what lets run_cycle report completion back to the platform."""
+        all_flat = True
+        for inst in INSTRUMENTS:
+            inst_state = self.store.state.instruments[inst.name]
+            for leg_key_suffix, leg, direction in (
+                ("PE_repair", inst_state.pe_repair, "SHORT"), ("CE_repair", inst_state.ce_repair, "SHORT"),
+                ("PE", inst_state.pe, "LONG"), ("CE", inst_state.ce, "LONG"),
+            ):
+                if not leg.entry_filled or leg.closed:
+                    continue
+                leg_key = f"{inst.name}_{leg_key_suffix}"
+                if leg.error_state:
+                    Log.warning(f"[{leg_key}] Force Exit waiting on an unresolved error "
+                                f"({leg.error_state}/{leg.error_kind}) -- resolve it via "
+                                f"Retry/Cancel/Manually Completed first.")
+                    all_flat = False
+                    continue
+                all_flat = False
+                self._close_open_leg(inst, leg_key, leg, direction, "force_exit")
+        return all_flat
+
+    def run_cycle(self):
+        try:
+            self._reset_day_if_needed()
+
+            if check_force_exit(self.env):
+                if self._handle_force_exit():
+                    Log.warning("Force Exit complete -- all positions flat. Stopping.")
+                    ack_force_exit_complete(self.env)
+                return
+
+            if not self._within_market_hours():
+                return
+
+            today = datetime.now(IST).date()
+            now_time = datetime.now(IST).time()
+            past_universal_exit_time = self._past_universal_exit_time()
+
+            for inst in INSTRUMENTS:
+                inst_state = self.store.state.instruments[inst.name]
+
+                # Check pending actions for any leg currently in error mode, and
+                # finalize any leg whose exit already completed in the background
+                # but hasn't been written to the trade log yet -- both regardless
+                # of what phase this instrument is in below (exited_today/
+                # traded_today/aggregate PnL), since an errored or
+                # filled-but-not-yet-finalized leg must always get resolved.
+                # Without this, a leg force-closed for an aggregate-PnL breach
+                # that then recovers before the async fill lands would never be
+                # revisited by _close_open_leg again (only the universal-exit-time
+                # and aggregate-PnL branches below call it). See
+                # docs/prd/python-strategies-order-error-recovery.md.
+                for leg_key, leg, direction in (
+                    (f"{inst.name}_PE", inst_state.pe, "LONG"),
+                    (f"{inst.name}_CE", inst_state.ce, "LONG"),
+                    (f"{inst.name}_PE_repair", inst_state.pe_repair, "SHORT"),
+                    (f"{inst.name}_CE_repair", inst_state.ce_repair, "SHORT"),
+                ):
+                    if leg.error_state:
+                        pending = check_pending_action(self.env, leg_key)
+                        if pending is not None:
+                            self._resolve_leg_error(leg_key, inst, pending)
+                    elif leg.exit_filled and not leg.closed:
+                        self._finalize_close(inst, leg_key, leg, direction, reason="force_close")
+
+                if inst_state.exited_today:
+                    continue
+
+                if past_universal_exit_time:
+                    if inst_state.traded_today:
+                        Log.warning(f"[{inst.name}] Universal exit time reached; force-closing.")
+                        self._force_close_instrument(inst, inst_state, reason="universal_exit_time")
+                    continue
+
+                if inst_state.traded_today:
+                    agg_pnl = self._aggregate_unrealized_pnl(inst, inst_state)
+                    if agg_pnl is not None and agg_pnl <= config.universal_exit_pnl:
+                        Log.warning(f"[{inst.name}] Aggregate unrealized PnL {agg_pnl:.0f} breached "
+                                    f"{config.universal_exit_pnl} -> force-closing.")
+                        self._force_close_instrument(inst, inst_state, reason="universal_exit_pnl")
+                        continue
+
+                    self._maybe_fire_repair(inst, inst_state, "PE", inst_state.pe, inst_state.pe_repair)
+                    self._maybe_fire_repair(inst, inst_state, "CE", inst_state.ce, inst_state.ce_repair)
+                    continue
+
+                if not (now_time > config.entry_start) and not config.test_mode:
+                    continue
+
+                try:
+                    _, expiry_date = self._get_week_expiry(inst)
+                except Exception as exc:
+                    Log.warning(f"[{inst.name}] Could not resolve expiry: {exc}")
+                    continue
+                if expiry_date != today and not config.test_mode:
+                    continue  # not this instrument's expiry day -- no entry
+
+                # Live underlying LTP from the WebSocket cache (pushed, not
+                # polled) -- falls back to a single one-off REST quotes()
+                # call for just this instrument if the feed is stale/missing.
+                spot = self.price_stream.get_ltp(
+                    inst.name, inst.underlying_exchange, max_age=config.ws_stale_seconds
+                )
+                if spot is None:
+                    spot = fetch_ltp(self.ltp_client, inst)
+                if spot is None:
+                    continue
+
+                self._enter_straddle(inst, inst_state, spot)
+
+        except Exception as exc:
+            Log.exception(f"Cycle failed: {exc}")
+
+
+###############################################################################
+# STARTUP
+###############################################################################
+def print_banner():
+    print("=" * 70)
+    print(config.strategy_name)
+    print("=" * 70)
+    print(f"Version              : {config.version}")
+    print(f"Instruments          : {', '.join(i.name for i in INSTRUMENTS)}")
+    print(f"Entry (once/day)     : > {config.entry_start}, ONLY on that instrument's own expiry day")
+    print(f"Universal exit       : PnL <= {config.universal_exit_pnl} OR time >= {config.universal_exit_time}")
+    print(f"Repair               : fires immediately once the straddle leg on that side fills")
+    print("⚠️  LONG STRADDLE THAT CONVERTS TO NAKED SHORT VIA REPAIR -- RISK PROFILE CHANGES MID-TRADE ⚠️")
+    if config.test_mode:
+        print("⚠️  TEST MODE ENABLED -- market-hours/entry-day/entry-time checks are BYPASSED")
+    print("=" * 70)
+
+
+def main():
+    print_banner()
+
+    env = Environment()
+    _migrate_trade_log_if_needed(env.strategy_tag)
+    state_store = StateStore(env)
+    state_store.load()
+
+    # New execution number for this process run -- see OptionLeg.execution_id
+    # and the Trades UI's execution dropdown.
+    state_store.state.last_execution_id += 1
+    execution_id = state_store.state.last_execution_id
+    state_store.save()
+
+    broker = Broker(env)
+    client = broker.connect()
+    ltp_client = broker.connect_ltp_client()
+
+    price_stream = PriceStream(client)
+    price_stream.start()
+
+    # Fixed set: both underlyings, needed continuously for ATM strike
+    # selection at entry. Dynamic set: any leg already entry_filled and not
+    # closed from a same-day restart (straddle and/or repair legs that
+    # opened earlier today before this process started).
+    seed_instruments = [
+        {"symbol": inst.name, "exchange": inst.underlying_exchange} for inst in INSTRUMENTS
+    ]
+    today_key = datetime.now(IST).date().isoformat()
+    if state_store.state.current_day == today_key:
+        for inst in INSTRUMENTS:
+            inst_state = state_store.state.instruments[inst.name]
+            for leg in (inst_state.pe, inst_state.ce, inst_state.pe_repair, inst_state.ce_repair):
+                if leg.entry_filled and not leg.closed:
+                    seed_instruments.append({"symbol": leg.symbol, "exchange": inst.options_exchange})
+    price_stream.add_instruments(seed_instruments)
+
+    print()
+    print("=" * 70)
+    print("HEALTH CHECK")
+    print("=" * 70)
+    print(f"OpenAlgo Connected : {broker.connected}")
+    print(f"State File         : OK ({state_store.path})")
+    print(f"Execution ID       : {execution_id}")
+    print(f"Price Stream       : starting ({seed_instruments})")
+    print("=" * 70)
+
+    engine = StrategyEngine(client, state_store, env, price_stream, execution_id=execution_id,
+                             ltp_client=ltp_client)
+
+    # Restart while a leg was in error mode: STRATEGY_ERRORS on the platform
+    # side is in-memory only, so re-push any already-erroring leg once here --
+    # otherwise the UI badge would silently vanish across a restart even
+    # though the leg is still frozen awaiting a decision. See
+    # docs/prd/python-strategies-order-error-recovery.md.
+    for inst_name, inst_state in state_store.state.instruments.items():
+        for suffix, leg in (("PE", inst_state.pe), ("CE", inst_state.ce),
+                            ("PE_repair", inst_state.pe_repair), ("CE_repair", inst_state.ce_repair)):
+            if leg.error_state:
+                leg_key = f"{inst_name}_{suffix}"
+                direction = "SHORT" if suffix.endswith("_repair") else "LONG"
+                entry_action = "BUY" if direction == "LONG" else "SELL"
+                exit_action = "SELL" if direction == "LONG" else "BUY"
+                action = entry_action if leg.error_state == "entry_failed" else exit_action
+                push_leg_error(env, leg_key, leg, action=action)
+                Log.error(f"[{leg_key}] Resuming with an unresolved error from before restart "
+                          f"({leg.error_state}/{leg.error_kind}) -- "
+                          f"needs Retry/Cancel/Manually Completed.")
+
+    Log.info("Strategy Initialization Complete. Starting scheduler...")
+
+    scheduler = BlockingScheduler(timezone=IST)
+    scheduler.add_job(
+        engine.run_cycle,
+        trigger=IntervalTrigger(seconds=config.scheduler_interval),
+        id="strategy_cycle",
+        max_instances=1,
+        coalesce=True,
+    )
+    # Separate, faster job purely for PnL -- see report_pnl_tick's own
+    # docstring for why this is safe to run far more often than the main
+    # strategy cycle (cache-only, never a REST call).
+    scheduler.add_job(
+        engine.report_pnl_tick,
+        trigger=IntervalTrigger(seconds=config.pnl_tick_interval),
+        id="pnl_tick",
+        max_instances=1,
+        coalesce=True,
+    )
+    try:
+        scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        Log.info("Shutting down scheduler.")
+        scheduler.shutdown(wait=False)
+        price_stream.stop()
+
+
+###############################################################################
+# MAIN
+###############################################################################
+if __name__ == "__main__":
+    main()
