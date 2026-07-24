@@ -726,7 +726,8 @@ export default function PythonStrategyIndex() {
                     <TooltipTrigger asChild>
                       <Button variant="outline" size="sm" asChild>
                         <Link to={`/python/${strategy.id}/trades`}>
-                          <Receipt className="h-4 w-4" />
+                          <Receipt className="h-4 w-4 mr-1" />
+                          <span className="text-xs">Trades</span>
                         </Link>
                       </Button>
                     </TooltipTrigger>
@@ -760,7 +761,8 @@ export default function PythonStrategyIndex() {
                     <TooltipTrigger asChild>
                       <Button variant="outline" size="sm" asChild>
                         <Link to={`/python/${strategy.id}/logs`}>
-                          <FileText className="h-4 w-4" />
+                          <FileText className="h-4 w-4 mr-1" />
+                          <span className="text-xs">Logs</span>
                         </Link>
                       </Button>
                     </TooltipTrigger>
@@ -771,7 +773,8 @@ export default function PythonStrategyIndex() {
                     <TooltipTrigger asChild>
                       <Button variant="outline" size="sm" asChild>
                         <Link to={`/python/${strategy.id}/edit`}>
-                          <FileCode className="h-4 w-4" />
+                          <FileCode className="h-4 w-4 mr-1" />
+                          <span className="text-xs">Edit</span>
                         </Link>
                       </Button>
                     </TooltipTrigger>
