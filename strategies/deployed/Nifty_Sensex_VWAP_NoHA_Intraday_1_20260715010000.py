@@ -557,12 +557,12 @@ class PriceStream:
                 all_instruments = list(self._instruments.values())
             if all_instruments:
                 self.client.unsubscribe_ltp(all_instruments)
-        except Exception:
-            pass
+        except Exception as exc:
+            Log.warning(f"[PriceStream] unsubscribe_ltp failed during teardown: {exc}")
         try:
             self.client.disconnect()
-        except Exception:
-            pass
+        except Exception as exc:
+            Log.warning(f"[PriceStream] disconnect failed during teardown: {exc}")
 
     def _watchdog_loop(self):
         backoffs = (1, 2, 5, 10, 30)
@@ -1295,6 +1295,13 @@ class StrategyEngine:
         self._fill_executor = ThreadPoolExecutor(
             max_workers=len(LEG_KEYS), thread_name_prefix="fillwatch"
         )
+        # Guards the ATM-lock background dispatch (see _lock_atm_if_needed_bg)
+        # -- _lock_atm_if_needed's chain fetch (client.history() +
+        # client.expiry() + client.optionchain(), up to 3 broker round-trips)
+        # is the same call shape that caused the documented 2026-07-24
+        # production stall; this keeps a slow fetch from being resubmitted on
+        # top of itself if it outlives one scheduler_interval.
+        self._atm_lock_pending: set[str] = set()
         # Guards _get_option_signal so it submits at most one in-flight
         # option-signal refresh per leg at a time -- without this, a refresh
         # that takes longer than indicator_refresh_interval to complete would
@@ -1403,6 +1410,35 @@ class StrategyEngine:
         if settled.empty:
             settled = raw
         return float(settled["close"].iloc[-1])
+
+    def _lock_atm_if_needed_bg(self, inst: InstrumentConfig):
+        """Dispatch wrapper for _lock_atm_if_needed -- its spot-history fetch
+        plus expiry/chain lookup (up to 3 real broker round-trips on the main
+        client) is the exact call shape that caused the documented
+        2026-07-24 production stall when run inline in run_cycle, worst case
+        blocking every instrument's signal/exit check for ~60s if both
+        instruments lock in the same cycle. Runs on _fill_executor instead;
+        guarded per instrument so a slow fetch that outlives one
+        scheduler_interval isn't resubmitted on top of itself. Cheap no-op
+        dispatch once already locked (the function's own early-return), so
+        no separate gate is needed for the steady-state case."""
+        guard_key = inst.name
+        if guard_key in self._atm_lock_pending:
+            return
+        lock = self.store.state.instrument_locks[inst.name]
+        if lock.locked:
+            return  # avoid executor overhead entirely once locked for the day
+        self._atm_lock_pending.add(guard_key)
+
+        def _run():
+            try:
+                self._lock_atm_if_needed(inst)
+            except Exception as exc:
+                Log.exception(f"[{inst.name}] ATM lock (background) failed: {exc}")
+            finally:
+                self._atm_lock_pending.discard(guard_key)
+
+        self._fill_executor.submit(_run)
 
     def _lock_atm_if_needed(self, inst: InstrumentConfig):
         lock = self.store.state.instrument_locks[inst.name]
@@ -1706,75 +1742,18 @@ class StrategyEngine:
         kind = pos.error_kind
 
         if action["action"] == "retry":
-            if was_exit:
-                # _exit_leg IS reliably called again on a later cycle regardless
-                # of exit_condition's value (see the exit_already_committed
-                # gate in run_cycle) -- and its body unconditionally resumes
-                # watching whatever exit_order_id is currently set. So the exit
-                # side only needs the reprice (if resting) + clearing the error
-                # fields; the normal flow does the rest.
-                if kind == "resting":
-                    fresh_ltp = fetch_symbol_ltp(self.ltp_client, pos.symbol, inst.options_exchange)
-                    if fresh_ltp is not None:
-                        try:
-                            self.client.modifyorder(
-                                order_id=pos.error_order_id, strategy=self.env.strategy_tag,
-                                symbol=pos.symbol, action="BUY",
-                                exchange=inst.options_exchange, price_type="LIMIT",
-                                product=config.product, quantity=str(pos.quantity),
-                                price=str(fresh_ltp), disclosed_quantity="0", trigger_price="0",
-                            )
-                        except Exception as exc:
-                            Log.warning(f"[{leg_key}] Retry's reprice failed ({exc}) -- "
-                                        f"resuming the watcher on the order as-is anyway.")
-                    # exit_order_id already equals error_order_id -- _exit_leg's
-                    # own "if not pos.exit_order_id" guard stays false and it
-                    # resumes watching this same order on its next call.
-                else:  # kind == "terminal" -- nothing resting, must place fresh
-                    pos.exit_order_id = ""  # _exit_leg places a brand-new close order next cycle
-                pos.error_state = ""
-                pos.error_kind = ""
-                pos.error_order_id = ""
-                self._save_state()
-                push_leg_error(self.env, leg_key, pos, clear=True)
-                ack_pending_action(self.env, leg_key)
-                return
-
-            # Entry side: unlike exit, run_cycle only ever calls _enter_leg
-            # when pos.symbol is EMPTY (has_position is false) -- and an
-            # entry attempt already in error mode has pos.symbol set from the
-            # moment the attempt began. run_cycle would therefore never call
-            # _enter_leg again to resume this leg; Retry has to directly
-            # (re)submit the watcher itself instead of relying on a normal-flow
-            # path that structurally cannot fire for an in-progress entry.
-            if kind == "resting":
-                fresh_ltp = fetch_symbol_ltp(self.ltp_client, pos.symbol, inst.options_exchange)
-                if fresh_ltp is not None:
-                    try:
-                        self.client.modifyorder(
-                            order_id=pos.error_order_id, strategy=self.env.strategy_tag,
-                            symbol=pos.symbol, action="SELL",
-                            exchange=inst.options_exchange, price_type="LIMIT",
-                            product=config.product, quantity=str(pos.quantity),
-                            price=str(fresh_ltp), disclosed_quantity="0", trigger_price="0",
-                        )
-                    except Exception as exc:
-                        Log.warning(f"[{leg_key}] Retry's reprice failed ({exc}) -- resuming "
-                                    f"the watcher on the order as-is anyway.")
-                resume_order_id = pos.error_order_id
-            else:  # kind == "terminal" -- nothing resting, place a genuinely new order
-                resume_order_id = place(self.client, self.env.strategy_tag, pos.symbol,
-                                         inst.options_exchange, "SELL", pos.quantity)
-                pos.entry_order_id = resume_order_id
-            pos.error_state = ""
-            pos.error_kind = ""
-            pos.error_order_id = ""
-            self._save_state()
-            push_leg_error(self.env, leg_key, pos, clear=True)
-            ack_pending_action(self.env, leg_key)
+            # The actual broker calls (reprice via modifyorder, or a fresh
+            # place() for a terminal rejection) run on _fill_executor, not
+            # inline -- a user clicking Retry must not block run_cycle's
+            # per-cycle signal/exit checks for every other leg for a full
+            # broker round-trip. Guard + ack happen here, synchronously and
+            # cheaply, so run_cycle's error-check dispatch can't re-fire this
+            # same action again on the next cycle while resolution is still
+            # in flight.
             self._pending_fills.add(leg_key)
+            ack_pending_action(self.env, leg_key)
             self._fill_executor.submit(
-                self._watch_entry_fill, leg_key, inst, resume_order_id, pos.symbol, pos.quantity
+                self._do_retry_resolution, leg_key, inst, was_exit, kind
             )
             return
 
@@ -1828,6 +1807,91 @@ class StrategyEngine:
             self._save_state()
             push_leg_error(self.env, leg_key, pos, clear=True)
             ack_pending_action(self.env, leg_key)
+
+    def _do_retry_resolution(self, leg_key: str, inst: InstrumentConfig, was_exit: bool, kind: str):
+        """The actual broker calls behind a Retry action (reprice via
+        modifyorder, or a fresh place() for a terminal rejection) -- moved
+        off the main scheduler thread by _resolve_leg_error, which has
+        already added leg_key to _pending_fills and ack'd the action before
+        submitting this. Discards leg_key from _pending_fills itself UNLESS
+        it hands off to _watch_entry_fill, which owns that guard from then
+        on (mirrors _watch_entry_fill/_watch_exit_fill/_watch_entry_cancel's
+        own finally-discard pattern)."""
+        try:
+            leg = self.store.state.legs[leg_key]
+            pos = leg.position
+            if was_exit:
+                # _exit_leg IS reliably called again on a later cycle regardless
+                # of exit_condition's value (see the exit_already_committed
+                # gate in run_cycle) -- and its body unconditionally resumes
+                # watching whatever exit_order_id is currently set. So the exit
+                # side only needs the reprice (if resting) + clearing the error
+                # fields; the normal flow does the rest.
+                if kind == "resting":
+                    fresh_ltp = fetch_symbol_ltp(self.ltp_client, pos.symbol, inst.options_exchange)
+                    if fresh_ltp is not None:
+                        try:
+                            self.client.modifyorder(
+                                order_id=pos.error_order_id, strategy=self.env.strategy_tag,
+                                symbol=pos.symbol, action="BUY",
+                                exchange=inst.options_exchange, price_type="LIMIT",
+                                product=config.product, quantity=str(pos.quantity),
+                                price=str(fresh_ltp), disclosed_quantity="0", trigger_price="0",
+                            )
+                        except Exception as exc:
+                            Log.warning(f"[{leg_key}] Retry's reprice failed ({exc}) -- "
+                                        f"resuming the watcher on the order as-is anyway.")
+                    # exit_order_id already equals error_order_id -- _exit_leg's
+                    # own "if not pos.exit_order_id" guard stays false and it
+                    # resumes watching this same order on its next call.
+                else:  # kind == "terminal" -- nothing resting, must place fresh
+                    pos.exit_order_id = ""  # _exit_leg places a brand-new close order next cycle
+                pos.error_state = ""
+                pos.error_kind = ""
+                pos.error_order_id = ""
+                self._save_state()
+                push_leg_error(self.env, leg_key, pos, clear=True)
+                self._pending_fills.discard(leg_key)
+                return
+
+            # Entry side: unlike exit, run_cycle only ever calls _enter_leg
+            # when pos.symbol is EMPTY (has_position is false) -- and an
+            # entry attempt already in error mode has pos.symbol set from the
+            # moment the attempt began. run_cycle would therefore never call
+            # _enter_leg again to resume this leg; Retry has to directly
+            # (re)submit the watcher itself instead of relying on a normal-flow
+            # path that structurally cannot fire for an in-progress entry.
+            if kind == "resting":
+                fresh_ltp = fetch_symbol_ltp(self.ltp_client, pos.symbol, inst.options_exchange)
+                if fresh_ltp is not None:
+                    try:
+                        self.client.modifyorder(
+                            order_id=pos.error_order_id, strategy=self.env.strategy_tag,
+                            symbol=pos.symbol, action="SELL",
+                            exchange=inst.options_exchange, price_type="LIMIT",
+                            product=config.product, quantity=str(pos.quantity),
+                            price=str(fresh_ltp), disclosed_quantity="0", trigger_price="0",
+                        )
+                    except Exception as exc:
+                        Log.warning(f"[{leg_key}] Retry's reprice failed ({exc}) -- resuming "
+                                    f"the watcher on the order as-is anyway.")
+                resume_order_id = pos.error_order_id
+            else:  # kind == "terminal" -- nothing resting, place a genuinely new order
+                resume_order_id = place(self.client, self.env.strategy_tag, pos.symbol,
+                                         inst.options_exchange, "SELL", pos.quantity)
+                pos.entry_order_id = resume_order_id
+            pos.error_state = ""
+            pos.error_kind = ""
+            pos.error_order_id = ""
+            self._save_state()
+            push_leg_error(self.env, leg_key, pos, clear=True)
+            # _watch_entry_fill owns _pending_fills for this leg_key from here.
+            self._fill_executor.submit(
+                self._watch_entry_fill, leg_key, inst, resume_order_id, pos.symbol, pos.quantity
+            )
+        except Exception as exc:
+            Log.exception(f"[{leg_key}] Retry resolution failed unexpectedly: {exc}")
+            self._pending_fills.discard(leg_key)
 
     def _watch_entry_cancel(self, leg_key: str, inst: InstrumentConfig, order_id: str,
                              symbol: str, quantity: int):
@@ -1908,7 +1972,7 @@ class StrategyEngine:
                 return
 
             for inst in INSTRUMENTS:
-                self._lock_atm_if_needed(inst)
+                self._lock_atm_if_needed_bg(inst)
 
             if self._past_universal_exit():
                 for leg_key in LEG_KEYS:
@@ -2109,6 +2173,37 @@ def main():
             Log.error(f"[{leg_key}] Resuming with an unresolved error from before restart "
                       f"({leg.position.error_state}/{leg.position.error_kind}) -- "
                       f"needs Retry/Cancel/Manually Completed.")
+            continue
+
+        # Restart between order-placement and fill-confirmation: run_cycle
+        # only calls _enter_leg for a leg with NO position yet, and _exit_leg
+        # for one WITH a position -- neither path re-arms the fill watcher
+        # for a leg whose entry/exit order was placed but never confirmed
+        # before this process died. Without this, has_position stays True
+        # forever (blocking re-entry) while entry_filled never becomes True,
+        # and a later exit_condition could fire a closing order against an
+        # entry that was never confirmed filled at the broker.
+        pos = leg.position
+        inst_name = leg_key.split("_")[0]
+        inst = next((i for i in INSTRUMENTS if i.name == inst_name), None)
+        if inst is None:
+            continue
+        if pos.entry_order_id and not pos.entry_filled:
+            Log.warning(f"[{leg_key}] Resuming entry-fill watch for an order placed "
+                        f"before a restart (order_id={pos.entry_order_id}).")
+            engine._pending_fills.add(leg_key)
+            engine._fill_executor.submit(
+                engine._watch_entry_fill, leg_key, inst, pos.entry_order_id,
+                pos.symbol, pos.quantity
+            )
+        elif pos.exit_order_id and not pos.exit_filled:
+            Log.warning(f"[{leg_key}] Resuming exit-fill watch for an order placed "
+                        f"before a restart (order_id={pos.exit_order_id}).")
+            engine._pending_fills.add(leg_key)
+            engine._fill_executor.submit(
+                engine._watch_exit_fill, leg_key, inst, pos.exit_order_id,
+                pos.symbol, pos.quantity
+            )
 
     Log.info("Strategy Initialization Complete. Starting scheduler...")
 

@@ -545,12 +545,12 @@ class PriceStream:
                 all_instruments = list(self._instruments.values())
             if all_instruments:
                 self.client.unsubscribe_ltp(all_instruments)
-        except Exception:
-            pass
+        except Exception as exc:
+            Log.warning(f"[PriceStream] unsubscribe_ltp failed during teardown: {exc}")
         try:
             self.client.disconnect()
-        except Exception:
-            pass
+        except Exception as exc:
+            Log.warning(f"[PriceStream] disconnect failed during teardown: {exc}")
 
     def _watchdog_loop(self):
         backoffs = (1, 2, 5, 10, 30)
@@ -1238,6 +1238,11 @@ class StrategyEngine:
         self._fill_executor = ThreadPoolExecutor(
             max_workers=len(INSTRUMENTS) * 4, thread_name_prefix="fillwatch"
         )
+        # Guards the entry/repair chain-fetch background dispatch (see
+        # _enter_straddle_bg/_maybe_fire_repair_bg) -- separate from
+        # _pending_fills since it tracks "a chain fetch is in flight", not
+        # "a fill is being watched".
+        self._chain_pending: set[str] = set()
 
     def _save_state(self):
         """Every self.store.save() call in this engine goes through here --
@@ -1285,6 +1290,29 @@ class StrategyEngine:
         return datetime.now(IST).time() >= config.universal_exit_time
 
     # ---- entry (long straddle, once/day/instrument) -------------------------
+    def _enter_straddle_bg(self, inst: InstrumentConfig, inst_state: InstrumentState, spot: float):
+        """Dispatch wrapper for _enter_straddle -- its chain fetch
+        (fetch_chain -> client.optionchain()) is a real broker round-trip on
+        the main client (up to Environment.timeout), so it runs on
+        _fill_executor instead of inline in run_cycle, where it would block
+        every other instrument's signal/exit check for the same duration.
+        Guarded per instrument so a slow fetch that outlives one
+        scheduler_interval isn't resubmitted on top of itself."""
+        guard_key = f"{inst.name}_entry_chain"
+        if guard_key in self._chain_pending:
+            return
+        self._chain_pending.add(guard_key)
+
+        def _run():
+            try:
+                self._enter_straddle(inst, inst_state, spot)
+            except Exception as exc:
+                Log.exception(f"[{inst.name}] Straddle entry (background) failed: {exc}")
+            finally:
+                self._chain_pending.discard(guard_key)
+
+        self._fill_executor.submit(_run)
+
     def _enter_straddle(self, inst: InstrumentConfig, inst_state: InstrumentState, spot: float):
         strategy_tag = self.env.strategy_tag
         # The CURRENT (expiring-today) week's expiry -- per explicit
@@ -1407,12 +1435,51 @@ class StrategyEngine:
         push_leg_error(self.env, leg_key, leg, action=action)
 
     # ---- repair (search-and-sell, at most once per side per day) -----------
+    def _maybe_fire_repair_bg(self, inst: InstrumentConfig, inst_state: InstrumentState,
+                               option_type: str, straddle_leg: OptionLeg, repair_leg: RepairLeg):
+        """Dispatch wrapper for _maybe_fire_repair -- its chain fetch
+        (fetch_chain -> client.optionchain()) is a real broker round-trip on
+        the main client, so it runs on _fill_executor instead of inline in
+        run_cycle. Guarded per leg so a slow fetch that outlives one
+        scheduler_interval isn't resubmitted on top of itself. Cheap when
+        repair_leg.fired is already True (just a fill-watcher resume check),
+        but still dispatched through the same guard for simplicity/safety."""
+        guard_key = f"{inst.name}_{option_type}_repair_chain"
+        if guard_key in self._chain_pending:
+            return
+        self._chain_pending.add(guard_key)
+
+        def _run():
+            try:
+                self._maybe_fire_repair(inst, inst_state, option_type, straddle_leg, repair_leg)
+            except Exception as exc:
+                Log.exception(f"[{inst.name}_{option_type}_repair] Repair fire (background) failed: {exc}")
+            finally:
+                self._chain_pending.discard(guard_key)
+
+        self._fill_executor.submit(_run)
+
     def _maybe_fire_repair(self, inst: InstrumentConfig, inst_state: InstrumentState,
                             option_type: str, straddle_leg: OptionLeg, repair_leg: RepairLeg):
         # Fires the very first cycle after the straddle leg is fully filled --
         # no artificial delay, per explicit instruction (the short repair
         # leg goes on immediately, not after any wait).
-        if repair_leg.fired or not straddle_leg.entry_filled:
+        leg_key = f"{inst.name}_{option_type}_repair"
+        if repair_leg.fired:
+            # Already fired earlier today (or before a restart). If the fill
+            # was never confirmed (process died between place() and the
+            # watcher resolving it), not frozen in error, and not already
+            # being watched in this process, resume the watcher here --
+            # otherwise this leg's `fired=True` latch permanently orphans a
+            # live naked short with nothing tracking its fill.
+            if (not repair_leg.entry_filled and not repair_leg.error_state
+                    and repair_leg.entry_order_id and leg_key not in self._pending_fills):
+                Log.warning(f"[{leg_key}] Resuming fill watch for a repair order placed "
+                            f"before a restart (order_id={repair_leg.entry_order_id}).")
+                self._pending_fills.add(leg_key)
+                self._fill_executor.submit(self._watch_entry_fill, leg_key, repair_leg.entry_order_id)
+            return
+        if not straddle_leg.entry_filled:
             return
 
         target_price = straddle_leg.entry_px / inst.repair_n
@@ -1446,7 +1513,6 @@ class StrategyEngine:
         )
 
         strategy_tag = self.env.strategy_tag
-        leg_key = f"{inst.name}_{option_type}_repair"
         if not repair_leg.entry_order_id:
             repair_leg.entry_order_id = place(self.client, strategy_tag, repair_leg.symbol,
                                                inst.options_exchange, "SELL", repair_leg.quantity)
@@ -1566,69 +1632,19 @@ class StrategyEngine:
         exit_action = "SELL" if direction == "LONG" else "BUY"
 
         if action["action"] == "retry":
-            if was_exit:
-                # _close_open_leg IS reliably called again on a later cycle
-                # (run_cycle's per-instrument error-check pass above, plus the
-                # universal-exit-time/aggregate-PnL branches while they're
-                # active) -- and its body unconditionally resumes watching
-                # whatever exit_order_id is currently set. So the exit side
-                # only needs the reprice (if resting) + clearing the error
-                # fields; the normal flow does the rest.
-                if kind == "resting":
-                    fresh_ltp = fetch_symbol_ltp(self.ltp_client, leg.symbol, inst.options_exchange)
-                    if fresh_ltp is not None:
-                        try:
-                            self.client.modifyorder(
-                                order_id=leg.error_order_id, strategy=self.env.strategy_tag,
-                                symbol=leg.symbol, action=exit_action,
-                                exchange=inst.options_exchange, price_type="LIMIT",
-                                product=config.product, quantity=str(leg.quantity),
-                                price=str(fresh_ltp), disclosed_quantity="0", trigger_price="0",
-                            )
-                        except Exception as exc:
-                            Log.warning(f"[{leg_key}] Retry's reprice failed ({exc}) -- "
-                                        f"resuming the watcher on the order as-is anyway.")
-                else:  # kind == "terminal" -- nothing resting, must place fresh
-                    leg.exit_order_id = ""  # _close_open_leg places a brand-new close order next cycle
-                leg.error_state = ""
-                leg.error_kind = ""
-                leg.error_order_id = ""
-                self._save_state()
-                push_leg_error(self.env, leg_key, leg, clear=True)
-                ack_pending_action(self.env, leg_key)
-                return
-
-            # Entry side: unlike exit, nothing in run_cycle calls
-            # _enter_straddle/_maybe_fire_repair again for a leg that already
-            # has a symbol (has_position-equivalent is already true) --
-            # Retry has to directly (re)submit the watcher itself.
-            if kind == "resting":
-                fresh_ltp = fetch_symbol_ltp(self.ltp_client, leg.symbol, inst.options_exchange)
-                if fresh_ltp is not None:
-                    try:
-                        self.client.modifyorder(
-                            order_id=leg.error_order_id, strategy=self.env.strategy_tag,
-                            symbol=leg.symbol, action=entry_action,
-                            exchange=inst.options_exchange, price_type="LIMIT",
-                            product=config.product, quantity=str(leg.quantity),
-                            price=str(fresh_ltp), disclosed_quantity="0", trigger_price="0",
-                        )
-                    except Exception as exc:
-                        Log.warning(f"[{leg_key}] Retry's reprice failed ({exc}) -- resuming "
-                                    f"the watcher on the order as-is anyway.")
-                resume_order_id = leg.error_order_id
-            else:  # kind == "terminal" -- nothing resting, place a genuinely new order
-                resume_order_id = place(self.client, self.env.strategy_tag, leg.symbol,
-                                         inst.options_exchange, entry_action, leg.quantity)
-                leg.entry_order_id = resume_order_id
-            leg.error_state = ""
-            leg.error_kind = ""
-            leg.error_order_id = ""
-            self._save_state()
-            push_leg_error(self.env, leg_key, leg, clear=True)
-            ack_pending_action(self.env, leg_key)
+            # The actual broker calls (reprice via modifyorder, or a fresh
+            # place() for a terminal rejection) run on _fill_executor, not
+            # inline -- a user clicking Retry must not block run_cycle's
+            # per-cycle signal/exit checks for every other leg for a full
+            # broker round-trip. Guard + ack happen here, synchronously and
+            # cheaply, so run_cycle's error-check dispatch can't re-fire this
+            # same action again on the next cycle while resolution is still
+            # in flight.
             self._pending_fills.add(leg_key)
-            self._fill_executor.submit(self._watch_entry_fill, leg_key, resume_order_id)
+            ack_pending_action(self.env, leg_key)
+            self._fill_executor.submit(
+                self._do_retry_resolution, leg_key, inst, direction, was_exit, kind
+            )
             return
 
         if action["action"] == "cancel":
@@ -1696,6 +1712,86 @@ class StrategyEngine:
             self._save_state()
             push_leg_error(self.env, leg_key, leg, clear=True)
             ack_pending_action(self.env, leg_key)
+
+    def _do_retry_resolution(self, leg_key: str, inst: InstrumentConfig, direction: str,
+                              was_exit: bool, kind: str):
+        """The actual broker calls behind a Retry action (reprice via
+        modifyorder, or a fresh place() for a terminal rejection) -- moved
+        off the main scheduler thread by _resolve_leg_error, which has
+        already added leg_key to _pending_fills and ack'd the action before
+        submitting this. Discards leg_key from _pending_fills itself UNLESS
+        it hands off to _watch_entry_fill, which owns that guard from then
+        on (mirrors _watch_entry_fill/_watch_exit_fill/_watch_entry_cancel's
+        own finally-discard pattern)."""
+        entry_action = "BUY" if direction == "LONG" else "SELL"
+        exit_action = "SELL" if direction == "LONG" else "BUY"
+        try:
+            _, leg, _ = self._resolve_leg_key(leg_key)
+            if was_exit:
+                # _close_open_leg IS reliably called again on a later cycle
+                # (run_cycle's per-instrument error-check pass, plus the
+                # universal-exit-time/aggregate-PnL branches while they're
+                # active) -- and its body unconditionally resumes watching
+                # whatever exit_order_id is currently set. So the exit side
+                # only needs the reprice (if resting) + clearing the error
+                # fields; the normal flow does the rest.
+                if kind == "resting":
+                    fresh_ltp = fetch_symbol_ltp(self.ltp_client, leg.symbol, inst.options_exchange)
+                    if fresh_ltp is not None:
+                        try:
+                            self.client.modifyorder(
+                                order_id=leg.error_order_id, strategy=self.env.strategy_tag,
+                                symbol=leg.symbol, action=exit_action,
+                                exchange=inst.options_exchange, price_type="LIMIT",
+                                product=config.product, quantity=str(leg.quantity),
+                                price=str(fresh_ltp), disclosed_quantity="0", trigger_price="0",
+                            )
+                        except Exception as exc:
+                            Log.warning(f"[{leg_key}] Retry's reprice failed ({exc}) -- "
+                                        f"resuming the watcher on the order as-is anyway.")
+                else:  # kind == "terminal" -- nothing resting, must place fresh
+                    leg.exit_order_id = ""  # _close_open_leg places a brand-new close order next cycle
+                leg.error_state = ""
+                leg.error_kind = ""
+                leg.error_order_id = ""
+                self._save_state()
+                push_leg_error(self.env, leg_key, leg, clear=True)
+                self._pending_fills.discard(leg_key)
+                return
+
+            # Entry side: unlike exit, nothing in run_cycle calls
+            # _enter_straddle/_maybe_fire_repair again for a leg that already
+            # has a symbol (has_position-equivalent is already true) --
+            # Retry has to directly (re)submit the watcher itself.
+            if kind == "resting":
+                fresh_ltp = fetch_symbol_ltp(self.ltp_client, leg.symbol, inst.options_exchange)
+                if fresh_ltp is not None:
+                    try:
+                        self.client.modifyorder(
+                            order_id=leg.error_order_id, strategy=self.env.strategy_tag,
+                            symbol=leg.symbol, action=entry_action,
+                            exchange=inst.options_exchange, price_type="LIMIT",
+                            product=config.product, quantity=str(leg.quantity),
+                            price=str(fresh_ltp), disclosed_quantity="0", trigger_price="0",
+                        )
+                    except Exception as exc:
+                        Log.warning(f"[{leg_key}] Retry's reprice failed ({exc}) -- resuming "
+                                    f"the watcher on the order as-is anyway.")
+                resume_order_id = leg.error_order_id
+            else:  # kind == "terminal" -- nothing resting, place a genuinely new order
+                resume_order_id = place(self.client, self.env.strategy_tag, leg.symbol,
+                                         inst.options_exchange, entry_action, leg.quantity)
+                leg.entry_order_id = resume_order_id
+            leg.error_state = ""
+            leg.error_kind = ""
+            leg.error_order_id = ""
+            self._save_state()
+            push_leg_error(self.env, leg_key, leg, clear=True)
+            # _watch_entry_fill owns _pending_fills for this leg_key from here.
+            self._fill_executor.submit(self._watch_entry_fill, leg_key, resume_order_id)
+        except Exception as exc:
+            Log.exception(f"[{leg_key}] Retry resolution failed unexpectedly: {exc}")
+            self._pending_fills.discard(leg_key)
 
     def _watch_entry_cancel(self, leg_key: str, order_id: str):
         """Entry-Cancel's one-last-chance flow for a still-`resting` order --
@@ -1848,13 +1944,41 @@ class StrategyEngine:
         all_flat = True
         for inst in INSTRUMENTS:
             inst_state = self.store.state.instruments[inst.name]
+
+            # Repair (SHORT) legs first. If one is stuck in error_state, this
+            # instrument's straddle (LONG) legs below must NOT be closed this
+            # pass -- otherwise the hedge is removed while the naked short
+            # stays open and unmanaged, exactly what the SHORT-before-LONG
+            # requirement exists to prevent.
+            instrument_blocked = False
             for leg_key_suffix, leg, direction in (
                 ("PE_repair", inst_state.pe_repair, "SHORT"), ("CE_repair", inst_state.ce_repair, "SHORT"),
+            ):
+                if not leg.entry_filled or leg.closed:
+                    continue
+                leg_key = f"{inst.name}_{leg_key_suffix}"
+                if leg.error_state:
+                    Log.warning(f"[{leg_key}] Force Exit waiting on an unresolved error "
+                                f"({leg.error_state}/{leg.error_kind}) -- resolve it via "
+                                f"Retry/Cancel/Manually Completed first.")
+                    all_flat = False
+                    instrument_blocked = True
+                    continue
+                all_flat = False
+                self._close_open_leg(inst, leg_key, leg, direction, "force_exit")
+
+            for leg_key_suffix, leg, direction in (
                 ("PE", inst_state.pe, "LONG"), ("CE", inst_state.ce, "LONG"),
             ):
                 if not leg.entry_filled or leg.closed:
                     continue
                 leg_key = f"{inst.name}_{leg_key_suffix}"
+                if instrument_blocked:
+                    Log.warning(f"[{leg_key}] Force Exit holding this straddle leg open -- "
+                                f"{inst.name}'s repair leg has an unresolved error and must be "
+                                f"resolved first (SHORT-before-LONG requirement).")
+                    all_flat = False
+                    continue
                 if leg.error_state:
                     Log.warning(f"[{leg_key}] Force Exit waiting on an unresolved error "
                                 f"({leg.error_state}/{leg.error_kind}) -- resolve it via "
@@ -1926,8 +2050,8 @@ class StrategyEngine:
                         self._force_close_instrument(inst, inst_state, reason="universal_exit_pnl")
                         continue
 
-                    self._maybe_fire_repair(inst, inst_state, "PE", inst_state.pe, inst_state.pe_repair)
-                    self._maybe_fire_repair(inst, inst_state, "CE", inst_state.ce, inst_state.ce_repair)
+                    self._maybe_fire_repair_bg(inst, inst_state, "PE", inst_state.pe, inst_state.pe_repair)
+                    self._maybe_fire_repair_bg(inst, inst_state, "CE", inst_state.ce, inst_state.ce_repair)
                     continue
 
                 if not (now_time > config.entry_start) and not config.test_mode:
@@ -1952,7 +2076,7 @@ class StrategyEngine:
                 if spot is None:
                     continue
 
-                self._enter_straddle(inst, inst_state, spot)
+                self._enter_straddle_bg(inst, inst_state, spot)
 
         except Exception as exc:
             Log.exception(f"Cycle failed: {exc}")
