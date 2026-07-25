@@ -81,11 +81,11 @@ used elsewhere in this project:
     resuming mid-session (any leg already `entry_filled` and not `closed`
     in the loaded state) also gets its symbol added at startup, same
     resumability guarantee as VWAP.
-  - Closed legs are NOT explicitly unsubscribed intraday (a deliberate
-    simplification -- at most 6 symbols total per day across both
-    instruments, the overhead of a stale subscription still flowing
-    ignored ticks is negligible, and the process is expected to restart
-    daily per this project's convention anyway).
+  - A closed/abandoned leg's symbol IS explicitly unsubscribed via
+    `PriceStream.remove_instruments` (`_finalize_close`, `_resolve_leg_error`'s
+    terminal-cancel branch, and `_watch_entry_cancel`'s abandon path) --
+    without this, a long-running process accumulates dead subscriptions
+    that the watchdog eventually escalates into full reconnects.
   - Same per-symbol staleness detection/resubscribe and SDK
     `auto_reconnect` handling as the other three strategies.
 
@@ -112,11 +112,11 @@ actually WORSE than a simple infinite-repoll loop:
   - `_close_open_leg` (used for both universal-exit paths, and both LONG
     straddle legs and SHORT repair legs): a rejected/cancelled exit order
     clears only `exit_order_id` (the position is still open at the
-    broker) so the next cycle places a brand-new close order, with a new
-    `OptionLeg.exit_reject_count` (inherited by `RepairLeg`) escalating to
-    an ERROR log after 3 consecutive failures -- same highest-risk-failure
-    treatment as the other three strategies' naked short legs, here
-    applying to BOTH the long straddle legs and the short repair legs.
+    broker) so the next cycle places a brand-new close order. A repeated
+    failure is surfaced via the error-mode/Retry-Cancel-Manual system (see
+    `_enter_error_mode`), not a local counter -- same highest-risk-failure
+    treatment as the other four strategies' naked short/naked leg cases,
+    here applying to BOTH the long straddle legs and the short repair legs.
   - `place()` retries up to 3 attempts (1.5s apart) before raising. A
     `TimeoutError` from `poll_fill` now means it already tried RE-PRICING
     the stale order (via `modifyorder()`, to the current LTP) up to
@@ -324,7 +324,6 @@ class OptionLeg:
     exit_order_id: str = ""
     exit_filled: bool = False
     closed: bool = False
-    exit_reject_count: int = 0     # consecutive rejected/cancelled exit orders for THIS open position
     execution_id: int = 0          # which process run OPENED this leg -- captured at entry so a
                                     # mid-position restart still tags the eventual close correctly
     # Order error recovery (see docs/prd/python-strategies-order-error-recovery.md) --
@@ -533,6 +532,28 @@ class PriceStream:
             Log.info(f"[PriceStream] subscribed: {new_ones}")
         except Exception as exc:
             Log.warning(f"[PriceStream] subscribe failed for {new_ones}: {exc}")
+
+    def remove_instruments(self, instruments: list):
+        """Called once a leg's option symbol is fully closed -- without this,
+        every distinct strike traded stays subscribed and watched by
+        _watchdog_loop for the rest of this long-lived process's life, an
+        unbounded (across days) WS-subscription accumulation."""
+        removed = []
+        with self._lock:
+            for inst in instruments:
+                key = (inst["symbol"], inst["exchange"])
+                if key in self._instruments:
+                    del self._instruments[key]
+                    self._cache.pop(key, None)
+                    self._stale_streak.pop(key, None)
+                    removed.append(inst)
+        if not removed:
+            return
+        try:
+            self.client.unsubscribe_ltp(removed)
+            Log.info(f"[PriceStream] unsubscribed: {removed}")
+        except Exception as exc:
+            Log.warning(f"[PriceStream] unsubscribe failed for {removed}: {exc}")
 
     def _connect(self):
         self.client.connect()
@@ -1274,6 +1295,15 @@ class StrategyEngine:
         self._fill_executor = ThreadPoolExecutor(
             max_workers=len(INSTRUMENTS) * 4, thread_name_prefix="fillwatch"
         )
+        # Separate, single-worker pool purely for the Force Exit check
+        # (check_force_exit, a quick local HTTP call). If all _fill_executor
+        # workers are simultaneously busy watching fills (each can block up
+        # to fill_poll_timeout * (1 + reprice_max_attempts) seconds -- worst
+        # case at the highest-risk moment, an end-of-day/expiry-day unwind),
+        # a Force Exit check submitted to that SAME pool would just queue
+        # silently behind them for minutes with no log line and no
+        # escalation, exactly when a human is trying to intervene fastest.
+        self._bg_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bgcheck")
         # Guards the entry/repair chain-fetch background dispatch (see
         # _enter_straddle_bg/_maybe_fire_repair_bg) -- separate from
         # _pending_fills since it tracks "a chain fetch is in flight", not
@@ -1447,16 +1477,25 @@ class StrategyEngine:
         strategy_tag = self.env.strategy_tag
         entry_action = "BUY" if direction == "LONG" else "SELL"
         try:
-            poll_fill(self.client, order_id, strategy_tag, leg.symbol, inst.options_exchange,
-                      entry_action, leg.quantity)
+            fill_data = poll_fill(self.client, order_id, strategy_tag, leg.symbol,
+                                   inst.options_exchange, entry_action, leg.quantity)
             inst, leg, _ = self._resolve_leg_key(leg_key)  # re-fetch: may have changed while polling
             if leg.entry_order_id == order_id:  # guard vs. a superseded/stale order
                 leg.entry_filled = True
+                # entry_px was set from a pre-trade LTP snapshot when the order
+                # was placed -- correct it to the real average fill price now
+                # that the order is confirmed complete, since this feeds the
+                # repair-strike target and the aggregate-PnL stop-loss check.
+                # Fall back to the pre-trade snapshot only if the broker
+                # didn't supply a usable average_price.
+                avg_price = float(fill_data.get("average_price") or 0.0)
+                if avg_price > 0:
+                    leg.entry_px = avg_price
                 inst_state = self.store.state.instruments[inst.name]
                 if inst_state.pe.entry_filled and inst_state.ce.entry_filled:
                     inst_state.traded_today = True
                 self._save_state()
-                Log.info(f"[{leg_key}] Entry filled: {leg.symbol}")
+                Log.info(f"[{leg_key}] Entry filled: {leg.symbol} @ {leg.entry_px}")
         except OrderNeedsAttention as exc:
             self._enter_error_mode(leg_key, "entry_failed", "resting", exc.order_id, str(exc))
         except (RuntimeError, TimeoutError) as exc:
@@ -1721,8 +1760,20 @@ class StrategyEngine:
             except Exception as exc:
                 Log.warning(f"[{leg_key}] Failed to append trade log: {exc}")
         else:
-            Log.warning(f"[{leg_key}] Could not fetch exit LTP for trade log -- skipping this row.")
+            # Both the WS cache and the REST fallback failed at this exact
+            # moment -- the exit already filled at the broker (that's the
+            # only way this function is reached), so leaving leg.closed
+            # False (exit_filled stays True) means _close_open_leg's own
+            # `if leg.exit_filled: self._finalize_close(...)` guard retries
+            # this same price resolution again next cycle, instead of
+            # silently and permanently losing this trade's PnL/log row.
+            Log.warning(f"[{leg_key}] Could not fetch exit LTP for trade log -- "
+                        f"will retry next cycle instead of finalizing.")
+            return
 
+        self.price_stream.remove_instruments(
+            [{"symbol": leg.symbol, "exchange": inst.options_exchange}]
+        )
         leg.closed = True
         self._save_state()
 
@@ -1788,6 +1839,10 @@ class StrategyEngine:
                 # this file's own original terminal-rejection behavior for
                 # straddle/repair entries -- next cycle re-picks the strike
                 # (straddle) or re-runs search-and-sell (repair) from scratch.
+                if leg.symbol:
+                    self.price_stream.remove_instruments(
+                        [{"symbol": leg.symbol, "exchange": inst.options_exchange}]
+                    )
                 if leg_key.endswith("_repair"):
                     for field_name, value in asdict(RepairLeg()).items():
                         setattr(leg, field_name, value)
@@ -1864,15 +1919,20 @@ class StrategyEngine:
                 # only needs the reprice (if resting) + clearing the error
                 # fields; the normal flow does the rest.
                 if kind == "resting":
-                    fresh_ltp = fetch_symbol_ltp(self.ltp_client, leg.symbol, inst.options_exchange)
-                    if fresh_ltp is not None:
+                    # Cross the spread (ask for BUY, bid for SELL) rather than
+                    # re-quote the last-traded price -- matches
+                    # _reprice_and_wait_once's approach, which is what
+                    # actually gets a resting order filled on a thin book.
+                    bid, ask = fetch_symbol_bid_ask(self.ltp_client, leg.symbol, inst.options_exchange)
+                    fresh_price = ask if exit_action == "BUY" else bid
+                    if fresh_price is not None:
                         try:
                             self.client.modifyorder(
                                 order_id=leg.error_order_id, strategy=self.env.strategy_tag,
                                 symbol=leg.symbol, action=exit_action,
                                 exchange=inst.options_exchange, price_type="LIMIT",
                                 product=config.product, quantity=str(leg.quantity),
-                                price=str(fresh_ltp), disclosed_quantity="0", trigger_price="0",
+                                price=str(fresh_price), disclosed_quantity="0", trigger_price="0",
                             )
                         except Exception as exc:
                             Log.warning(f"[{leg_key}] Retry's reprice failed ({exc}) -- "
@@ -1892,15 +1952,20 @@ class StrategyEngine:
             # has a symbol (has_position-equivalent is already true) --
             # Retry has to directly (re)submit the watcher itself.
             if kind == "resting":
-                fresh_ltp = fetch_symbol_ltp(self.ltp_client, leg.symbol, inst.options_exchange)
-                if fresh_ltp is not None:
+                # Cross the spread (ask for BUY, bid for SELL) rather than
+                # re-quote the last-traded price -- matches
+                # _reprice_and_wait_once's approach, which is what actually
+                # gets a resting order filled on a thin book.
+                bid, ask = fetch_symbol_bid_ask(self.ltp_client, leg.symbol, inst.options_exchange)
+                fresh_price = ask if entry_action == "BUY" else bid
+                if fresh_price is not None:
                     try:
                         self.client.modifyorder(
                             order_id=leg.error_order_id, strategy=self.env.strategy_tag,
                             symbol=leg.symbol, action=entry_action,
                             exchange=inst.options_exchange, price_type="LIMIT",
                             product=config.product, quantity=str(leg.quantity),
-                            price=str(fresh_ltp), disclosed_quantity="0", trigger_price="0",
+                            price=str(fresh_price), disclosed_quantity="0", trigger_price="0",
                         )
                     except Exception as exc:
                         Log.warning(f"[{leg_key}] Retry's reprice failed ({exc}) -- resuming "
@@ -1972,6 +2037,10 @@ class StrategyEngine:
                     Log.warning(f"[{leg_key}] cancelorder failed while abandoning entry "
                                 f"({exc}) -- clearing local position anyway; verify "
                                 f"manually at the broker that nothing is resting.")
+                if leg.symbol:
+                    self.price_stream.remove_instruments(
+                        [{"symbol": leg.symbol, "exchange": inst.options_exchange}]
+                    )
                 if leg_key.endswith("_repair"):
                     for field_name, value in asdict(RepairLeg()).items():
                         setattr(leg, field_name, value)
@@ -2003,10 +2072,38 @@ class StrategyEngine:
             self._pending_fills.discard(leg_key)
 
     def _force_close_instrument(self, inst: InstrumentConfig, inst_state: InstrumentState, reason: str):
-        if inst_state.pe.entry_filled:
-            self._close_open_leg(inst, f"{inst.name}_PE", inst_state.pe, "LONG", reason)
-        if inst_state.ce.entry_filled:
-            self._close_open_leg(inst, f"{inst.name}_CE", inst_state.ce, "LONG", reason)
+        # Repair (SHORT) legs close AFTER the straddle (LONG) legs in this
+        # function -- unlike _handle_force_exit's SHORT-before-LONG order,
+        # this order is intentional here (see _handle_force_exit's docstring)
+        # and is left unchanged. But if a repair leg is ALREADY stuck in an
+        # unresolved error_state from a prior cycle, closing its paired
+        # straddle leg now would strip the hedge off a naked short repair leg
+        # that this same call cannot close either -- exactly the risk the
+        # SHORT-before-LONG guard on the Force Exit button protects against.
+        # Guard this path too, at the same instrument-level granularity
+        # _handle_force_exit uses.
+        instrument_blocked = bool(inst_state.pe_repair.error_state) or bool(inst_state.ce_repair.error_state)
+        if instrument_blocked:
+            Log.warning(f"[{inst.name}] Force-close ({reason}) holding straddle legs open -- "
+                        f"a repair leg has an unresolved error and must be resolved first.")
+        else:
+            if inst_state.pe.entry_filled:
+                self._close_open_leg(inst, f"{inst.name}_PE", inst_state.pe, "LONG", reason)
+            if inst_state.ce.entry_filled:
+                self._close_open_leg(inst, f"{inst.name}_CE", inst_state.ce, "LONG", reason)
+            # This check happened BEFORE the straddle closes above -- a
+            # repair leg's own background fill-watcher (a fully independent
+            # thread) can set error_state at any wall-clock moment, including
+            # in the narrow window between the check and these close calls.
+            # A re-check here can't undo an already-placed straddle close,
+            # but it surfaces the situation immediately (loudly) instead of
+            # only being noticed whenever someone next looks, since this
+            # exact ordering is what the SHORT-before-LONG guard exists to
+            # prevent.
+            if inst_state.pe_repair.error_state or inst_state.ce_repair.error_state:
+                Log.error(f"[{inst.name}] A repair leg entered error_state during this "
+                          f"force-close pass, AFTER the straddle legs above were already "
+                          f"closed -- verify manually whether the repair leg is now naked.")
         if inst_state.pe_repair.entry_filled:
             self._close_open_leg(inst, f"{inst.name}_PE_repair", inst_state.pe_repair, "SHORT", reason)
         if inst_state.ce_repair.entry_filled:
@@ -2037,7 +2134,15 @@ class StrategyEngine:
         any_open = False
         for leg, direction in ((inst_state.pe, "LONG"), (inst_state.ce, "LONG"),
                                 (inst_state.pe_repair, "SHORT"), (inst_state.ce_repair, "SHORT")):
-            if not leg.entry_filled or leg.closed:
+            # exit_filled-but-not-closed means the exit is already confirmed
+            # at the broker and only waiting on a price-resolution retry
+            # (see _finalize_close) -- economically flat already, so it must
+            # NOT count as "open" here. Otherwise a leg stuck retrying its
+            # exit price (e.g. an illiquid near-zero-premium option late in
+            # the session) can make this whole function return None every
+            # cycle, silently disabling the aggregate-PnL stop-loss check for
+            # every OTHER leg of this instrument too.
+            if not leg.entry_filled or leg.closed or leg.exit_filled:
                 continue
             any_open = True
             # Live option LTP from the WebSocket cache (pushed, not polled)
@@ -2113,7 +2218,7 @@ class StrategyEngine:
             finally:
                 self._force_exit_check_pending = False
 
-        self._fill_executor.submit(_run)
+        self._bg_executor.submit(_run)
 
     def _handle_force_exit(self) -> bool:
         """Force-closes every leg currently holding a position, regardless of
@@ -2191,6 +2296,29 @@ class StrategyEngine:
 
             self._refresh_force_exit_check_bg()
             if self._force_exit_pending:
+                # _handle_force_exit leaves any leg already in error_state
+                # untouched (Force Exit doesn't override an unresolved
+                # Retry/Cancel/Manual decision) -- but this branch returns
+                # right after, and while force_exit_pending stays True this
+                # is the ONLY branch that runs. Without checking here too, a
+                # user's Retry/Cancel/Manual click on that errored leg would
+                # never be consumed, permanently deadlocking both the leg and
+                # Force Exit until a manual restart. Resolve it first, same
+                # as the per-instrument error-check loop elsewhere in this
+                # function, so a just-resolved leg can be force-closed in
+                # this same cycle by _handle_force_exit right after.
+                for inst in INSTRUMENTS:
+                    inst_state = self.store.state.instruments[inst.name]
+                    for leg_key, leg in (
+                        (f"{inst.name}_PE", inst_state.pe),
+                        (f"{inst.name}_CE", inst_state.ce),
+                        (f"{inst.name}_PE_repair", inst_state.pe_repair),
+                        (f"{inst.name}_CE_repair", inst_state.ce_repair),
+                    ):
+                        if leg.error_state:
+                            pending = check_pending_action(self.env, leg_key)
+                            if pending is not None:
+                                self._resolve_leg_error(leg_key, inst, pending)
                 if self._handle_force_exit():
                     Log.warning("Force Exit complete -- all positions flat. Stopping.")
                     ack_force_exit_complete(self.env)
@@ -2397,6 +2525,19 @@ def main():
         Log.info("Shutting down scheduler.")
         scheduler.shutdown(wait=False)
         price_stream.stop()
+        engine._fill_executor.shutdown(wait=False)
+        engine._bg_executor.shutdown(wait=False)
+    except Exception:
+        # scheduler.start() shouldn't normally raise anything else (job
+        # exceptions are caught/logged by APScheduler itself), but if it
+        # ever does, run the exact same cleanup instead of leaking the
+        # WebSocket connection and both thread pools silently.
+        Log.exception("Scheduler stopped unexpectedly -- cleaning up before exit.")
+        scheduler.shutdown(wait=False)
+        price_stream.stop()
+        engine._fill_executor.shutdown(wait=False)
+        engine._bg_executor.shutdown(wait=False)
+        raise
 
 
 ###############################################################################

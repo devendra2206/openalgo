@@ -122,8 +122,9 @@ made. Fixed identically here: `_enter_leg` clears the whole leg position
 on a rejected entry (fresh strike/expiry + new order next cycle, doesn't
 consume a trade_count slot); `_exit_leg` clears only `exit_order_id` on a
 rejected exit (position is still open) so the next cycle places a
-brand-new close order, with `LegPosition.exit_reject_count` escalating to
-an ERROR log after 3 consecutive failures. `place()` retries up to 3
+brand-new close order. A repeated failure is surfaced via the error-mode/
+Retry-Cancel-Manual system (see `_enter_error_mode`), not a local counter.
+`place()` retries up to 3
 attempts (1.5s apart) before raising. A `TimeoutError` from `poll_fill`
 now means it already tried RE-PRICING the stale order (via
 `modifyorder()`, to the current LTP) up to `config.reprice_max_attempts`
@@ -341,7 +342,6 @@ class LegPosition:
     entry_filled: bool = False
     exit_order_id: str = ""
     exit_filled: bool = False
-    exit_reject_count: int = 0     # consecutive rejected/cancelled exit orders for THIS open position
     execution_id: int = 0          # which process run OPENED this leg -- captured at entry so a
                                     # mid-position restart still tags the eventual close correctly
     # Order error recovery (see docs/prd/python-strategies-order-error-recovery.md) --
@@ -545,6 +545,28 @@ class PriceStream:
         except Exception as exc:
             Log.warning(f"[PriceStream] subscribe failed for {new_ones}: {exc}")
 
+    def remove_instruments(self, instruments: list):
+        """Called once a leg's option symbol is fully closed -- without this,
+        every distinct strike traded in a day stays subscribed and watched by
+        _watchdog_loop for the rest of this long-lived process's life, an
+        unbounded (across days) WS-subscription accumulation."""
+        removed = []
+        with self._lock:
+            for inst in instruments:
+                key = (inst["symbol"], inst["exchange"])
+                if key in self._instruments:
+                    del self._instruments[key]
+                    self._cache.pop(key, None)
+                    self._stale_streak.pop(key, None)
+                    removed.append(inst)
+        if not removed:
+            return
+        try:
+            self.client.unsubscribe_ltp(removed)
+            Log.info(f"[PriceStream] unsubscribed: {removed}")
+        except Exception as exc:
+            Log.warning(f"[PriceStream] unsubscribe failed for {removed}: {exc}")
+
     def _connect_and_subscribe(self):
         self.client.connect()
         with self._lock:
@@ -744,8 +766,19 @@ def resolve_current_week_expiry(client, inst: InstrumentConfig) -> str:
     for i, raw in enumerate(dates_raw):
         d = datetime.strptime(raw, "%d-%b-%y").date()
         if d >= today:
-            if d == today and i + 1 < len(dates_raw):
-                return _compact_expiry(dates_raw[i + 1])
+            if d == today:
+                if i + 1 < len(dates_raw):
+                    return _compact_expiry(dates_raw[i + 1])
+                # Broker's expiry list ends exactly at today with no later
+                # date to roll to -- silently falling through to today's
+                # (already-expiring) contract is exactly what this whole
+                # function exists to avoid. Raise loudly instead of trading
+                # it, same as the "expiry lookup failed outright" case above.
+                raise RuntimeError(
+                    f"{inst.name}: today ({today}) is the nearest expiry and the broker "
+                    f"returned no later expiry date to roll to -- refusing to silently "
+                    f"trade today's expiring contract."
+                )
             return _compact_expiry(raw)
     return _compact_expiry(dates_raw[-1])
 
@@ -1549,6 +1582,25 @@ class StrategyEngine:
                             f"will retry once the background refresh completes.")
                 return
             atm_leg = pick_atm_leg(chain, option_type, spot)
+            # pick_atm_leg only ever picks the nearest of the 3 cached
+            # strikes (ATM+/-1) -- if the cache lagged (a slow/failed
+            # background refresh) or spot gapped since it was fetched, the
+            # TRUE current ATM could have drifted entirely outside that
+            # window, and this would silently return a strike that isn't
+            # actually ATM with no warning. Derive the chain's own strike
+            # step from its cached rows and bail out (same "not populated
+            # yet" skip-and-retry path used above) if the nearest cached
+            # strike is more than one step away from spot, forcing a fresh
+            # background refresh before trading this leg.
+            strikes = sorted({leg["strike"] for leg in _legs_with_strike(chain, option_type)})
+            if len(strikes) >= 2:
+                strike_step = min(b - a for a, b in zip(strikes, strikes[1:]))
+                if abs(atm_leg["strike"] - spot) > strike_step:
+                    Log.warning(f"[{leg_key}] Cached option chain looks stale -- nearest strike "
+                                f"{atm_leg['strike']} is more than one strike step ({strike_step}) "
+                                f"from spot {spot}. Skipping this cycle and forcing a chain refresh.")
+                    self._chain_cache.pop(inst.name, None)
+                    return
             quantity = config.lot_multiplier * atm_leg["lotsize"]
 
             Log.info(f"[{leg_key}] Entry: strike={atm_leg['strike']} symbol={atm_leg['symbol']}@{atm_leg['ltp']} qty={quantity}")
@@ -1741,8 +1793,20 @@ class StrategyEngine:
             except Exception as exc:
                 Log.warning(f"[{leg_key}] Failed to append trade log: {exc}")
         else:
-            Log.warning(f"[{leg_key}] Could not fetch exit LTP for trade log -- skipping this row.")
+            # Both the WS cache and the REST fallback failed at this exact
+            # moment -- the exit already filled at the broker (that's the
+            # only way this function is reached), so leaving pos.exit_filled
+            # set and NOT clearing the position means _exit_leg's own
+            # `if pos.exit_filled: self._finalize_exit(...)` guard retries
+            # this same price resolution again next cycle, instead of
+            # silently and permanently losing this trade's PnL/log row.
+            Log.warning(f"[{leg_key}] Could not fetch exit LTP for trade log -- "
+                        f"will retry next cycle instead of finalizing.")
+            return
 
+        self.price_stream.remove_instruments(
+            [{"symbol": pos.symbol, "exchange": inst.options_exchange}]
+        )
         leg.position = LegPosition()
         self._save_state()
 
@@ -1800,6 +1864,9 @@ class StrategyEngine:
                 return
             if kind == "terminal":
                 # Nothing resting -- no broker call needed, straight to flat.
+                self.price_stream.remove_instruments(
+                    [{"symbol": pos.symbol, "exchange": inst.options_exchange}]
+                )
                 leg.position = LegPosition()
                 self._save_state()
                 push_leg_error(self.env, leg_key, leg.position, clear=True)
@@ -1863,15 +1930,19 @@ class StrategyEngine:
                 # side only needs the reprice (if resting) + clearing the error
                 # fields; the normal flow does the rest.
                 if kind == "resting":
-                    fresh_ltp = fetch_symbol_ltp(self.ltp_client, pos.symbol, inst.options_exchange)
-                    if fresh_ltp is not None:
+                    # Cross the spread (ask for BUY, bid for SELL) rather
+                    # than re-quote the last-traded price -- matches
+                    # _reprice_and_wait_once's approach, which is what
+                    # actually gets a resting order filled on a thin book.
+                    bid, ask = fetch_symbol_bid_ask(self.ltp_client, pos.symbol, inst.options_exchange)
+                    if ask is not None:
                         try:
                             self.client.modifyorder(
                                 order_id=pos.error_order_id, strategy=self.env.strategy_tag,
                                 symbol=pos.symbol, action="BUY",
                                 exchange=inst.options_exchange, price_type="LIMIT",
                                 product=config.product, quantity=str(pos.quantity),
-                                price=str(fresh_ltp), disclosed_quantity="0", trigger_price="0",
+                                price=str(ask), disclosed_quantity="0", trigger_price="0",
                             )
                         except Exception as exc:
                             Log.warning(f"[{leg_key}] Retry's reprice failed ({exc}) -- "
@@ -1897,15 +1968,19 @@ class StrategyEngine:
             # (re)submit the watcher itself instead of relying on a normal-flow
             # path that structurally cannot fire for an in-progress entry.
             if kind == "resting":
-                fresh_ltp = fetch_symbol_ltp(self.ltp_client, pos.symbol, inst.options_exchange)
-                if fresh_ltp is not None:
+                # Cross the spread (ask for BUY, bid for SELL) rather than
+                # re-quote the last-traded price -- matches
+                # _reprice_and_wait_once's approach, which is what actually
+                # gets a resting order filled on a thin book.
+                bid, ask = fetch_symbol_bid_ask(self.ltp_client, pos.symbol, inst.options_exchange)
+                if bid is not None:
                     try:
                         self.client.modifyorder(
                             order_id=pos.error_order_id, strategy=self.env.strategy_tag,
                             symbol=pos.symbol, action="SELL",
                             exchange=inst.options_exchange, price_type="LIMIT",
                             product=config.product, quantity=str(pos.quantity),
-                            price=str(fresh_ltp), disclosed_quantity="0", trigger_price="0",
+                            price=str(bid), disclosed_quantity="0", trigger_price="0",
                         )
                     except Exception as exc:
                         Log.warning(f"[{leg_key}] Retry's reprice failed ({exc}) -- resuming "
@@ -1974,6 +2049,9 @@ class StrategyEngine:
                     Log.warning(f"[{leg_key}] cancelorder failed while abandoning entry "
                                 f"({exc}) -- clearing local position anyway; verify "
                                 f"manually at the broker that nothing is resting.")
+                self.price_stream.remove_instruments(
+                    [{"symbol": symbol, "exchange": inst.options_exchange}]
+                )
                 leg.position = LegPosition()
                 self._save_state()
             # NOT ack_pending_action() here -- _resolve_leg_error's cancel/resting
@@ -2023,7 +2101,11 @@ class StrategyEngine:
             finally:
                 self._force_exit_check_pending = False
 
-        self._fill_executor.submit(_run)
+        # Submitted to _signal_executor, NOT _fill_executor -- fill-watchers
+        # can legitimately block that pool for minutes during a reprice loop,
+        # which would otherwise silently stall Force Exit detection at
+        # exactly the moment a human is trying to intervene fastest.
+        self._signal_executor.submit(_run)
 
     def _handle_force_exit(self) -> bool:
         """Force-closes every leg currently holding a position, regardless of
@@ -2060,6 +2142,25 @@ class StrategyEngine:
 
             self._refresh_force_exit_check_bg()
             if self._force_exit_pending:
+                # _handle_force_exit leaves any leg already in error_state
+                # untouched (Force Exit doesn't override an unresolved
+                # Retry/Cancel/Manual decision) -- but this branch returns
+                # right after, and while force_exit_pending stays True this
+                # is the ONLY branch that runs. Without checking here too, a
+                # user's Retry/Cancel/Manual click on that errored leg would
+                # never be consumed, permanently deadlocking both the leg and
+                # Force Exit until a manual restart. Resolve it first, same
+                # as the per-leg loop below, so a just-resolved leg can be
+                # force-closed in this same cycle by _handle_force_exit right
+                # after.
+                for leg_key in LEG_KEYS:
+                    leg = self.store.state.legs[leg_key]
+                    if leg.position.error_state:
+                        inst_name = leg_key.split("_")[0]
+                        inst = next(i for i in INSTRUMENTS if i.name == inst_name)
+                        pending = check_pending_action(self.env, leg_key)
+                        if pending is not None:
+                            self._resolve_leg_error(leg_key, inst, pending)
                 if self._handle_force_exit():
                     Log.warning("Force Exit complete -- all positions flat. Stopping.")
                     ack_force_exit_complete(self.env)
@@ -2348,6 +2449,19 @@ def main():
         Log.info("Shutting down scheduler.")
         scheduler.shutdown(wait=False)
         price_stream.stop()
+        engine._fill_executor.shutdown(wait=False)
+        engine._signal_executor.shutdown(wait=False)
+    except Exception:
+        # scheduler.start() shouldn't normally raise anything else (job
+        # exceptions are caught/logged by APScheduler itself), but if it
+        # ever does, run the exact same cleanup instead of leaking the
+        # WebSocket connection and both thread pools silently.
+        Log.exception("Scheduler stopped unexpectedly -- cleaning up before exit.")
+        scheduler.shutdown(wait=False)
+        price_stream.stop()
+        engine._fill_executor.shutdown(wait=False)
+        engine._signal_executor.shutdown(wait=False)
+        raise
 
 
 ###############################################################################
