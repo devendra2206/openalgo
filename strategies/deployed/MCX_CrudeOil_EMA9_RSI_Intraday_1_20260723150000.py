@@ -251,12 +251,12 @@ class Config:
     ws_stale_reconnect_after: int = 3
 
     fill_poll_interval: float = 2.0
-    # 15s per wait-cycle (1 initial + 19 reprices) = 20 x 15s = 300s (5 min)
+    # 5s per wait-cycle (1 initial + 59 reprices) = 60 x 5s = 300s (5 min)
     # total before giving up and raising OrderNeedsAttention -- each reprice
     # crosses the spread with a fresh bid/ask (see _reprice_and_wait_once),
     # not just the last-traded price.
-    fill_poll_timeout: float = 15.0
-    reprice_max_attempts: int = 19   # times poll_fill() re-prices a stale unfilled order before giving up
+    fill_poll_timeout: float = 5.0
+    reprice_max_attempts: int = 59   # times poll_fill() re-prices a stale unfilled order before giving up
 
     place_order_max_attempts: int = 3
     place_order_retry_delay: float = 1.5
