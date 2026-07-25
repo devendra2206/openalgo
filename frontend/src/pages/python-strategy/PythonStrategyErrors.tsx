@@ -76,6 +76,14 @@ export default function PythonStrategyErrors() {
         const data = JSON.parse(event.data)
         if (data.type === 'error_update' && data.strategy_id === strategyId) {
           fetchData()
+          // The backend has just reported a fresh state for this strategy's
+          // errors -- whether a pending action resolved cleanly or re-failed
+          // (e.g. Retry attempted again and failed once more), this is the
+          // authoritative signal that whatever was "pending" has finished.
+          // Without clearing here, a leg whose Retry/Cancel/Manual action
+          // re-entered error mode would show "Waiting for the strategy to
+          // confirm..." forever, permanently hiding its buttons.
+          setPendingLegs(new Set())
         }
       } catch {
         // ignore malformed events

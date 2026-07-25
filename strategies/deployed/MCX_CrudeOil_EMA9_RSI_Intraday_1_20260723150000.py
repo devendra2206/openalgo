@@ -233,7 +233,7 @@ class Config:
 
     scheduler_interval: int = 10
     indicator_refresh_interval: int = 15     # throttle for the 3m EMA/RSI history fetch
-    pnl_tick_interval: int = 1                # seconds between PnL pushes -- runs on its OWN scheduler
+    pnl_tick_interval: float = 0.8             # seconds between PnL pushes -- runs on its OWN scheduler
                                                # job (see report_pnl_tick), decoupled from
                                                # scheduler_interval, since it's cache-only/read-only and
                                                # doesn't share the blocking-call risk that interval guards
@@ -250,18 +250,13 @@ class Config:
     # state needs a clean reset, not another poke at the same symbol.
     ws_stale_reconnect_after: int = 3
 
-    # check_force_exit is a synchronous local HTTP call (up to its own
-    # timeout, worse with the unix-socket/TCP/host fallback chain) -- calling
-    # it every single scheduler_interval cycle regardless of whether Force
-    # Exit is ever used eats into that same interval for no reason. Throttled
-    # to this cadence instead; a manual Force Exit click is still picked up
-    # within one interval of this, which is plenty responsive for a button a
-    # human just clicked.
-    force_exit_check_interval: float = 20.0
-
     fill_poll_interval: float = 2.0
-    fill_poll_timeout: float = 60.0
-    reprice_max_attempts: int = 2    # times poll_fill() re-prices a stale unfilled order to LTP before giving up
+    # 15s per wait-cycle (1 initial + 19 reprices) = 20 x 15s = 300s (5 min)
+    # total before giving up and raising OrderNeedsAttention -- each reprice
+    # crosses the spread with a fresh bid/ask (see _reprice_and_wait_once),
+    # not just the last-traded price.
+    fill_poll_timeout: float = 15.0
+    reprice_max_attempts: int = 19   # times poll_fill() re-prices a stale unfilled order before giving up
 
     place_order_max_attempts: int = 3
     place_order_retry_delay: float = 1.5
@@ -763,6 +758,29 @@ def fetch_symbol_ltp(client, symbol: str, exchange: str) -> Optional[float]:
     return float(ltp) if ltp is not None else None
 
 
+def fetch_symbol_bid_ask(client, symbol: str, exchange: str) -> tuple[Optional[float], Optional[float]]:
+    """Used only by the reprice loop (_reprice_and_wait_once) -- crossing the
+    spread with a fresh bid/ask is a genuinely different, more aggressive
+    price than the last-traded price fetch_symbol_ltp returns, and is what
+    actually gets a resting order filled rather than just re-quoting the
+    same stale level."""
+    try:
+        resp = client.quotes(symbol=symbol, exchange=exchange)
+    except Exception as exc:
+        Log.warning(f"quotes() (bid/ask) failed for {symbol}: {exc}")
+        return None, None
+    if _is_error_response(resp) and resp.get("status") != "success":
+        Log.warning(f"quotes() (bid/ask) error response for {symbol}: {resp}")
+        return None, None
+    data = resp.get("data", resp) if isinstance(resp, dict) else resp
+    if not isinstance(data, dict):
+        return None, None
+    bid = data.get("bid")
+    ask = data.get("ask")
+    return (float(bid) if bid is not None else None,
+            float(ask) if ask is not None else None)
+
+
 @dataclass
 class InstrumentSignal:
     close_prev1: float
@@ -909,26 +927,33 @@ class OrderNeedsAttention(Exception):
 
 def _reprice_and_wait_once(client, order_id: str, strategy: str, symbol: str, exchange: str,
                             action: str, quantity: int) -> Optional[dict]:
-    """One reprice-to-current-LTP (modifyorder(), keeping the same order
-    id/queue position) + one fill_poll_timeout-bounded wait. Returns the fill
-    data if it completed, None if still unfilled (order left resting either
-    way -- this never cancels). Shared by poll_fill()'s own reprice loop AND
-    by Entry-Cancel's one-last-chance flow (_watch_entry_cancel), so this
-    "give it a fair price, then wait" behavior only exists in one place."""
+    """One reprice-to-a-fresh-crossing-price (modifyorder(), keeping the same
+    order id/queue position) + one fill_poll_timeout-bounded wait. Reprices
+    to the current ASK for a BUY and the current BID for a SELL -- crossing
+    the spread against a fresh quote each attempt, rather than re-quoting the
+    last-traded price, since that's what actually gets a resting order filled
+    instead of just re-posting at the same stale level. Returns the fill data
+    if it completed, None if still unfilled (order left resting either way --
+    this never cancels). Shared by poll_fill()'s own reprice loop AND by
+    Entry-Cancel's one-last-chance flow (_watch_entry_cancel), so this "give
+    it a fair, aggressive price, then wait" behavior only exists in one
+    place."""
     import time as _time
 
-    fresh_ltp = fetch_symbol_ltp(client, symbol, exchange)
-    if fresh_ltp is None:
-        Log.warning(f"Order {order_id}: no fresh quote available to re-price -- skipping this attempt.")
+    bid, ask = fetch_symbol_bid_ask(client, symbol, exchange)
+    fresh_price = ask if action == "BUY" else bid
+    if fresh_price is None:
+        Log.warning(f"Order {order_id}: no fresh bid/ask available to re-price -- skipping this attempt.")
         return None
     try:
         client.modifyorder(
             order_id=order_id, strategy=strategy, symbol=symbol, action=action,
             exchange=exchange, price_type="LIMIT", product=config.product,
-            quantity=str(quantity), price=str(fresh_ltp),
+            quantity=str(quantity), price=str(fresh_price),
             disclosed_quantity="0", trigger_price="0",
         )
-        Log.warning(f"Order {order_id}: re-priced to {fresh_ltp}.")
+        Log.warning(f"Order {order_id}: re-priced to {fresh_price} (crossing to "
+                    f"{'ask' if action == 'BUY' else 'bid'}).")
     except Exception as exc:
         Log.warning(f"Order {order_id}: modify (reprice) failed: {exc}.")
         return None
@@ -948,14 +973,16 @@ def _reprice_and_wait_once(client, order_id: str, strategy: str, symbol: str, ex
 
 def poll_fill(client, orderid: str, strategy: str, symbol: str, exchange: str,
               action: str, quantity: int) -> dict:
-    """Polls order status until a terminal state or config.fill_poll_timeout.
-    On timeout, actively RE-PRICES the same order (via _reprice_and_wait_once,
-    keeping its order id/queue position) to the current LTP -- up to
-    config.reprice_max_attempts times. If it's STILL resting after all of
-    those, raises OrderNeedsAttention WITHOUT cancelling it -- entering error
-    mode is now a user decision (Retry/Cancel/Manually Completed), not an
-    automatic cancel. A genuine broker rejection/cancellation (order never
-    became fillable at all) still raises RuntimeError immediately, unchanged.
+    """Polls order status until a terminal state or config.fill_poll_timeout
+    (15s). On timeout, actively RE-PRICES the same order (via
+    _reprice_and_wait_once, keeping its order id/queue position) crossing the
+    spread with a fresh bid/ask each time -- up to config.reprice_max_attempts
+    (19) times, for a combined ceiling of ~5 minutes (fill_poll_timeout x
+    (1 + reprice_max_attempts)). If it's STILL resting after all of those,
+    raises OrderNeedsAttention WITHOUT cancelling it -- entering error mode is
+    now a user decision (Retry/Cancel/Manually Completed), not an automatic
+    cancel. A genuine broker rejection/cancellation (order never became
+    fillable at all) still raises RuntimeError immediately, unchanged.
     See docs/prd/python-strategies-order-error-recovery.md."""
     import time as _time
 
@@ -1312,8 +1339,14 @@ class StrategyEngine:
         # active watcher so run_cycle doesn't submit a duplicate one next cycle.
         self._state_lock = threading.Lock()
         self._pending_fills: set[str] = set()
-        self._last_force_exit_check: Optional[datetime] = None
         self._force_exit_pending: bool = False
+        self._force_exit_check_pending: bool = False
+        # Guards _reset_day_if_needed's background dispatch -- the daily
+        # futures-contract resolution (client.expiry()) used to run inline on
+        # the main scheduler thread, and on failure retried EVERY cycle with
+        # no backoff, blocking the whole thread for up to env.timeout on each
+        # attempt until it succeeded.
+        self._day_reset_pending: bool = False
         self._fill_executor = ThreadPoolExecutor(
             max_workers=len(LEG_KEYS), thread_name_prefix="fillwatch"
         )
@@ -1407,12 +1440,19 @@ class StrategyEngine:
     # ---- state helpers -----------------------------------------------------
     def _reset_day_if_needed(self):
         today_key = datetime.now(IST).date().isoformat()
-        if self.store.state.current_day != today_key:
+        if self.store.state.current_day == today_key:
+            return
+        if self._day_reset_pending:
+            return  # already dispatched in the background -- wait for it
+        self._day_reset_pending = True
+
+        def _run():
             try:
                 futures_symbol = resolve_current_month_futures(self.client, INSTRUMENTS[0])
             except Exception as exc:
                 Log.warning(f"Could not resolve current-month futures contract yet ({exc}); "
                             f"retrying next cycle.")
+                self._day_reset_pending = False
                 return  # don't mark the day as reset -- retry next cycle
             Log.info(f"New day detected ({today_key}); resetting daily trade counters. "
                       f"Futures contract: {futures_symbol}")
@@ -1427,6 +1467,17 @@ class StrategyEngine:
             self.price_stream.add_instruments(
                 [{"symbol": futures_symbol, "exchange": INSTRUMENTS[0].options_exchange}]
             )
+            self._day_reset_pending = False
+
+        # Dispatched, not run inline: this used to block the main scheduler
+        # thread for a real client.expiry() round-trip on the first cycle of
+        # each day, and on failure retried EVERY subsequent cycle with no
+        # backoff. Deferring to the background is safe here -- run_cycle just
+        # keeps using yesterday's (still-valid intraday) futures_symbol/state
+        # for the one extra cycle until this completes, exactly the same
+        # graceful-degradation behavior the old code already had on failure,
+        # just applied uniformly instead of only after an error.
+        self._fill_executor.submit(_run)
 
     def _within_entry_window(self) -> bool:
         if config.test_mode:
@@ -1443,7 +1494,7 @@ class StrategyEngine:
         return datetime.now(IST).time() >= config.universal_exit_time
 
     def report_pnl_tick(self):
-        """Runs on its OWN scheduler job at config.pnl_tick_interval (1s),
+        """Runs on its OWN scheduler job at config.pnl_tick_interval (0.8s),
         completely decoupled from run_cycle's scheduler_interval (10s). PnL
         is purely observational -- it never feeds a trading decision -- so
         it can refresh far more often than the main cycle without any of
@@ -1487,18 +1538,23 @@ class StrategyEngine:
 
         if not pos.symbol:
             # Reads the background-refreshed chain cache (see _refresh_chain_cache,
-            # piggybacked on get_signal's indicator_refresh_interval cadence) instead
-            # of fetching live here -- this is what keeps the signal-to-order path
-            # down to just the order placement call itself. Live fetch is only a
-            # fallback for the rare case a signal fires before the very first
-            # background refresh has completed (e.g. right after a restart).
+            # piggybacked on get_signal's indicator_refresh_interval cadence) --
+            # this is what keeps the signal-to-order path down to just the order
+            # placement call itself. If the cache isn't populated yet (rare --
+            # right after a restart, before the first background refresh
+            # completes), skip entry THIS cycle rather than falling back to a
+            # synchronous chain fetch here, which would block every other
+            # leg/instrument's check on the main scheduler thread for a real
+            # broker round-trip. get_signal's own due_for_refresh path already
+            # has (or will trigger) a background refresh, so the cache fills in
+            # within indicator_refresh_interval and this leg enters on a later
+            # cycle instead -- a small, bounded delay rather than a stall.
             chain = self._chain_cache.get(inst.name)
             if chain is None:
-                expiry = self._expiry_cache.get(inst.name)
-                if expiry is None:
-                    expiry = resolve_current_month_expiry(self.client, inst)
-                    self._expiry_cache[inst.name] = expiry
-                chain = fetch_chain(self.client, inst, expiry, futures_symbol)
+                Log.warning(f"[{leg_key}] Entry signal fired but the option chain "
+                            f"cache isn't populated yet -- skipping this cycle, "
+                            f"will retry once the background refresh completes.")
+                return
             atm_leg = pick_atm_leg(chain, option_type, spot)
             quantity = config.lot_multiplier * atm_leg["lotsize"]
 
@@ -1519,8 +1575,21 @@ class StrategyEngine:
             return  # already filled, or a background watcher is already tracking this order
 
         if not pos.entry_order_id:
-            pos.entry_order_id = place(self.client, strategy_tag, pos.symbol,
-                                        inst.options_exchange, "SELL", pos.quantity)
+            # place() can raise (either a RuntimeError after exhausting its own
+            # retries on a persistent clean rejection, or an immediate ambiguous
+            # exception it deliberately never retries) -- uncaught, that would
+            # escape to run_cycle's outer handler with NO error_state ever set,
+            # silently retrying every cycle forever with zero UI visibility.
+            # Both cases route to "terminal" (nothing resting to reprice/watch),
+            # matching how every other genuinely-ambiguous case in this file is
+            # already resolved via Retry/Cancel/Manual.
+            try:
+                pos.entry_order_id = place(self.client, strategy_tag, pos.symbol,
+                                            inst.options_exchange, "SELL", pos.quantity)
+            except Exception as exc:
+                Log.exception(f"[{leg_key}] place() failed for entry: {exc}")
+                self._enter_error_mode(leg_key, "entry_failed", "terminal", "", str(exc))
+                return
             self._save_state()
 
         # The actual fill confirmation (poll_fill, up to fill_poll_timeout *
@@ -1595,8 +1664,16 @@ class StrategyEngine:
             return  # exit order already in flight -- background watcher will resolve it
 
         if not pos.exit_order_id:
-            pos.exit_order_id = place(self.client, strategy_tag, pos.symbol,
-                                       inst.options_exchange, "BUY", pos.quantity)
+            # See _enter_leg's matching comment -- an uncaught place() failure
+            # here is the more dangerous direction: it would leave a naked
+            # short open indefinitely with no error_state/UI alert at all.
+            try:
+                pos.exit_order_id = place(self.client, strategy_tag, pos.symbol,
+                                           inst.options_exchange, "BUY", pos.quantity)
+            except Exception as exc:
+                Log.exception(f"[{leg_key}] place() failed for exit: {exc}")
+                self._enter_error_mode(leg_key, "exit_failed", "terminal", "", str(exc))
+                return
             self._save_state()
 
         # Fill confirmation happens off this thread -- see _enter_leg's note on
@@ -1641,9 +1718,15 @@ class StrategyEngine:
 
         # A "Manually Completed" exit resolution sets manual_exit_px -- the
         # user's real fill price is authoritative there, not a fresh quote
-        # (see docs/prd/python-strategies-order-error-recovery.md).
-        exit_px = (pos.manual_exit_px if pos.manual_exit_px is not None
-                   else fetch_symbol_ltp(self.ltp_client, pos.symbol, inst.options_exchange))
+        # (see docs/prd/python-strategies-order-error-recovery.md). Otherwise
+        # WS-cache-first, REST fallback -- same pattern used everywhere else
+        # price is read, instead of an unconditional REST round-trip here.
+        exit_px = pos.manual_exit_px
+        if exit_px is None:
+            exit_px = self.price_stream.get_ltp(pos.symbol, inst.options_exchange,
+                                                 max_age=config.ws_stale_seconds)
+        if exit_px is None:
+            exit_px = fetch_symbol_ltp(self.ltp_client, pos.symbol, inst.options_exchange)
         if exit_px is not None:
             self.store.state.today_realized_pnl += (pos.entry_px - exit_px) * pos.quantity
             self._save_state()
@@ -1666,6 +1749,19 @@ class StrategyEngine:
     # See docs/prd/python-strategies-order-error-recovery.md for the full
     # design rationale behind every branch here.
     def _resolve_leg_error(self, leg_key: str, inst: InstrumentConfig, action: dict):
+        if leg_key in self._pending_fills:
+            # A Retry/Cancel resolution (or a resumed fill watcher) is already
+            # in flight for this leg -- e.g. the user submitted a second
+            # action (Cancel-again, or switching to Retry) before the first
+            # one's background watcher finished (up to fill_poll_timeout,
+            # ~60s). error_state isn't cleared until that watcher completes,
+            # so without this guard a second call here would dispatch a
+            # SECOND concurrent watcher/place() against the same order --
+            # two threads racing modifyorder/cancelorder, or worse, a
+            # duplicate order from a second terminal-retry place(). The new
+            # action is simply left un-acked and gets picked up on a later
+            # cycle once this leg's _pending_fills entry clears.
+            return
         leg = self.store.state.legs[leg_key]
         pos = leg.position
         was_exit = pos.error_state == "exit_failed"
@@ -1713,12 +1809,20 @@ class StrategyEngine:
             # silently abandoned (an untracked entry order filling later would
             # create a position from nothing). Can take up to one
             # fill_poll_timeout window, so runs on _fill_executor, not inline.
+            # Ack'd here, immediately, NOT deferred until _watch_entry_cancel
+            # finishes -- otherwise error_state stays set and a later cycle's
+            # error-check could re-read this same still-"pending" action from
+            # the platform and dispatch a SECOND concurrent _watch_entry_cancel
+            # against the same order_id (two threads racing modifyorder/
+            # cancelorder on one order). Mirrors how the "retry" branch above
+            # already acks before dispatch.
+            ack_pending_action(self.env, leg_key)
             self._pending_fills.add(leg_key)
             self._fill_executor.submit(
                 self._watch_entry_cancel, leg_key, inst, pos.error_order_id,
                 pos.symbol, pos.quantity
             )
-            return  # _watch_entry_cancel does its own save/push/ack once resolved
+            return
 
         if action["action"] == "manual":
             fill_price = action["fill_price"]
@@ -1807,8 +1911,20 @@ class StrategyEngine:
                                     f"the watcher on the order as-is anyway.")
                 resume_order_id = pos.error_order_id
             else:  # kind == "terminal" -- nothing resting, place a genuinely new order
-                resume_order_id = place(self.client, self.env.strategy_tag, pos.symbol,
-                                         inst.options_exchange, "SELL", pos.quantity)
+                # If THIS retry attempt's own place() fails, re-enter error
+                # mode with a fresh message/timestamp (see _enter_error_mode's
+                # own docstring -- it's explicitly designed to be called again
+                # on a repeated failure) instead of falling through to the
+                # outer except, which only logs and would leave the UI
+                # showing the stale pre-retry error text.
+                try:
+                    resume_order_id = place(self.client, self.env.strategy_tag, pos.symbol,
+                                             inst.options_exchange, "SELL", pos.quantity)
+                except Exception as exc:
+                    Log.exception(f"[{leg_key}] Retry's fresh place() failed again: {exc}")
+                    self._enter_error_mode(leg_key, "entry_failed", "terminal", "", str(exc))
+                    self._pending_fills.discard(leg_key)
+                    return
                 pos.entry_order_id = resume_order_id
             pos.error_state = ""
             pos.error_kind = ""
@@ -1828,37 +1944,86 @@ class StrategyEngine:
         """Entry-Cancel's one-last-chance flow for a still-`resting` order --
         never silently abandoned. Deliberately self-terminating (unlike the
         other watchers): ends in exactly one of two definitive outcomes, never
-        back in error mode."""
+        back in error mode -- UNLESS something genuinely unexpected happens
+        (see the outer except below), in which case it re-enters error mode
+        rather than leaving the leg stuck. _pending_fills is ALWAYS released
+        in the finally -- with _resolve_leg_error's re-entry guard now in
+        place, a leg whose guard never clears would be permanently
+        unresolvable via Retry/Cancel/Manual without a process restart."""
         strategy_tag = self.env.strategy_tag
-        result = _reprice_and_wait_once(self.client, order_id, strategy_tag,
-                                         symbol, inst.options_exchange, "SELL", quantity)
-        leg = self.store.state.legs[leg_key]
-        pos = leg.position
-        if pos.error_order_id != order_id:
+        try:
+            result = _reprice_and_wait_once(self.client, order_id, strategy_tag,
+                                             symbol, inst.options_exchange, "SELL", quantity)
+            leg = self.store.state.legs[leg_key]
+            pos = leg.position
+            if pos.error_order_id != order_id:
+                return  # superseded by a newer action/order in the meantime -- do nothing
+            if result is not None:
+                pos.entry_filled = True
+                leg.trade_count += 1
+                pos.error_state = ""
+                pos.error_kind = ""
+                pos.error_order_id = ""
+                self._save_state()
+                Log.info(f"[{leg_key}] Entry filled during Cancel's final chance: {symbol}")
+            else:
+                try:
+                    self.client.cancelorder(order_id=order_id, strategy=strategy_tag)
+                except Exception as exc:
+                    Log.warning(f"[{leg_key}] cancelorder failed while abandoning entry "
+                                f"({exc}) -- clearing local position anyway; verify "
+                                f"manually at the broker that nothing is resting.")
+                leg.position = LegPosition()
+                self._save_state()
+            # NOT ack_pending_action() here -- _resolve_leg_error's cancel/resting
+            # branch already acked THIS action before dispatching us. Acking again
+            # here would risk discarding a genuinely NEW action a user submitted
+            # for this same leg while we were running (up to fill_poll_timeout),
+            # since the platform's ack has no action-identity/token check -- it
+            # would silently swallow that new action instead of leaving it for
+            # the next cycle to pick up once _pending_fills clears in the finally.
+            push_leg_error(self.env, leg_key, leg.position, clear=True)
+        except Exception as exc:
+            # _reprice_and_wait_once can raise (a RuntimeError if the order
+            # landed rejected/cancelled during the wait, or an unguarded
+            # client.orderstatus() failure) -- uncaught, that would leave this
+            # leg's _pending_fills entry stuck forever, silently blocking all
+            # future Retry/Cancel/Manual actions via _resolve_leg_error's
+            # re-entry guard. Re-enter error mode instead so it stays
+            # actionable; "resting" since we genuinely don't know the order's
+            # final fate.
+            Log.exception(f"[{leg_key}] Unexpected error during Cancel's final chance: {exc}")
+            self._enter_error_mode(leg_key, "entry_failed", "resting", order_id, str(exc))
+        finally:
             self._pending_fills.discard(leg_key)
-            return  # superseded by a newer action/order in the meantime -- do nothing
-        if result is not None:
-            pos.entry_filled = True
-            leg.trade_count += 1
-            pos.error_state = ""
-            pos.error_kind = ""
-            pos.error_order_id = ""
-            self._save_state()
-            Log.info(f"[{leg_key}] Entry filled during Cancel's final chance: {symbol}")
-        else:
-            try:
-                self.client.cancelorder(order_id=order_id, strategy=strategy_tag)
-            except Exception as exc:
-                Log.warning(f"[{leg_key}] cancelorder failed while abandoning entry "
-                            f"({exc}) -- clearing local position anyway; verify "
-                            f"manually at the broker that nothing is resting.")
-            leg.position = LegPosition()
-            self._save_state()
-        self._pending_fills.discard(leg_key)
-        push_leg_error(self.env, leg_key, leg.position, clear=True)
-        ack_pending_action(self.env, leg_key)
 
     # ---- main cycle -----------------------------------------------------
+    def _refresh_force_exit_check_bg(self):
+        """Dispatches check_force_exit (a synchronous local HTTP call) to the
+        background executor every cycle instead of running it inline -- a
+        human just clicked the Force Exit button and expects it to be picked
+        up quickly, so this is intentionally NOT throttled to a slow interval
+        (an earlier interval-throttle traded away exactly that responsiveness
+        for defense against a rare slow-local-HTTP edge case). Guarded so a
+        slow check that outlives one scheduler_interval isn't resubmitted on
+        top of itself; in the normal/fast case (a local unix-socket call,
+        typically well under a second) this means a fresh check completes
+        every single cycle, giving essentially real-time detection while
+        still never blocking run_cycle even in the rare slow case."""
+        if self._force_exit_check_pending:
+            return
+        self._force_exit_check_pending = True
+
+        def _run():
+            try:
+                self._force_exit_pending = check_force_exit(self.env)
+            except Exception as exc:
+                Log.warning(f"check_force_exit background refresh failed: {exc}")
+            finally:
+                self._force_exit_check_pending = False
+
+        self._fill_executor.submit(_run)
+
     def _handle_force_exit(self) -> bool:
         """Force-closes every leg currently holding a position, regardless of
         the strategy's own signal/exit logic -- called from run_cycle while a
@@ -1892,13 +2057,7 @@ class StrategyEngine:
         try:
             self._reset_day_if_needed()
 
-            now_check = datetime.now(IST)
-            if (self._last_force_exit_check is None
-                    or (now_check - self._last_force_exit_check).total_seconds()
-                    >= config.force_exit_check_interval):
-                self._last_force_exit_check = now_check
-                self._force_exit_pending = check_force_exit(self.env)
-
+            self._refresh_force_exit_check_bg()
             if self._force_exit_pending:
                 if self._handle_force_exit():
                     Log.warning("Force Exit complete -- all positions flat. Stopping.")
