@@ -325,13 +325,22 @@ class LegPosition:
     symbol: str = ""
     quantity: int = 0
     entry_time: str = ""
-    entry_px: float = 0.0
+    entry_px: float = 0.0          # Set from a pre-trade LTP snapshot when the order is placed,
+                                    # then CORRECTED to the broker's real average fill price the
+                                    # moment poll_fill confirms the order complete (see
+                                    # _watch_entry_fill) -- the trade log's PnL columns should
+                                    # reflect the real fill, not the pre-trade estimate.
     entry_high: float = 0.0        # max(High[-2], High[-1]) of the option's own 2m candles at
                                     # entry -- native exit reference level from the source strategy
     entry_order_id: str = ""
     entry_filled: bool = False
     exit_order_id: str = ""
     exit_filled: bool = False
+    # Real average fill price for the EXIT order, captured from poll_fill's
+    # orderstatus() response the moment the exit is confirmed complete (see
+    # _watch_exit_fill). None until then; _finalize_exit prefers this over
+    # the WS/REST LTP-cache fallback once it's available.
+    exit_fill_px: Optional[float] = None
     execution_id: int = 0          # which process run OPENED this leg -- captured at entry so a
                                     # mid-position restart still tags the eventual close correctly
     # Order error recovery (see docs/prd/python-strategies-order-error-recovery.md) --
@@ -1729,15 +1738,25 @@ class StrategyEngine:
                            symbol: str, quantity: int):
         strategy_tag = self.env.strategy_tag
         try:
-            poll_fill(self.client, order_id, strategy_tag, symbol, inst.options_exchange,
-                      "SELL", quantity)
+            fill_data = poll_fill(self.client, order_id, strategy_tag, symbol, inst.options_exchange,
+                                   "SELL", quantity)
             leg = self.store.state.legs[leg_key]
             pos = leg.position
             if pos.entry_order_id == order_id:  # guard vs. a superseded/stale order
                 pos.entry_filled = True
+                # entry_px was set from a pre-trade LTP snapshot when the
+                # order was placed -- correct it to the broker's real
+                # average fill price now that the order is confirmed
+                # complete, since this is what the trade log's PnL columns
+                # are supposed to reflect. Fall back to the pre-trade
+                # snapshot only if the broker didn't supply a usable
+                # average_price.
+                avg_price = float(fill_data.get("average_price") or 0.0)
+                if avg_price > 0:
+                    pos.entry_px = avg_price
                 leg.trade_count += 1
                 self._save_state()
-                Log.info(f"[{leg_key}] Entry filled: {symbol}")
+                Log.info(f"[{leg_key}] Entry filled: {symbol} @ {pos.entry_px}")
         except OrderNeedsAttention as exc:
             self._enter_error_mode(leg_key, "entry_failed", "resting", exc.order_id, str(exc))
         except (RuntimeError, TimeoutError) as exc:
@@ -1812,12 +1831,18 @@ class StrategyEngine:
                           symbol: str, quantity: int):
         strategy_tag = self.env.strategy_tag
         try:
-            poll_fill(self.client, order_id, strategy_tag, symbol, inst.options_exchange,
-                      "BUY", quantity)
+            fill_data = poll_fill(self.client, order_id, strategy_tag, symbol, inst.options_exchange,
+                                   "BUY", quantity)
             leg = self.store.state.legs[leg_key]
             pos = leg.position
             if pos.exit_order_id == order_id:  # guard vs. a superseded/stale order
                 pos.exit_filled = True
+                # Capture the broker's real average fill price for this exit
+                # -- _finalize_exit prefers this over the WS/REST LTP-cache
+                # fallback once it's available (see that method).
+                avg_price = float(fill_data.get("average_price") or 0.0)
+                if avg_price > 0:
+                    pos.exit_fill_px = avg_price
                 self._save_state()
         except OrderNeedsAttention as exc:
             self._enter_error_mode(leg_key, "exit_failed", "resting", exc.order_id, str(exc))
@@ -1840,12 +1865,18 @@ class StrategyEngine:
 
         Log.info(f"[{leg_key}] Position closed: {pos.symbol}")
 
-        # A "Manually Completed" exit resolution sets manual_exit_px -- the
-        # user's real fill price is authoritative there, not a fresh quote
-        # (see docs/prd/python-strategies-order-error-recovery.md). Otherwise
-        # WS-cache-first, REST fallback -- same pattern used everywhere else
-        # price is read, instead of an unconditional REST round-trip here.
+        # Preference order: (1) a "Manually Completed" resolution's
+        # user-supplied fill price -- authoritative for that path, and the
+        # only one available since the normal watcher never confirmed a
+        # fill there (see docs/prd/python-strategies-order-error-recovery.md);
+        # (2) the broker's REAL average fill price, captured by
+        # _watch_exit_fill the moment the exit order confirmed complete --
+        # this is what the trade log is SUPPOSED to reflect, not an
+        # LTP-cache guess; (3)/(4) WS/REST LTP as a last-resort estimate,
+        # only reached if the broker somehow didn't supply average_price.
         exit_px = pos.manual_exit_px
+        if exit_px is None:
+            exit_px = pos.exit_fill_px
         if exit_px is None:
             exit_px = self.price_stream.get_ltp(pos.symbol, inst.options_exchange,
                                                  max_age=config.ws_stale_seconds)
@@ -2108,12 +2139,15 @@ class StrategyEngine:
                 return  # superseded by a newer action/order in the meantime -- do nothing
             if result is not None:
                 pos.entry_filled = True
+                avg_price = float(result.get("average_price") or 0.0)
+                if avg_price > 0:
+                    pos.entry_px = avg_price
                 leg.trade_count += 1
                 pos.error_state = ""
                 pos.error_kind = ""
                 pos.error_order_id = ""
                 self._save_state()
-                Log.info(f"[{leg_key}] Entry filled during Cancel's final chance: {symbol}")
+                Log.info(f"[{leg_key}] Entry filled during Cancel's final chance: {symbol} @ {pos.entry_px}")
             else:
                 try:
                     self.client.cancelorder(order_id=order_id, strategy=strategy_tag)
