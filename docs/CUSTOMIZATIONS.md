@@ -14,6 +14,96 @@ mirror of upstream.
 
 ---
 
+## How to sync with upstream
+
+`main` must stay a byte-for-byte mirror of `upstream/main` at all times — it's
+the fast-forward staging point, never merge into it directly, and never commit
+customizations to it.
+
+```bash
+# 1. Fetch both remotes
+git fetch upstream
+git fetch origin
+
+# 2. Fast-forward main to upstream/main (should ALWAYS be --ff-only;
+#    if this fails, main has diverged and needs investigation first,
+#    not a force-push)
+git checkout main
+git merge upstream/main --ff-only
+git push origin main
+
+# 3. Merge main into custom-strategies
+git checkout custom-strategies
+git merge main --no-ff -m "chore: merge upstream/main (via main) into custom-strategies"
+```
+
+**Expected conflicts — `frontend/dist/` only, every time.** Both branches
+independently rebuild the frontend with content-hashed filenames (CI on
+upstream's side, the local `commit-dist` step on this fork's side), so nearly
+every asset shows up as a `rename/rename` or `modify/delete` conflict even
+though nothing meaningfully differs. Resolve by taking `main`'s copy of the
+whole directory wholesale — it's the latest canonical CI build, and this
+fork's own `frontend/dist` on `custom-strategies` was itself just an older CI
+build, not a hand-edited artifact:
+
+```bash
+rm -rf frontend/dist
+git checkout main -- frontend/dist
+git add -f frontend/dist   # -f required: frontend/dist is gitignored
+```
+
+**If anything OTHER than `frontend/dist/` conflicts**, stop and check it
+against the "Customizations vs upstream" sections above before resolving —
+that means upstream touched one of the files this fork has actually modified
+(most likely `blueprints/python_strategy.py`), and the conflict needs to be
+read, not just picked one side. Confirm no unexpected conflicts before
+committing:
+
+```bash
+git diff --name-only --diff-filter=U   # should be empty after the dist fix
+```
+
+**Before committing the merge**, sanity-check that this fork's actual
+customized files came through untouched (compare against the pre-merge tip,
+not against upstream):
+
+```bash
+python -m py_compile app.py blueprints/python_strategy.py services/option_chain_service.py
+git diff <pre-merge-commit> HEAD -- app.py blueprints/python_strategy.py services/option_chain_service.py
+# should be empty unless upstream genuinely touched these files this time --
+# see the per-file sections above for what to expect if it did
+```
+
+A file showing 0 lines of diff between `custom-strategies` and the
+merge-base is **not actually customized** here (even if it looks
+project-specific) — it was simply inherited from an earlier point in
+upstream's own history, and a later upstream rewrite of it will merge in
+cleanly with no conflict, silently replacing it entirely. This happened to
+`CLAUDE.md` in the 2026-07-26 sync below: its detailed content (ZeroMQ bus
+invariant, multi-session login guard, etc.) was never actually a fork
+customization — upstream wrote it, this fork never touched it, and upstream's
+later restructure (moving broker-specific detail into
+`.claude/skills/broker-integration/`) replaced it wholesale, correctly. Before
+assuming a big diff on a "no conflict" file is fine, grep for the specific
+invariant/text you rely on in the new version — don't just trust that
+"no conflict" means "nothing changed."
+
+Finally:
+
+```bash
+git push origin custom-strategies
+```
+
+**Sync log:**
+- **2026-07-26**: 22 commits pulled from upstream (skills additions, broker
+  fixes, dependency bumps, `CLAUDE.md` restructure). Zero conflicts outside
+  `frontend/dist/`. Verified `app.py`/`blueprints/python_strategy.py`/
+  `services/option_chain_service.py` unchanged (0-line diff) and compiling
+  clean post-merge; verified the ZeroMQ-bus and multi-session-login
+  invariants survived `CLAUDE.md`'s restructure (moved, not dropped).
+
+---
+
 ## `app.py` (+21 lines)
 
 One addition: a CSRF exemption for the new Force Exit completion endpoint,
@@ -147,18 +237,38 @@ iterates on. Changes:
 
 ---
 
-## Strategy scripts (NOT tracked by git — local files only)
+## Strategy scripts (NOT tracked by git under `strategies/scripts/` — but a
+## COPY of each is committed under `strategies/deployed/`)
 
 `strategies/scripts/{MCX_CrudeOil_EMA9_RSI_Intraday, Nifty_Sensex_EMA34_RSI_Intraday,
 Nifty_Sensex_Pivot_Supertrend_Intraday, Nifty_Sensex_VWAP_NoHA_Intraday,
-Nifty_Sensex_Expiry_Batman}_*.py` — these never showed up in `git status` at
-all, so a `git pull` never touches them and they never conflict. They hold
-most of the actual behavior described above (PnL push cadence, Force Exit
-handling, WS reconnect logic) but they're outside git's purview entirely.
-Listed here purely so this doc is a complete picture of "what's different
-from a stock OpenAlgo install," not because git needs to track them.
+Nifty_Sensex_Expiry_Batman, Nifty_Sensex_Pivot_EMA_Combined_Intraday}_*.py` —
+the `strategies/scripts/` copies never show up in `git status`, so a
+`git pull`/merge never touches them and they never conflict. `strategies/deployed/`
+holds a byte-identical committed copy of each (kept in sync manually after any
+edit) purely so this project's own history/reviews/PRs have something to diff
+against — the live-served copy the Python Strategy Host actually runs is
+always the `strategies/scripts/` one. Listed here purely so this doc is a
+complete picture of "what's different from a stock OpenAlgo install," not
+because git needs to track the `scripts/` copies.
 
-Summary of what's in them (all 5, unless noted):
+**2026-07-26 additions:**
+- New `Nifty_Sensex_Pivot_EMA_Combined_Intraday_1` — merges the Pivot+Supertrend
+  and EMA34+RSI strategies into one deployed process, sharing the underlying
+  data fetch/WebSocket subscription/strategy_tag/PnL/trade-log while keeping
+  all 8 legs (4 per engine) fully independent. See the script's own module
+  docstring for the full design writeup.
+- `Nifty_Sensex_Pivot_Supertrend_Intraday_1`: candle interval changed 5m → 3m,
+  entry logic reverted to the original single-closed-candle signal (a
+  two-candle variant was tried and backtested worse on 3m/5m candles, better
+  only on 10m — not worth the added complexity).
+- Combined, `VWAP_NoHA`, and `Expiry_Batman`: `entry_px`/exit price now
+  corrected to the broker's real `average_price` (from `orderstatus()`, via
+  `poll_fill`'s return value) once a fill is confirmed, instead of relying
+  solely on a pre-trade LTP snapshot / post-fill LTP-cache guess. Falls back
+  to the old estimate if the broker doesn't supply `average_price`.
+
+Summary of what's in them (all 5 original scripts, unless noted):
 - `Environment.timeout` reduced 120.0 → 10.0; a second `ltp_client` with a
   separate 3.0s timeout for the WS-stale LTP fallback specifically.
 - Indicator-signal and chain-refresh REST calls genuinely backgrounded via
