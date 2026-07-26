@@ -150,6 +150,17 @@ def broadcast_error_update(strategy_id: str, leg_key: str, error: dict):
     _broadcast_sse({"type": "error_update", "strategy_id": strategy_id, "leg_key": leg_key, **error})
 
 
+def broadcast_trade_update(strategy_id: str):
+    """Broadcast that a leg just closed (a new row was written to
+    trades_{strategy_id}.csv) -- same multiplexed /api/events stream,
+    distinguished by "type": "trade_update". Deliberately carries no trade
+    data itself (unlike pnl_update/error_update) -- the frontend just
+    re-fetches GET .../trades on receipt, same "re-fetch on notify" pattern
+    already used for error_update, since reconstructing the full trade row
+    from a partial event payload isn't worth avoiding one cheap GET."""
+    _broadcast_sse({"type": "trade_update", "strategy_id": strategy_id})
+
+
 # File paths - use Path for cross-platform compatibility
 STRATEGIES_DIR = Path("strategies") / "scripts"
 LOGS_DIR = Path("log") / "strategies"  # Using existing log folder
@@ -2737,6 +2748,35 @@ def api_get_leg_errors(strategy_id):
     return jsonify({"errors": legs})
 
 
+@python_strategy_bp.route("/api/strategy/<strategy_id>/trade_closed", methods=["POST"])
+def api_push_trade_closed(strategy_id):
+    """Push endpoint: a RUNNING STRATEGY SUBPROCESS calls this right after
+    writing a closed-leg row to trades_{strategy_id}.csv (see
+    append_trade_log in each strategy script). Same API-key auth as
+    POST .../pnl and POST .../errors -- the caller is a subprocess, not a
+    browser. No state is stored here (unlike STRATEGY_PNL/STRATEGY_ERRORS) --
+    this purely triggers a live SSE nudge so the dashboard's Today's Trades
+    panel and the Trades page can re-fetch instead of waiting on a manual
+    refresh; the trade log CSV itself remains the single source of truth."""
+    data = request.get_json(silent=True) or {}
+    apikey = data.get("apikey")
+    if not apikey:
+        return jsonify({"status": "error", "message": "apikey is required"}), 401
+
+    from database.auth_db import verify_api_key
+
+    user_id = verify_api_key(apikey)
+    if not user_id:
+        return jsonify({"status": "error", "message": "Invalid API key"}), 401
+
+    ok, err_or_config = verify_strategy_ownership(strategy_id, user_id, return_config=True)
+    if not ok:
+        return err_or_config
+
+    broadcast_trade_update(strategy_id)
+    return jsonify({"status": "success"})
+
+
 @python_strategy_bp.route("/api/strategy/<strategy_id>/pending_action")
 def api_check_pending_action(strategy_id):
     """Pull endpoint: a RUNNING STRATEGY SUBPROCESS calls this only for a leg
@@ -3001,6 +3041,27 @@ def api_get_executions(strategy_id):
     return jsonify({"executions": executions})
 
 
+TODAY_EXECUTION_FILTER = "__today__"
+
+
+def _entry_time_is_today_ist(entry_time: str) -> bool:
+    """True if `entry_time` (an IST ISO timestamp string, as every strategy
+    script writes via datetime.now(IST).isoformat()) falls on today's IST
+    date. Used by the `__today__` execution_id filter -- spans EVERY run
+    from today, not just the latest one, so a strategy that restarted a few
+    times during the same trading day still shows everything from today in
+    one view."""
+    if not entry_time:
+        return False
+    try:
+        dt = datetime.fromisoformat(entry_time)
+    except ValueError:
+        return False
+    if dt.tzinfo is None:
+        dt = IST.localize(dt)
+    return dt.astimezone(IST).date() == datetime.now(IST).date()
+
+
 @python_strategy_bp.route("/api/strategy/<strategy_id>/trades")
 @check_session_validity
 def api_get_trades(strategy_id):
@@ -3008,14 +3069,17 @@ def api_get_trades(strategy_id):
     each strategy script already writes on every closed leg
     (strategies/scripts/trades_{strategy_id}.csv). Column names aren't
     hardcoded/enforced beyond entry_time/pnl_rupees/execution_id -- each of
-    the 5 strategy scripts writes its own copy-pasted trade-log writer and
+    the 6 strategy scripts writes its own copy-pasted trade-log writer and
     the column set can drift slightly between them, so unknown columns are
     just passed through as-is.
 
     Optional `?execution_id=<id>` filters to just that run (the Trades UI
     always passes one, defaulting to the latest from /executions) -- pass
-    "legacy" for trades logged before execution tracking existed. Omitting
-    the param returns every trade ever logged for this strategy.
+    "legacy" for trades logged before execution tracking existed. Pass
+    `__today__` (TODAY_EXECUTION_FILTER) to instead span EVERY run whose
+    entry_time falls on today's IST date -- useful after a same-day restart
+    produced more than one execution_id. Omitting the param returns every
+    trade ever logged for this strategy.
 
     Also folds in currently OPEN legs (from the same in-memory PnL snapshot
     /pnl reads) as status="OPEN" rows with no exit_time/exit_px/exit_reason
@@ -3026,6 +3090,7 @@ def api_get_trades(strategy_id):
         return err
 
     execution_id = request.args.get("execution_id")
+    today_only = execution_id == TODAY_EXECUTION_FILTER
 
     try:
         rows = _read_trade_log_rows(strategy_id)
@@ -3036,7 +3101,10 @@ def api_get_trades(strategy_id):
     trades = []
     total_pnl = 0.0
     for row in rows:
-        if execution_id is not None and (row.get("execution_id") or "legacy") != execution_id:
+        if today_only:
+            if not _entry_time_is_today_ist(row.get("entry_time", "")):
+                continue
+        elif execution_id is not None and (row.get("execution_id") or "legacy") != execution_id:
             continue
         row = dict(row, status="CLOSED")
         trades.append(row)
@@ -3049,7 +3117,10 @@ def api_get_trades(strategy_id):
         snapshot = STRATEGY_PNL.get(strategy_id)
     for pos in (snapshot or {}).get("open_positions", []):
         pos_exec_id = str(pos.get("execution_id")) if pos.get("execution_id") else "legacy"
-        if execution_id is not None and pos_exec_id != execution_id:
+        if today_only:
+            if not _entry_time_is_today_ist(pos.get("entry_time", "")):
+                continue
+        elif execution_id is not None and pos_exec_id != execution_id:
             continue
         pnl = float(pos.get("pnl", 0) or 0)
         trades.append({

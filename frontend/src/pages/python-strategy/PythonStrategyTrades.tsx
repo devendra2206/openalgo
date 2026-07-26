@@ -58,6 +58,12 @@ function formatExecutionLabel(execution: Execution): string {
 // "latest execution only" could hide a currently open leg entirely.
 const ALL_EXECUTIONS = '__all__'
 
+// Matches TODAY_EXECUTION_FILTER in blueprints/python_strategy.py's
+// api_get_trades -- spans EVERY execution run whose entry_time falls on
+// today's IST date, not just the latest run. Useful after a same-day
+// restart produced more than one execution_id.
+const TODAY_FILTER = '__today__'
+
 export default function PythonStrategyTrades() {
   const { strategyId } = useParams<{ strategyId: string }>()
   const [strategy, setStrategy] = useState<PythonStrategy | null>(null)
@@ -114,6 +120,50 @@ export default function PythonStrategyTrades() {
     fetchData()
   }, [])
 
+  // Live updates via the same multiplexed SSE stream the Errors page uses --
+  // a trade closing while this page is open re-fetches the currently
+  // selected view (run/Today/all) instead of requiring a manual Refresh.
+  // pnl_update (pushed ~every 0.8s per running strategy) additionally patches
+  // any OPEN row's LTP/PnL in place -- without this, an open position's
+  // Exit/LTP column would only refresh when SOME trade closes (trade_update),
+  // which could be minutes away, rather than ticking live like the PnL tile
+  // on the dashboard already does from the same push.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: fetchTrades/selectedExecutionId change every render; re-subscribing on every change would drop/reopen the connection needlessly
+  useEffect(() => {
+    if (!strategyId) return
+    const eventSource = new EventSource('/python/api/events')
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data)
+        if (data.type === 'trade_update' && data.strategy_id === strategyId) {
+          fetchTrades(selectedExecutionId)
+          return
+        }
+        if (data.type === 'pnl_update' && data.strategy_id === strategyId) {
+          const openPositions: { leg_key: string; current_price: number; pnl: number }[] =
+            data.open_positions || []
+          if (openPositions.length === 0) return
+          const byLeg = new Map(openPositions.map((p) => [p.leg_key, p]))
+          setTrades((prev) =>
+            prev.map((trade) => {
+              if (trade.status !== 'OPEN') return trade
+              const live = byLeg.get(trade.leg)
+              if (!live) return trade
+              return {
+                ...trade,
+                exit_px: String(live.current_price),
+                pnl_rupees: live.pnl.toFixed(2),
+              }
+            })
+          )
+        }
+      } catch {
+        // ignore malformed events
+      }
+    }
+    return () => eventSource.close()
+  }, [strategyId])
+
   const handleExecutionChange = (executionId: string) => {
     setSelectedExecutionId(executionId)
     fetchTrades(executionId)
@@ -154,6 +204,7 @@ export default function PythonStrategyTrades() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value={ALL_EXECUTIONS}>All runs (open + closed)</SelectItem>
+                <SelectItem value={TODAY_FILTER}>Today (all runs)</SelectItem>
                 {executions.map((execution) => (
                   <SelectItem key={execution.execution_id} value={execution.execution_id}>
                     {formatExecutionLabel(execution)}
@@ -191,7 +242,9 @@ export default function PythonStrategyTrades() {
               ? 'No trades yet'
               : selectedExecutionId === ALL_EXECUTIONS
                 ? `${trades.length} trade(s) across all runs`
-                : `${trades.length} trade(s) in this run`}
+                : selectedExecutionId === TODAY_FILTER
+                  ? `${trades.length} trade(s) today (all runs)`
+                  : `${trades.length} trade(s) in this run`}
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -215,7 +268,7 @@ export default function PythonStrategyTrades() {
                   <TableHead>Entry Time</TableHead>
                   <TableHead>Entry</TableHead>
                   <TableHead>Exit Time</TableHead>
-                  <TableHead>Exit / LTP</TableHead>
+                  <TableHead>LTP/Exit</TableHead>
                   <TableHead>PnL (pts)</TableHead>
                   <TableHead>PnL (₹)</TableHead>
                   <TableHead>Reason</TableHead>

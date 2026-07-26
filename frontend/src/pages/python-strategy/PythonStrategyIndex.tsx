@@ -1,6 +1,8 @@
 import {
   AlertTriangle,
   Calendar,
+  ChevronDown,
+  ChevronUp,
   Clock,
   Download,
   FileCode,
@@ -41,7 +43,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import type { MasterContractStatus, PnlSnapshot, PythonStrategy } from '@/types/python-strategy'
+import type { MasterContractStatus, PnlSnapshot, PythonStrategy, Trade } from '@/types/python-strategy'
 import { SCHEDULE_DAYS, STATUS_COLORS, STATUS_LABELS } from '@/types/python-strategy'
 import { showToast } from '@/utils/toast'
 
@@ -50,6 +52,8 @@ export default function PythonStrategyIndex() {
   const [strategies, setStrategies] = useState<PythonStrategy[]>([])
   const [pnlByStrategy, setPnlByStrategy] = useState<Record<string, PnlSnapshot>>({})
   const [errorCountByStrategy, setErrorCountByStrategy] = useState<Record<string, number>>({})
+  const [todayTradesByStrategy, setTodayTradesByStrategy] = useState<Record<string, Trade[]>>({})
+  const [expandedTrades, setExpandedTrades] = useState<Set<string>>(new Set())
   const [masterStatus, setMasterStatus] = useState<MasterContractStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [actionLoading, setActionLoading] = useState<string | null>(null)
@@ -103,6 +107,23 @@ export default function PythonStrategyIndex() {
         })
         return next
       })
+
+      // Same pattern again for today's trades -- initial load for the
+      // Today's Trades panel's count/list, otherwise kept live via the
+      // trade_update SSE event below.
+      const tradesResults = await Promise.allSettled(
+        running.map((s) => pythonStrategyApi.getTrades(s.id, '__today__'))
+      )
+      setTodayTradesByStrategy((prev) => {
+        const next = { ...prev }
+        running.forEach((s, i) => {
+          const result = tradesResults[i]
+          if (result.status === 'fulfilled') {
+            next[s.id] = result.value.trades
+          }
+        })
+        return next
+      })
     } catch (_error) {
       if (!silent) showToast.error('Failed to load strategies', 'pythonStrategy')
     } finally {
@@ -139,6 +160,32 @@ export default function PythonStrategyIndex() {
               updated_at: data.updated_at,
             },
           }))
+
+          // This same push already carries each open leg's live current_price
+          // and pnl (~every 0.8s) -- patch the matching OPEN row in the
+          // Today's Trades panel in place so its LTP/PnL actually ticks live,
+          // instead of only refreshing when a trade closes (trade_update
+          // fires on close only, far too infrequent for a "live" row).
+          const openPositions: { leg_key: string; current_price: number; pnl: number }[] =
+            data.open_positions || []
+          if (openPositions.length > 0) {
+            setTodayTradesByStrategy((prev) => {
+              const existing = prev[data.strategy_id]
+              if (!existing) return prev
+              const byLeg = new Map(openPositions.map((p) => [p.leg_key, p]))
+              const updated = existing.map((trade) => {
+                if (trade.status !== 'OPEN') return trade
+                const live = byLeg.get(trade.leg)
+                if (!live) return trade
+                return {
+                  ...trade,
+                  exit_px: String(live.current_price),
+                  pnl_rupees: live.pnl.toFixed(2),
+                }
+              })
+              return { ...prev, [data.strategy_id]: updated }
+            })
+          }
           return
         }
 
@@ -152,6 +199,25 @@ export default function PythonStrategyIndex() {
               setErrorCountByStrategy((prev) => ({
                 ...prev,
                 [data.strategy_id]: res.errors.length,
+              }))
+            })
+            .catch(() => {})
+          return
+        }
+
+        // A leg just closed -- re-fetch this strategy's today's-trades list
+        // (deliberately no trade data carried on the event itself, same
+        // re-fetch-on-notify style as error_update above) so the Today's
+        // Trades panel updates live regardless of whether it's currently
+        // expanded or collapsed (the collapsed count still needs to stay
+        // current).
+        if (data.type === 'trade_update' && data.strategy_id) {
+          pythonStrategyApi
+            .getTrades(data.strategy_id, '__today__')
+            .then((res) => {
+              setTodayTradesByStrategy((prev) => ({
+                ...prev,
+                [data.strategy_id]: res.trades,
               }))
             })
             .catch(() => {})
@@ -273,6 +339,18 @@ export default function PythonStrategyIndex() {
       setForceExitDialogOpen(false)
       setStrategyToForceExit(null)
     }
+  }
+
+  const toggleTodaysTrades = (strategyId: string) => {
+    setExpandedTrades((prev) => {
+      const next = new Set(prev)
+      if (next.has(strategyId)) {
+        next.delete(strategyId)
+      } else {
+        next.add(strategyId)
+      }
+      return next
+    })
   }
 
   const handleExport = async (strategy: PythonStrategy) => {
@@ -781,6 +859,81 @@ export default function PythonStrategyIndex() {
                     <TooltipContent>Edit code</TooltipContent>
                   </Tooltip>
                 </div>
+
+                {(todayTradesByStrategy[strategy.id]?.length ?? 0) > 0 && (
+                  <div className="mt-3 pt-3 border-t">
+                    <button
+                      type="button"
+                      onClick={() => toggleTodaysTrades(strategy.id)}
+                      className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                    >
+                      {expandedTrades.has(strategy.id) ? (
+                        <ChevronUp className="h-3 w-3" />
+                      ) : (
+                        <ChevronDown className="h-3 w-3" />
+                      )}
+                      Today's Trades ({todayTradesByStrategy[strategy.id]?.length ?? 0})
+                    </button>
+
+                    {expandedTrades.has(strategy.id) && (
+                      <div className="mt-2 overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="text-muted-foreground border-b">
+                              <th className="text-left py-1 pr-2 font-medium">Leg</th>
+                              <th className="text-right py-1 px-2 font-medium">Entry</th>
+                              <th className="text-right py-1 px-2 font-medium">LTP/Exit</th>
+                              <th className="text-right py-1 px-2 font-medium">PnL</th>
+                              <th className="text-left py-1 pl-2 font-medium">Reason</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {[...todayTradesByStrategy[strategy.id]]
+                              .reverse()
+                              .slice(0, 5)
+                              .map((trade, i) => {
+                                const pnlRupees = Number.parseFloat(trade.pnl_rupees)
+                                const isOpen = trade.status === 'OPEN'
+                                return (
+                                  // biome-ignore lint/suspicious/noArrayIndexKey: trade rows have no stable unique id in the CSV
+                                  <tr key={i} className="border-b last:border-0">
+                                    <td className="py-1 pr-2 font-medium">{trade.leg}</td>
+                                    <td className="text-right py-1 px-2">{trade.entry_px}</td>
+                                    <td className="text-right py-1 px-2">
+                                      {trade.exit_px}
+                                      {isOpen && (
+                                        <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-blue-500 animate-pulse" />
+                                      )}
+                                    </td>
+                                    <td
+                                      className={`text-right py-1 px-2 ${
+                                        pnlRupees >= 0
+                                          ? 'text-green-600 dark:text-green-400'
+                                          : 'text-red-600 dark:text-red-400'
+                                      }`}
+                                    >
+                                      ₹{trade.pnl_rupees}
+                                    </td>
+                                    <td className="py-1 pl-2 text-muted-foreground">
+                                      {isOpen ? 'OPEN' : trade.exit_reason}
+                                    </td>
+                                  </tr>
+                                )
+                              })}
+                          </tbody>
+                        </table>
+                        {todayTradesByStrategy[strategy.id].length > 5 && (
+                          <Link
+                            to={`/python/${strategy.id}/trades`}
+                            className="block text-right text-xs text-primary hover:underline mt-1"
+                          >
+                            View all trades →
+                          </Link>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
               </CardContent>
             </Card>
           ))}

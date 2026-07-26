@@ -465,6 +465,12 @@ def create_app():
         # not a session cookie.
         csrf.exempt(app.view_functions["python_strategy_bp.api_complete_force_exit"])
 
+        # Same rationale -- called by a hosted Python strategy SUBPROCESS via
+        # plain urllib (notify_trade_closed, strategies/scripts/
+        # _strategy_platform_client.py), authenticated via API key, not a
+        # session cookie.
+        csrf.exempt(app.view_functions["python_strategy_bp.api_push_trade_closed"])
+
         # Initialize latency monitoring (after registering API blueprint)
         init_latency_monitoring(app)
 

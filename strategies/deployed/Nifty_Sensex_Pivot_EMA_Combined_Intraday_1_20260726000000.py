@@ -160,6 +160,18 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from openalgo import api, ta
 
+try:
+    from _strategy_platform_client import notify_trade_closed
+except ImportError:
+    # Shared helper (strategies/scripts/_strategy_platform_client.py) not
+    # present alongside this script -- e.g. it was copied out standalone.
+    # Degrade gracefully: the live "trade just closed" SSE push simply won't
+    # fire, but nothing else about the strategy is affected. A live trading
+    # process failing to even START over a missing notification helper would
+    # be a far worse outcome than losing one dashboard convenience.
+    def notify_trade_closed(env, log_warning=None):
+        pass
+
 load_dotenv()
 
 print("Combined OpenAlgo Python Bot (Pivot+Supertrend / EMA34+RSI) is running.")
@@ -1653,6 +1665,16 @@ class StrategyEngine:
                 )
             except Exception as exc:
                 Log.warning(f"[{leg_key}] Failed to append trade log: {exc}")
+            # Dispatched to the background executor, NOT called inline --
+            # _finalize_exit runs on the MAIN scheduler thread (see _exit_leg's
+            # synchronous call into it), and notify_trade_closed makes a real
+            # blocking network call (_post_json_local, 3s default timeout).
+            # Calling it inline here would stall every OTHER leg's entry/exit
+            # check for up to 3s on a slow/stuck local Flask response --
+            # exactly the class of bug this codebase already fixed elsewhere
+            # (see the "~11-minute production stall" note in these scripts'
+            # module docstrings) for every other REST call on this thread.
+            self._fill_executor.submit(notify_trade_closed, self.env, log_warning=Log.warning)
         else:
             Log.warning(f"[{leg_key}] Could not fetch exit LTP for trade log -- "
                         f"will retry next cycle instead of finalizing.")
