@@ -2,7 +2,7 @@
 ===============================================================================
 Nifty & Sensex Pivot Point + Supertrend Intraday Option Seller
 ===============================================================================
-Version     : 1.8.0
+Version     : 1.10.0
 Platform    : OpenAlgo Hosted Strategy
 OpenAlgo    : >= 2.0.1.5
 Python      : >= 3.11
@@ -30,8 +30,8 @@ Signal Rules (per instrument, shared between its PE and CE leg)
 Computed once per cycle per instrument:
   - r1, s1     = daily Pivot Points (standard) from the previous COMPLETED
                  trading day's H/L/C.
-  - last_close, last_high, last_low = the last CLOSED 5m candle's own OHLC.
-  - supertrend = Supertrend(7, 3) on 5m candles, last CLOSED bar.
+  - last_close, last_high, last_low = the last CLOSED 3m candle's own OHLC.
+  - supertrend = Supertrend(7, 3) on 3m candles, last CLOSED bar.
   - ltp        = live LTP (client.quotes()) -- used only as a live
                  breakout-confirmation filter on top of the closed-candle
                  signal (see below), not for the Supertrend comparison
@@ -190,7 +190,7 @@ Shared rules across all 4 legs
   - Entry/exit conditions are checked near-CONTINUOUSLY -- every cycle
     (`scheduler_interval`, default 10s) re-fetches live LTP and re-evaluates
     the crossover, since a live-tick crossover can happen at any second, not
-    just on a 5m candle boundary. The expensive part (daily pivots + 5m
+    just on a 3m candle boundary. The expensive part (daily pivots + 3m
     Supertrend, both from `client.history()`) is cached and only refreshed
     at most once per `indicator_refresh_interval` (default 15s) -- see
     `StrategyEngine.get_signal()`. This keeps the crossover check continuous
@@ -227,7 +227,7 @@ Design notes carried over from OpenAlgo_Nifty_Weekly_Trend_Seller_2/3
   - `client.history()` can return an error dict instead of a DataFrame on a
     bad broker session -- handled explicitly, logs a warning and returns
     "no signal" instead of crashing the cycle.
-  - The broker's last returned bar (daily AND 5m) is dropped unconditionally
+  - The broker's last returned bar (daily AND 3m) is dropped unconditionally
     before use -- it is frequently still live/updating well past its
     nominal close, and using it as "the last completed candle" would mean
     trading on an unsettled bar (observed in production on the weekly
@@ -300,14 +300,14 @@ INSTRUMENTS = [
 @dataclass
 class Config:
     strategy_name: str = "Nifty & Sensex Pivot Point + Supertrend Intraday Seller"
-    version: str = "1.6.0"
+    version: str = "1.10.0"
 
-    intraday_interval: str = "5m"     # standard, documented OpenAlgo interval
-    history_lookback_days: int = 10   # calendar days of 5m history to fetch (Supertrend(7,3) warmup) --
+    intraday_interval: str = "3m"     # standard, documented OpenAlgo interval
+    history_lookback_days: int = 10   # calendar days of 3m history to fetch (Supertrend(7,3) warmup) --
                                        # was today-only (start_date=end_date=today), which meant a
                                        # multi-bar warmup requirement (supertrend_period + 1) couldn't be
                                        # satisfied until enough of TODAY's session had elapsed (e.g.
-                                       # 8 bars * 5m = 40 minutes after the 09:15 open) -- every single
+                                       # 8 bars * 3m = 24 minutes after the 09:15 open) -- every single
                                        # morning, regardless of any prior day's data. EMA34_RSI/MCX
                                        # already use this multi-day lookback pattern; this just brings
                                        # Pivot_Supertrend in line with them. Signal-computation always
@@ -331,14 +331,14 @@ class Config:
 
     # Entry/exit conditions compare a closed-candle indicator (Supertrend,
     # daily pivots) against LIVE LTP -- the crossover moment itself can
-    # happen at any second, not just on a 5m candle boundary. So the cycle
+    # happen at any second, not just on a 3m candle boundary. So the cycle
     # runs frequently (near-continuous) via `scheduler_interval`, but the
-    # expensive client.history() calls (daily + 5m OHLC) are throttled
+    # expensive client.history() calls (daily + 3m OHLC) are throttled
     # separately via `indicator_refresh_interval` -- only LTP (a cheap
     # quotes() call) is fetched on every single cycle. This keeps the
     # crossover check continuous without hammering client.history().
     scheduler_interval: int = 10             # seconds between strategy cycles (LTP check cadence)
-    indicator_refresh_interval: int = 15     # seconds between re-fetching the 5m Supertrend signal
+    indicator_refresh_interval: int = 15     # seconds between re-fetching the 3m Supertrend signal
     daily_refresh_interval: int = 600        # seconds between re-fetching the daily pivot (changes once/day)
     pnl_tick_interval: float = 0.8             # seconds between PnL pushes -- runs on its OWN scheduler
                                                # job (see report_pnl_tick), decoupled from
@@ -947,7 +947,7 @@ class InstrumentSignal:
 
 
 # Log the [inst] candle=... line only when the candle actually advances, not
-# on every indicator_refresh_interval refetch -- the same closed 5m candle
+# on every indicator_refresh_interval refetch -- the same closed 3m candle
 # stays the "last completed" one for up to 5 minutes, so re-logging it every
 # ~60s (up to 5x per candle per instrument) was pure noise with no new
 # information.
@@ -958,7 +958,7 @@ def fetch_daily_pivot(client, inst: InstrumentConfig) -> Optional[tuple]:
     """Fetch the previous COMPLETED day's daily OHLC and compute pivot
     R1/S1. This only changes once per trading day, so it's cached and
     refreshed on its own slow cadence (`config.daily_refresh_interval`),
-    separate from the 5m Supertrend signal below -- no reason to re-pull
+    separate from the 3m Supertrend signal below -- no reason to re-pull
     30 days of daily bars on the same fast cadence used for the intraday
     crossover check."""
     end = datetime.now(IST).date()
@@ -986,7 +986,7 @@ def fetch_daily_pivot(client, inst: InstrumentConfig) -> Optional[tuple]:
 
 def compute_instrument_signal(client, inst: InstrumentConfig, r1: float, s1: float,
                                ltp: Optional[float] = None) -> Optional[InstrumentSignal]:
-    """Fetch 5m history for one instrument and compute Supertrend(7,3) off
+    """Fetch 3m history for one instrument and compute Supertrend(7,3) off
     the last genuinely CLOSED bar, plus live LTP. `r1`/`s1` come from the
     separately-cached `fetch_daily_pivot()` (see StrategyEngine.get_signal)
     -- this function no longer re-fetches daily history itself. Returns
@@ -1637,7 +1637,7 @@ class StrategyEngine:
         daily pivot (R1/S1) only changes once per trading day, so it's
         refreshed on its own slow cadence (`config.daily_refresh_interval`,
         default 600s) -- no reason to re-pull 30 days of daily bars on the
-        same fast cadence as the 5m Supertrend signal. The 5m Supertrend
+        same fast cadence as the 3m Supertrend signal. The 3m Supertrend
         signal changes every candle, so it's refreshed at most once per
         `config.indicator_refresh_interval` (default 15s), close enough to
         the underlying candle's own close that entry/exit detection isn't
@@ -2450,7 +2450,7 @@ class StrategyEngine:
                     has_position = bool(leg.position.symbol)
 
                     if option_type == "PE":
-                        # Entry: closed 5m candle confirms bullish (pivot R1
+                        # Entry: closed 3m candle confirms bullish (pivot R1
                         # break + Supertrend below that candle's own close),
                         # AND live LTP confirms the breakout is still live by
                         # trading above that same candle's High.
@@ -2461,7 +2461,7 @@ class StrategyEngine:
                         )
                         exit_condition = signal.supertrend > signal.ltp
                     else:
-                        # Entry: closed 5m candle confirms bearish (pivot S1
+                        # Entry: closed 3m candle confirms bearish (pivot S1
                         # break + Supertrend above that candle's own close),
                         # AND live LTP confirms the breakdown is still live by
                         # trading below that same candle's Low.
