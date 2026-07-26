@@ -344,6 +344,13 @@ class LegPosition:
 class LegState:
     trade_count: int = 0
     position: LegPosition = field(default_factory=LegPosition)
+    # The engine's own reference close (PIVOT: last_close: EMA: close_prev1)
+    # captured at the moment this leg last ENTERED -- persists across that
+    # position's own close/reset (unlike LegPosition, which is wiped in
+    # _finalize_exit) so a same-candle re-entry can be blocked even after an
+    # intra-candle square-off. None means "no entry yet today" (or since the
+    # last daily reset) -- never blocks a first entry.
+    last_entry_ref_close: Optional[float] = None
 
 
 @dataclass
@@ -649,6 +656,7 @@ class StateStore:
             leg_raw = legs_data.get(key, {})
             leg = LegState()
             leg.trade_count = leg_raw.get("trade_count", 0)
+            leg.last_entry_ref_close = leg_raw.get("last_entry_ref_close")
             pos_raw = leg_raw.get("position", {})
             leg.position = LegPosition(**{**asdict(LegPosition()), **pos_raw})
             self.state.legs[key] = leg
@@ -665,6 +673,7 @@ class StateStore:
             "legs": {
                 key: {
                     "trade_count": leg.trade_count,
+                    "last_entry_ref_close": leg.last_entry_ref_close,
                     "position": asdict(leg.position),
                 }
                 for key, leg in self.state.legs.items()
@@ -1399,6 +1408,7 @@ class StrategyEngine:
             self._chain_cache.clear()
             for leg in self.store.state.legs.values():
                 leg.trade_count = 0
+                leg.last_entry_ref_close = None
             self._save_state()
 
     def _within_entry_window(self, engine: str) -> bool:
@@ -1983,6 +1993,15 @@ class StrategyEngine:
                                     )
                                 exit_reason = "ema_rsi_reversal"
 
+                            # Each engine's own reference close for this
+                            # instrument's CURRENT candle -- PIVOT's
+                            # last_close / EMA's close_prev1 only change when
+                            # a new candle closes, so comparing against
+                            # last_entry_ref_close is equivalent to "did this
+                            # leg already enter on this same candle" without
+                            # needing a separate candle_key field.
+                            ref_close = sig.last_close if engine == "PIVOT" else sig.close_prev1
+
                             if has_position:
                                 exit_already_committed = bool(leg.position.exit_order_id) or leg.position.exit_filled
                                 if exit_condition or exit_already_committed:
@@ -1995,9 +2014,20 @@ class StrategyEngine:
                                 continue
                             if leg.trade_count >= config.max_trades_per_leg_per_day:
                                 continue
+                            # Already entered once on THIS candle (entered
+                            # and squared off again before the candle
+                            # closed) -- don't re-enter on the same candle's
+                            # data even though entry_condition still matches;
+                            # wait for the next candle. Cleared automatically
+                            # once ref_close moves (new candle) or at the
+                            # next daily reset.
+                            if (leg.last_entry_ref_close is not None
+                                    and leg.last_entry_ref_close == ref_close):
+                                continue
                             if not entry_condition:
                                 continue
 
+                            leg.last_entry_ref_close = ref_close
                             self._enter_leg(leg_key, inst, option_type, spot=signal.ltp)
                 except Exception as exc:
                     Log.exception(f"[{inst.name}] Cycle failed for this instrument (other "
