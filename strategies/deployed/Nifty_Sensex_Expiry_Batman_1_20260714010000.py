@@ -457,6 +457,15 @@ class Broker:
             version=self.env.version,
             timeout=self.env.timeout,
             ws_url=self.env.ws_url,
+            # PriceStream._watchdog_loop already owns full reconnect +
+            # resubscribe on this same client. Leaving the SDK's own
+            # auto_reconnect thread enabled races it: both call
+            # _do_connect() on self.ws independently, which can tear
+            # down/replace the socket concurrently and immediately trigger
+            # another spurious close -- observed in production as a
+            # ~45-50s repeating "connection down" cycle that never
+            # settles. The watchdog is the single owner of reconnect.
+            auto_reconnect=False,
         )
         Log.info("Connected to OpenAlgo")
         return self.client
