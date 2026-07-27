@@ -1331,6 +1331,11 @@ class StrategyEngine:
         self._signal_executor = ThreadPoolExecutor(
             max_workers=len(INSTRUMENTS), thread_name_prefix="sigrefresh"
         )
+        # Dedicated single worker for report_pnl_tick's platform push --
+        # separate from _fill_executor so a fill-watcher blocked for minutes
+        # (reprice loop) can never make the live PnL display go stale too;
+        # PnL pushes are small/fast and only need to run one at a time.
+        self._pnl_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pnltick")
         self._expiry_cache: dict[str, str] = {}
         self._chain_cache: dict[str, dict] = {}
         self._signal_refresh_pending: set[str] = set()
@@ -1486,7 +1491,16 @@ class StrategyEngine:
                     "current_price": current_px, "pnl": pnl,
                     "entry_time": pos.entry_time, "execution_id": pos.execution_id,
                 })
-            report_pnl_to_platform(self.env, self.store.state.today_realized_pnl, open_positions)
+            try:
+                self._pnl_executor.submit(
+                    report_pnl_to_platform, self.env, self.store.state.today_realized_pnl,
+                    open_positions,
+                )
+            except Exception as exc:
+                # .submit() itself can raise (transient thread-creation
+                # hiccup, same class as notify_trade_closed's dispatch) --
+                # never let it crash this 0.8s job.
+                Log.warning(f"Failed to dispatch report_pnl_to_platform: {exc}")
         except Exception as exc:
             Log.exception(f"report_pnl_tick failed: {exc}")
 
@@ -1691,7 +1705,18 @@ class StrategyEngine:
             # exactly the class of bug this codebase already fixed elsewhere
             # (see the "~11-minute production stall" note in these scripts'
             # module docstrings) for every other REST call on this thread.
-            self._fill_executor.submit(notify_trade_closed, self.env, log_warning=Log.warning)
+            try:
+                self._fill_executor.submit(notify_trade_closed, self.env, log_warning=Log.warning)
+            except Exception as exc:
+                # .submit() itself can raise (e.g. RuntimeError: can't start
+                # new thread, a transient OS-level thread-creation hiccup --
+                # confirmed NOT a leak, just occasional resource contention)
+                # before it ever returns a Future. Uncaught, this crashed
+                # _finalize_exit and aborted the whole leg-exit cycle in
+                # production. This push is fire-and-forget/best-effort (see
+                # notify_trade_closed's own docstring) -- losing one live SSE
+                # nudge is harmless; crashing leg finalization over it is not.
+                Log.warning(f"[{leg_key}] Failed to dispatch notify_trade_closed: {exc}")
         else:
             Log.warning(f"[{leg_key}] Could not fetch exit LTP for trade log -- "
                         f"will retry next cycle instead of finalizing.")
@@ -2239,12 +2264,14 @@ def main():
         price_stream.stop()
         engine._fill_executor.shutdown(wait=False)
         engine._signal_executor.shutdown(wait=False)
+        engine._pnl_executor.shutdown(wait=False)
     except Exception:
         Log.exception("Scheduler stopped unexpectedly -- cleaning up before exit.")
         scheduler.shutdown(wait=False)
         price_stream.stop()
         engine._fill_executor.shutdown(wait=False)
         engine._signal_executor.shutdown(wait=False)
+        engine._pnl_executor.shutdown(wait=False)
         raise
 
 

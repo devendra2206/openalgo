@@ -1338,6 +1338,11 @@ class StrategyEngine:
         # silently behind them for minutes with no log line and no
         # escalation, exactly when a human is trying to intervene fastest.
         self._bg_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bgcheck")
+        # Dedicated single worker for report_pnl_tick's platform push --
+        # separate from _fill_executor so a fill-watcher blocked for minutes
+        # (reprice loop) can never make the live PnL display go stale too;
+        # PnL pushes are small/fast and only need to run one at a time.
+        self._pnl_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pnltick")
         # Guards the entry/repair chain-fetch background dispatch (see
         # _enter_straddle_bg/_maybe_fire_repair_bg) -- separate from
         # _pending_fills since it tracks "a chain fetch is in flight", not
@@ -1815,7 +1820,18 @@ class StrategyEngine:
             # would stall every OTHER leg's check for up to 3s on a slow/stuck
             # local Flask response -- exactly the class of bug this codebase
             # already fixed elsewhere for every other REST call on this thread.
-            self._fill_executor.submit(notify_trade_closed, self.env, log_warning=Log.warning)
+            try:
+                self._fill_executor.submit(notify_trade_closed, self.env, log_warning=Log.warning)
+            except Exception as exc:
+                # .submit() itself can raise (e.g. RuntimeError: can't start
+                # new thread, a transient OS-level thread-creation hiccup --
+                # confirmed NOT a leak, just occasional resource contention)
+                # before it ever returns a Future. Uncaught, this crashed
+                # _finalize_close and aborted the whole leg-close cycle in
+                # production. This push is fire-and-forget/best-effort (see
+                # notify_trade_closed's own docstring) -- losing one live SSE
+                # nudge is harmless; crashing leg finalization over it is not.
+                Log.warning(f"[{leg_key}] Failed to dispatch notify_trade_closed: {exc}")
         else:
             # Both the WS cache and the REST fallback failed at this exact
             # moment -- the exit already filled at the broker (that's the
@@ -2252,7 +2268,16 @@ class StrategyEngine:
                         "quantity": leg.quantity, "entry_price": leg.entry_px, "current_price": ltp, "pnl": pnl,
                         "entry_time": leg.entry_time, "execution_id": leg.execution_id,
                     })
-            report_pnl_to_platform(self.env, self.store.state.today_realized_pnl, open_positions)
+            try:
+                self._pnl_executor.submit(
+                    report_pnl_to_platform, self.env, self.store.state.today_realized_pnl,
+                    open_positions,
+                )
+            except Exception as exc:
+                # .submit() itself can raise (transient thread-creation
+                # hiccup, same class as notify_trade_closed's dispatch) --
+                # never let it crash this 0.8s job.
+                Log.warning(f"Failed to dispatch report_pnl_to_platform: {exc}")
         except Exception as exc:
             Log.exception(f"report_pnl_tick failed: {exc}")
 
@@ -2587,6 +2612,7 @@ def main():
         price_stream.stop()
         engine._fill_executor.shutdown(wait=False)
         engine._bg_executor.shutdown(wait=False)
+        engine._pnl_executor.shutdown(wait=False)
     except Exception:
         # scheduler.start() shouldn't normally raise anything else (job
         # exceptions are caught/logged by APScheduler itself), but if it
@@ -2597,6 +2623,7 @@ def main():
         price_stream.stop()
         engine._fill_executor.shutdown(wait=False)
         engine._bg_executor.shutdown(wait=False)
+        engine._pnl_executor.shutdown(wait=False)
         raise
 
 
