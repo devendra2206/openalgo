@@ -78,6 +78,12 @@ class FyersWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self._hsm_batch_timer: threading.Timer | None = None
         self._hsm_batch_lock = threading.Lock()
 
+        # Guards the background reconnect thread (see subscribe()'s
+        # needs_reconnect branch) -- at most one reconnect attempt in flight.
+        self._reconnect_thread: threading.Thread | None = None
+        self._reconnect_done = threading.Event()
+        self._reconnect_result: dict | None = None
+
         # Shared dispatcher registry, keyed by f"{data_type}_{full_symbol}"
         # (same shape FyersAdapter uses for its `subscription_callbacks` keys).
         # Every flush WRITES into this single dict and every dispatcher READS
@@ -176,6 +182,58 @@ class FyersWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.connected = False
             return {"status": "error", "message": str(e)}
 
+    def _trigger_background_reconnect(self, wait_seconds: float = 2.0) -> Optional[dict]:
+        """Kick off connect() on a background thread instead of the caller
+        blocking on it for up to ~15s (see subscribe()'s needs_reconnect
+        branch for why). Waits up to `wait_seconds` for the attempt to
+        finish and returns its real result if it does -- a genuine auth
+        failure (expired/invalid token) is almost always rejected fast by
+        the broker, well under this window, and callers upstream
+        (websocket_proxy/connection_manager.py's ConnectionPool.subscribe())
+        pattern-match the returned error message for auth-failure keywords
+        to trigger token-refresh recovery. Returning a generic message
+        instead of the real one would silently break that recovery path.
+        Only the genuinely slow case (no response at all -- network issue,
+        broker down) falls through past `wait_seconds` and returns None,
+        capping the worst-case block at `wait_seconds` instead of ~15s.
+        Guarded by _reconnect_thread so at most one attempt is ever in
+        flight -- FyersAdapter.connect() itself also guards against a
+        concurrent attempt via its own `connecting` flag, so a second
+        trigger while one is already running just waits on the same
+        in-flight attempt's completion event instead of starting another."""
+        with self.lock:
+            already_running = (
+                self._reconnect_thread is not None and self._reconnect_thread.is_alive()
+            )
+            if not already_running:
+                self._reconnect_done.clear()
+                self._reconnect_result = None
+                self._reconnect_thread = threading.Thread(
+                    target=self._background_reconnect, daemon=True, name="fyers-ws-reconnect"
+                )
+                self._reconnect_thread.start()
+
+        if self._reconnect_done.wait(timeout=wait_seconds):
+            return self._reconnect_result
+        return None
+
+    def _background_reconnect(self):
+        try:
+            result = self.connect()
+            if result and result.get("status") == "success":
+                self.logger.info("Background reconnect to Fyers WebSocket succeeded")
+            else:
+                self.logger.warning(
+                    f"Background reconnect to Fyers WebSocket failed: "
+                    f"{(result or {}).get('message')}"
+                )
+        except Exception as exc:
+            self.logger.exception(f"Background reconnect to Fyers WebSocket raised: {exc}")
+            result = {"status": "error", "message": str(exc)}
+        finally:
+            self._reconnect_result = result
+            self._reconnect_done.set()
+
     def disconnect(self):
         """Disconnect from the Fyers WebSocket and cleanup all resources"""
         try:
@@ -259,26 +317,38 @@ class FyersWebSocketAdapter(BaseBrokerWebSocketAdapter):
             depth_level: Depth level for order book (not used in Fyers)
         """
         try:
-            # Auto-reconnect if disconnected. The two pre-existing branches
-            # (outer adapter missing vs inner FyersAdapter disconnected) are
-            # collapsed into a single connect() call: connect() recreates the
-            # inner adapter if absent and reuses it otherwise. On failure, the
-            # underlying error from connect_result["message"] is surfaced so
-            # the ConnectionPool's auth-recovery (issue #1419) can detect a
-            # stale token via keyword match and rebuild this adapter against
-            # a freshly-read auth_db token.
+            # Auto-reconnect if disconnected. connect() can block for up to
+            # ~15s (FyersAdapter.connect()'s time.sleep(0.1) poll loop
+            # waiting for the WS handshake/auth) -- subscribe() is called
+            # synchronously from websocket_proxy/server.py's asyncio event
+            # loop, which also handles ping/pong for EVERY connected proxy
+            # client. Blocking here for up to 15s freezes that loop entirely,
+            # so every other client's WS ping-timeout (10s in the openalgo
+            # SDK) fires at once -- a correlated mass-disconnect across
+            # every strategy process, unrelated to any of them individually.
+            # Reconnect on a background thread with a short bounded wait
+            # instead: a genuine auth failure (expired/invalid token) is
+            # almost always rejected fast, well under 2s, so its real error
+            # message still reaches ConnectionPool.subscribe()'s auth-error
+            # keyword match (connection_manager.py) for token-refresh
+            # recovery. Only the genuinely slow case (no response at all)
+            # falls through to the generic message, capped at ~2s instead
+            # of ~15s -- the caller (proxy -> strategy watchdog) already
+            # retries a failed subscribe on its own next cycle either way.
             needs_reconnect = (
                 not self.connected
                 or not self.fyers_adapter
                 or not self.fyers_adapter.connected
             )
             if needs_reconnect:
-                self.logger.info("Not connected to Fyers - attempting to reconnect...")
-                connect_result = self.connect()
-                if not connect_result or connect_result.get("status") != "success":
-                    err = (connect_result or {}).get(
-                        "message"
-                    ) or "Failed to reconnect to Fyers WebSocket"
+                connect_result = self._trigger_background_reconnect()
+                if connect_result is None:
+                    return {
+                        "status": "error",
+                        "message": "Not connected to Fyers WebSocket -- reconnect in progress, retry shortly",
+                    }
+                if connect_result.get("status") != "success":
+                    err = connect_result.get("message") or "Failed to reconnect to Fyers WebSocket"
                     self.logger.error(f"Failed to reconnect to Fyers WebSocket: {err}")
                     return {"status": "error", "message": err}
                 self.logger.info("Successfully reconnected to Fyers WebSocket")
