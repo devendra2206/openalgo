@@ -195,6 +195,54 @@ Low conflict risk unless upstream touches the same ~15 lines of
 
 ---
 
+## `services/websocket_client.py` (+12 / -1 lines)
+
+One-line fix (plus comment) to a real production crash: `self.lock` was a
+plain `threading.Lock()` — under gunicorn's eventlet worker that's a
+greenlet-cooperative lock, valid only within the hub's single OS thread. But
+this file already runs its asyncio event loop on a genuine separate OS thread
+via `_original_threading.Thread` (the existing `eventlet.patcher.original`
+escape hatch, used because `asyncio.new_event_loop()` can't run inside a
+green thread) — and `_handle_message()`, which only ever executes inside
+that real thread, acquired the same `self.lock` that `subscribe()`/
+`unsubscribe()` acquire from ordinary eventlet-green Flask-request code.
+Acquiring/releasing a greenlet-cooperative lock across that real-vs-green OS
+thread boundary crashes with `greenlet.error: Cannot switch to a different
+thread` — observed taking down the Sandbox engine's position-feed
+subscription path (`sandbox/websocket_execution_engine.py`) in production.
+Fix: `self.lock = _original_threading.Lock()` — a genuine OS-native lock has
+no greenlet affinity and works from either side.
+
+Low conflict risk — a single-line change plus a comment block, isolated to
+`__init__`.
+
+---
+
+## `websocket_proxy/server.py` (+15 / -3 lines)
+
+Fixes an asymmetry in `subscribe_client()`: unlike `unsubscribe_client()`
+(which already refcounts via `self.subscription_index` and only calls
+`adapter.unsubscribe()` for the *last* client on a symbol), `subscribe_client()`
+called `adapter.subscribe()` unconditionally for *every* client's request,
+even when another client already held that exact `(symbol, exchange, mode)`
+live. Several broker adapters (e.g. `broker/zerodha/streaming/zerodha_adapter.py`'s
+`subscribe()`) unconditionally re-enqueue a fresh subscribe on every call
+regardless of whether the token is already streaming — so a redundant
+re-subscribe from one client (e.g. a strategy process's routine reconnect)
+could reset/interrupt that symbol's tick delivery for every *other* client
+already subscribed to it. This matters here specifically because multiple
+independently-running strategy processes commonly share the same underlying
+symbols (all 5 NIFTY/SENSEX scripts subscribe to `NIFTY.NSE_INDEX`, for
+example) via one pooled broker adapter per user. Fix mirrors the existing
+refcount check in reverse: skip the adapter call when
+`self.subscription_index` already has a subscriber for that key.
+
+Low conflict risk — an isolated ~15-line change inside one method's loop
+body; only conflicts if upstream also touches `subscribe_client`'s
+subscribe-vs-index-update ordering.
+
+---
+
 ## Frontend
 
 ### `frontend/src/App.tsx` (+6 lines)
@@ -304,3 +352,13 @@ Summary of what's in them (all 5 original scripts, unless noted):
   actually WS-cached — previously `report_pnl_tick` could never see an open
   position for these two scripts specifically, since the option symbol was
   never subscribed at all.
+- **2026-07-27, all 6 scripts:** `Broker.connect()` now passes
+  `auto_reconnect=False` to the `api()` client. The SDK's own built-in
+  auto-reconnect thread (`openalgo` package's `feed.py`) was racing each
+  script's own `PriceStream._watchdog_loop`, which already owns full
+  reconnect + resubscribe on the same client — both independently calling
+  `_do_connect()` on `self.ws` could tear down/replace the socket
+  concurrently and immediately trigger another spurious close. Observed in
+  production as a repeating ~45-50s "connection down" cycle that never
+  settled (70-100+ reconnects in a single session). The watchdog is now the
+  sole owner of reconnect for every script.
