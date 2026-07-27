@@ -69,7 +69,18 @@ class WebSocketClient:
 
         # Subscription tracking
         self.active_subscriptions = {}
-        self.lock = threading.Lock()
+        # Must be the ORIGINAL (unpatched) Lock, not eventlet's monkey-patched
+        # one: _handle_message() acquires this from inside the real OS thread
+        # running the asyncio loop (see _original_threading.Thread above),
+        # while subscribe()/unsubscribe()/get_ltp() acquire it from ordinary
+        # eventlet-green Flask request code. A greenlet-cooperative Lock
+        # can't be waited on/released across that real-vs-green OS thread
+        # boundary -- eventlet's hub can't switch to a suspended greenlet
+        # that belongs to a different native thread's stack, which crashes
+        # with "greenlet.error: Cannot switch to a different thread." A
+        # genuine OS-native Lock has no such affinity and works from either
+        # side.
+        self.lock = _original_threading.Lock()
 
         # Market data cache
         self.market_data_cache = {}
