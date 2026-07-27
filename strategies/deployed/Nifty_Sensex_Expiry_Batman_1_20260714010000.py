@@ -186,7 +186,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from openalgo import api
 
 try:
-    from _strategy_platform_client import notify_trade_closed
+    from _strategy_platform_client import notify_trade_closed, filter_known_fields
 except ImportError:
     # Shared helper (strategies/scripts/_strategy_platform_client.py) not
     # present alongside this script -- e.g. it was copied out standalone.
@@ -194,6 +194,14 @@ except ImportError:
     # fire, but nothing else about the strategy is affected.
     def notify_trade_closed(env, log_warning=None):
         pass
+
+    # Same behavior as the shared module's version (see its own docstring) --
+    # trivial and dependency-free enough to duplicate exactly rather than
+    # degrade, unlike notify_trade_closed above which genuinely needs
+    # network/env access it can't have as a standalone fallback.
+    def filter_known_fields(cls, raw):
+        known = set(vars(cls()).keys())
+        return {k: v for k, v in raw.items() if k in known}
 
 load_dotenv()
 
@@ -724,10 +732,10 @@ class StateStore:
             inst_state = InstrumentState()
             inst_state.traded_today = raw.get("traded_today", False)
             inst_state.exited_today = raw.get("exited_today", False)
-            inst_state.pe = OptionLeg(**{**asdict(OptionLeg()), **raw.get("pe", {})})
-            inst_state.ce = OptionLeg(**{**asdict(OptionLeg()), **raw.get("ce", {})})
-            inst_state.pe_repair = RepairLeg(**{**asdict(RepairLeg()), **raw.get("pe_repair", {})})
-            inst_state.ce_repair = RepairLeg(**{**asdict(RepairLeg()), **raw.get("ce_repair", {})})
+            inst_state.pe = OptionLeg(**{**asdict(OptionLeg()), **filter_known_fields(OptionLeg, raw.get("pe", {}))})
+            inst_state.ce = OptionLeg(**{**asdict(OptionLeg()), **filter_known_fields(OptionLeg, raw.get("ce", {}))})
+            inst_state.pe_repair = RepairLeg(**{**asdict(RepairLeg()), **filter_known_fields(RepairLeg, raw.get("pe_repair", {}))})
+            inst_state.ce_repair = RepairLeg(**{**asdict(RepairLeg()), **filter_known_fields(RepairLeg, raw.get("ce_repair", {}))})
             self.state.instruments[inst.name] = inst_state
         Log.info(f"State loaded from {self.path}")
         return self.state

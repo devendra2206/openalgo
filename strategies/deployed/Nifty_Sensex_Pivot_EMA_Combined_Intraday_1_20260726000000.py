@@ -161,7 +161,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from openalgo import api, ta
 
 try:
-    from _strategy_platform_client import notify_trade_closed
+    from _strategy_platform_client import notify_trade_closed, filter_known_fields
 except ImportError:
     # Shared helper (strategies/scripts/_strategy_platform_client.py) not
     # present alongside this script -- e.g. it was copied out standalone.
@@ -171,6 +171,14 @@ except ImportError:
     # be a far worse outcome than losing one dashboard convenience.
     def notify_trade_closed(env, log_warning=None):
         pass
+
+    # Same behavior as the shared module's version (see its own docstring) --
+    # trivial and dependency-free enough to duplicate exactly rather than
+    # degrade, unlike notify_trade_closed above which genuinely needs
+    # network/env access it can't have as a standalone fallback.
+    def filter_known_fields(cls, raw):
+        known = set(vars(cls()).keys())
+        return {k: v for k, v in raw.items() if k in known}
 
 load_dotenv()
 
@@ -678,7 +686,7 @@ class StateStore:
             leg.trade_count = leg_raw.get("trade_count", 0)
             leg.last_entry_ref_close = leg_raw.get("last_entry_ref_close")
             pos_raw = leg_raw.get("position", {})
-            leg.position = LegPosition(**{**asdict(LegPosition()), **pos_raw})
+            leg.position = LegPosition(**{**asdict(LegPosition()), **filter_known_fields(LegPosition, pos_raw)})
             self.state.legs[key] = leg
         Log.info(f"State loaded from {self.path}")
         return self.state

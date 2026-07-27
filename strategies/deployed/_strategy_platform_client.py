@@ -102,3 +102,29 @@ def notify_trade_closed(env, log_warning=None) -> None:
     except Exception as exc:
         if log_warning is not None:
             log_warning(f"notify_trade_closed failed: {exc}")
+
+
+def filter_known_fields(cls, raw: dict) -> dict:
+    """Drop any keys in `raw` that aren't fields of `cls` before it gets
+    spread into that dataclass's constructor.
+
+    Why this exists: a persisted strategy_state_{tag}.json survives across
+    restarts AND across redeploys of a new script version onto an existing
+    server. If a dataclass's field set ever changes between versions (a
+    field renamed or removed -- this project has done exactly that, e.g.
+    LegPosition gained exit_fill_px in one revision), the OLD state file on
+    disk still has the old field names. The previous pattern --
+    `SomeClass(**{**asdict(SomeClass()), **raw})` -- spreads `raw` with NO
+    filtering, so a single stale key raises TypeError ("unexpected keyword
+    argument") and crashes state loading entirely, taking the whole
+    strategy process down before it even connects to the broker. Dropping
+    the stale field instead (silently -- the caller can log it) is far
+    safer than refusing to start over a field the current code doesn't even
+    use anymore.
+
+    `cls`: the dataclass itself (not an instance) -- e.g. LegPosition,
+    OptionLeg, InstrumentLock. Uses `vars(cls())` rather than
+    `dataclasses.fields()` so this needs no extra import beyond what every
+    script already has."""
+    known = set(vars(cls()).keys())
+    return {k: v for k, v in raw.items() if k in known}
