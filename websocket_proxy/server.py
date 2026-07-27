@@ -1222,8 +1222,21 @@ class WebSocketProxy:
             if not symbol or not exchange:
                 continue  # Skip invalid symbols
 
-            # Subscribe to market data
-            response = adapter.subscribe(symbol, exchange, mode, depth_level)
+            sub_key = (symbol, exchange, mode)
+            # Another client already holds this exact (symbol, exchange, mode)
+            # live at the broker -- skip re-sending subscribe to the adapter.
+            # A redundant re-subscribe for an already-streaming token can
+            # reset/interrupt that token's tick delivery at the broker's own
+            # feed (e.g. broker/zerodha/streaming/zerodha_adapter.py's
+            # subscribe() unconditionally re-enqueues a fresh subscribe on
+            # every call, regardless of whether the token is already
+            # streaming), which would otherwise silently disrupt every OTHER
+            # client already subscribed to the same symbol. Mirrors the
+            # refcount check unsubscribe_client already does in reverse.
+            if self.subscription_index.get(sub_key):
+                response = {"status": "success"}
+            else:
+                response = adapter.subscribe(symbol, exchange, mode, depth_level)
 
             if response.get("status") == "success":
                 # Store the subscription
@@ -1241,7 +1254,6 @@ class WebSocketProxy:
                     self.subscriptions[client_id] = {json.dumps(subscription_info)}
 
                 # OPTIMIZATION: Update subscription index for O(1) lookup
-                sub_key = (symbol, exchange, mode)
                 self.subscription_index[sub_key].add(client_id)
 
                 # Add to successful subscriptions
