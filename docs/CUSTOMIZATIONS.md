@@ -243,6 +243,43 @@ subscribe-vs-index-update ordering.
 
 ---
 
+## `sandbox/websocket_execution_engine.py` (+24 / -1 lines)
+
+Second instance of the same eventlet cross-thread lock crash class as
+`services/websocket_client.py` above — a different lock object, same root
+cause. `self._lock` was a plain `threading.Lock()` (greenlet-cooperative
+under eventlet). It's acquired from two different thread contexts:
+
+1. **The real OS thread**: `_on_market_data()` is registered as a
+   `market_data` callback (`services/websocket_service.py`'s
+   `register_market_data_callback()` → `client.register_callback(...)`) and
+   gets invoked synchronously inside `services/websocket_client.py`'s
+   `_handle_message()`, which only ever runs on that client's dedicated real
+   OS thread (hosting its own `asyncio` event loop).
+2. **Ordinary eventlet-green Flask request code**: `notify_order_placed()`,
+   `notify_position_opened()`, `notify_position_closed()`,
+   `_rebuild_order_index()` — all touch the same `self._lock`, called from
+   normal API routes (placing/closing a sandbox order).
+
+A greenlet-cooperative lock can't be waited on/released across that
+real-vs-green OS thread boundary — eventlet's hub can't resume a suspended
+greenlet belonging to a different native thread's stack, producing
+`greenlet.error: Cannot switch to a different thread`. This one fires far
+more often than the first instance, since it's on the hot path for every
+incoming tick with a matching pending order or open position — i.e.
+constantly during active trading, which matches the ~26/day, trading-hours-
+clustered occurrences observed in production (2026-07-28) even AFTER the
+first lock fix was deployed and the server restarted. Fixed the same way:
+`self._lock = _original_threading.Lock()` (the file's own
+`eventlet.patcher.original("threading")` escape hatch, added alongside).
+
+Low conflict risk — an isolated change to `__init__` plus one added
+module-level `if "eventlet" in sys.modules:` block, mirroring the existing
+pattern already used in `services/websocket_client.py` and
+`services/telegram_bot_service.py`.
+
+---
+
 ## Frontend
 
 ### `frontend/src/App.tsx` (+6 lines)

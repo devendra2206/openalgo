@@ -27,6 +27,29 @@ from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Must be the ORIGINAL (unpatched) threading module, not eventlet's
+# monkey-patched one: _on_market_data() (registered as a market_data
+# callback -- see services/websocket_service.py's register_market_data_callback)
+# is invoked synchronously from services/websocket_client.py's
+# _handle_message(), which only ever runs on that client's dedicated real OS
+# thread (hosting its own asyncio event loop). _lock below is ALSO acquired
+# from ordinary eventlet-green Flask request code (notify_order_placed,
+# notify_position_opened/closed, _rebuild_order_index, when a user places/
+# closes a sandbox order via the API). A greenlet-cooperative Lock can't be
+# waited on/released across that real-vs-green OS thread boundary --
+# eventlet's hub can't switch to a suspended greenlet that belongs to a
+# different native thread's stack, which crashes with "greenlet.error:
+# Cannot switch to a different thread" (observed repeatedly in production,
+# correlated with trading-hours order/position activity). A genuine
+# OS-native Lock has no such affinity and works from either side. Same
+# pattern as services/websocket_client.py's self.lock fix.
+if "eventlet" in sys.modules:
+    import eventlet
+
+    _original_threading = eventlet.patcher.original("threading")
+else:
+    _original_threading = threading
+
 
 class WebSocketExecutionEngine:
     """
@@ -38,7 +61,7 @@ class WebSocketExecutionEngine:
         self.market_data_service = get_market_data_service()
         self._subscriber_id: str | None = None
         self._running = False
-        self._lock = threading.Lock()
+        self._lock = _original_threading.Lock()
 
         # Index of pending orders by symbol key (exchange:symbol)
         # Maps symbol_key -> list of order IDs
