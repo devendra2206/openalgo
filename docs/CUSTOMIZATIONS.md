@@ -389,6 +389,19 @@ Summary of what's in them (all 5 original scripts, unless noted):
   actually WS-cached — previously `report_pnl_tick` could never see an open
   position for these two scripts specifically, since the option symbol was
   never subscribed at all.
+- **2026-07-28, all 6 scripts:** `threading.stack_size(1024 * 1024)` set at
+  module load, before any thread is created. Python's default (8MB per
+  thread) reserves ~96MB of virtual address space across the ~12 threads
+  these scripts run at once (fill-watchers, signal-refresh, PnL push, the
+  trade-log writer, PriceStream's watchdog/WS threads) -- none of which do
+  anything beyond simple polling loops and REST calls, nowhere near deep
+  recursion. That ~96MB comes directly out of the `STRATEGY_MEMORY_LIMIT_MB`
+  `RLIMIT_AS` cap (`blueprints/python_strategy.py`'s `set_resource_limits()`,
+  1024MB by default) every strategy subprocess runs under -- confirmed in
+  production as the actual ceiling behind `RuntimeError: can't start new
+  thread` (2026-07-28, both on the Combined script's trade-log-writer spawn
+  and Batman's repair-fire dispatch). 1MB per thread is a generous margin
+  for this workload while reclaiming the bulk of that reserved space.
 - **2026-07-27, all 6 scripts:** `Broker.connect()` now passes
   `auto_reconnect=False` to the `api()` client. The SDK's own built-in
   auto-reconnect thread (`openalgo` package's `feed.py`) was racing each

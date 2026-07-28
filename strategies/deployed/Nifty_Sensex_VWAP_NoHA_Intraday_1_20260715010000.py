@@ -199,6 +199,22 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from openalgo import api, ta
 
+# Python's default thread stack reservation is 8MB. This process runs
+# several threads at once (fill-watchers, the Force Exit background check,
+# ATM-lock background dispatch, PnL push, the trade-log writer, plus
+# PriceStream's own watchdog/WS threads) -- none of which do anything
+# beyond simple polling loops and REST calls, nowhere near deep recursion.
+# At the default size that adds up to tens of MB of virtual address space
+# reserved purely for stacks, out of the STRATEGY_MEMORY_LIMIT_MB
+# RLIMIT_AS cap (blueprints/python_strategy.py's set_resource_limits(),
+# 1024MB by default) every strategy subprocess runs under -- confirmed in
+# production as the actual ceiling behind "RuntimeError: can't start new
+# thread" (2026-07-28, on the Combined script specifically, but the same
+# risk applies here). Must be called before any thread is created; affects
+# every threading.Thread from here on, including ones spawned internally
+# by ThreadPoolExecutor.
+threading.stack_size(1024 * 1024)  # 1MB, generous for these workloads
+
 try:
     from _strategy_platform_client import notify_trade_closed, filter_known_fields
 except ImportError:

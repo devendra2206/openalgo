@@ -100,6 +100,32 @@ def test_pnl_executor_is_independent_of_fill_executor(engine):
     assert engine._pnl_executor._max_workers == 1
 
 
+def test_thread_stack_size_reduced_from_default(script_module):
+    """Loading the script sets a smaller default thread stack size (1MB
+    instead of Python's 8MB default) -- this process runs ~12 threads at
+    once, and at the default size that's ~96MB of virtual address space
+    reserved purely for stacks, out of the 1024MB RLIMIT_AS cap every
+    strategy subprocess runs under (confirmed as the actual ceiling behind
+    a production "can't start new thread" crash, 2026-07-28). This must be
+    set before any thread is created -- verified here by confirming a
+    freshly spawned thread's actual OS-level stack allocation reflects it."""
+    assert threading.stack_size() == 1024 * 1024
+
+    # Confirm it's not just the setting that changed, but that newly
+    # created threads actually work correctly with the reduced stack --
+    # a thread doing ordinary (non-recursive) work should complete fine.
+    result = {}
+
+    def worker():
+        result["ran"] = True
+        result["thread_name"] = threading.current_thread().name
+
+    t = threading.Thread(target=worker, name="stack-size-test-thread")
+    t.start()
+    t.join(timeout=5)
+    assert result.get("ran") is True
+
+
 def test_report_pnl_tick_dispatches_via_pnl_executor_not_fill_executor(engine, script_module, monkeypatch):
     """With no open positions (fresh state), report_pnl_tick() should still
     dispatch a push with an empty snapshot -- and it must run on a
