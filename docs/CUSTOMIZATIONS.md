@@ -417,6 +417,23 @@ Summary of what's in them (all 5 original scripts, unless noted):
   thread` (2026-07-28, both on the Combined script's trade-log-writer spawn
   and Batman's repair-fire dispatch). 1MB per thread is a generous margin
   for this workload while reclaiming the bulk of that reserved space.
+
+  **Companion `.env` changes (not a code diff, so not tracked by git —
+  noted here for context since they were applied alongside this fix on
+  the same day):** `STRATEGY_MEMORY_LIMIT_MB` raised `1024` → `2048`
+  (doubles the `RLIMIT_AS` ceiling itself), and `OPENBLAS_NUM_THREADS` /
+  `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `NUMEXPR_NUM_THREADS` /
+  `NUMBA_NUM_THREADS` all set to `2` (previously unset, meaning OpenBLAS/
+  MKL default to one native thread per CPU core — those threads bypass
+  Python's `threading` module entirely, so the stack-size fix above has no
+  effect on them). Confirmed on a live process
+  (`MCX_CrudeOil_EMA9_RSI_Intraday_1`): `VmPeak` sits at a stable
+  ~1017MB regardless of these code-level changes (measured identical
+  before and after) — the actual protection came from doubling the
+  ceiling, not from either thread change reducing real usage. Both
+  settings require an `openalgo.service` restart to apply to newly-spawned
+  strategy subprocesses (read once via `os.environ.get(...)` at process
+  spawn time).
 - **2026-07-27, all 6 scripts:** `Broker.connect()` now passes
   `auto_reconnect=False` to the `api()` client. The SDK's own built-in
   auto-reconnect thread (`openalgo` package's `feed.py`) was racing each
