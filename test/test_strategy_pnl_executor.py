@@ -200,3 +200,124 @@ def test_submit_failure_is_caught_not_raised(engine, script_module, monkeypatch)
 
     # Must not raise.
     engine.report_pnl_tick()
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the periodic error re-push fix (2026-07-28).
+#
+# Background: push_leg_error() only fired once, on the transition into
+# error_state. If that one POST was lost (server busy, transient network
+# blip), the UI's error badge silently never appeared -- confirmed in
+# production: three legs sat in exit_failed for 1-4 hours with no UI error
+# shown, even though the strategy's own state.json correctly tracked the
+# error the whole time. _repush_active_errors() re-pushes at most once per
+# config.error_repush_interval_sec (60s) for every leg still in
+# error_state, so a single lost push self-heals within a minute.
+# ---------------------------------------------------------------------------
+
+def _make_errored_leg(engine, leg_key: str, error_state: str = "exit_failed"):
+    pos = engine.store.state.legs[leg_key].position
+    pos.symbol = "NIFTY04AUG2624000PE"
+    pos.error_state = error_state
+    pos.error_kind = "resting"
+    pos.error_order_id = "26072899949009"
+    return pos
+
+
+def _drain_pnl_executor(engine):
+    """_repush_active_errors() dispatches the actual push to _pnl_executor
+    (a background thread) -- submitting a no-op to that same single-worker
+    executor and waiting for its result guarantees every previously queued
+    task has already completed (FIFO, one worker), without a sleep/race."""
+    engine._pnl_executor.submit(lambda: None).result(timeout=5)
+
+
+def test_repush_dispatches_for_a_leg_in_error(engine, script_module, monkeypatch):
+    calls = []
+
+    def fake_push_leg_error(env, leg_key, pos, action=None, clear=False):
+        calls.append((leg_key, action))
+
+    monkeypatch.setattr(script_module, "push_leg_error", fake_push_leg_error)
+    _make_errored_leg(engine, "EMA_NIFTY_PE")
+
+    engine._repush_active_errors()
+    _drain_pnl_executor(engine)
+
+    assert len(calls) == 1
+    assert calls[0][0] == "EMA_NIFTY_PE"
+
+
+def test_repush_does_not_spam_within_interval(engine, script_module, monkeypatch):
+    """A second call within error_repush_interval_sec must NOT re-push --
+    only the first call (or one after the interval elapses) should."""
+    calls = []
+
+    def fake_push_leg_error(env, leg_key, pos, action=None, clear=False):
+        calls.append(leg_key)
+
+    monkeypatch.setattr(script_module, "push_leg_error", fake_push_leg_error)
+    _make_errored_leg(engine, "EMA_NIFTY_PE")
+
+    engine._repush_active_errors()
+    engine._repush_active_errors()
+    engine._repush_active_errors()
+    _drain_pnl_executor(engine)
+
+    assert len(calls) == 1, f"expected exactly 1 push within the interval, got {len(calls)}"
+
+
+def test_repush_fires_again_after_interval_elapses(engine, script_module, monkeypatch):
+    calls = []
+
+    def fake_push_leg_error(env, leg_key, pos, action=None, clear=False):
+        calls.append(leg_key)
+
+    monkeypatch.setattr(script_module, "push_leg_error", fake_push_leg_error)
+    monkeypatch.setattr(script_module.config, "error_repush_interval_sec", 0.2)
+    _make_errored_leg(engine, "EMA_NIFTY_PE")
+
+    engine._repush_active_errors()
+    time.sleep(0.3)
+    engine._repush_active_errors()
+    _drain_pnl_executor(engine)
+
+    assert len(calls) == 2
+
+
+def test_repush_stops_once_error_cleared(engine, script_module, monkeypatch):
+    """Once a leg's error_state is cleared (Retry/Cancel/Manual resolved
+    it), _repush_active_errors must stop pushing for it and drop its
+    tracked timestamp -- confirms no stale entries linger forever."""
+    calls = []
+
+    def fake_push_leg_error(env, leg_key, pos, action=None, clear=False):
+        calls.append(leg_key)
+
+    monkeypatch.setattr(script_module, "push_leg_error", fake_push_leg_error)
+    pos = _make_errored_leg(engine, "EMA_NIFTY_PE")
+
+    engine._repush_active_errors()
+    _drain_pnl_executor(engine)
+    assert "EMA_NIFTY_PE" in engine._last_error_push
+
+    pos.error_state = ""
+    engine._repush_active_errors()
+    _drain_pnl_executor(engine)
+
+    assert len(calls) == 1  # only the first call, before it was cleared
+    assert "EMA_NIFTY_PE" not in engine._last_error_push
+
+
+def test_repush_dispatch_failure_is_caught_not_raised(engine, script_module, monkeypatch):
+    """.submit() itself raising (transient thread-creation hiccup) must not
+    crash run_cycle -- same class of fix as report_pnl_tick's."""
+    _make_errored_leg(engine, "EMA_NIFTY_PE")
+
+    def raising_submit(*args, **kwargs):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(engine._pnl_executor, "submit", raising_submit)
+
+    # Must not raise.
+    engine._repush_active_errors()

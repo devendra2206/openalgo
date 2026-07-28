@@ -389,6 +389,21 @@ Summary of what's in them (all 5 original scripts, unless noted):
   actually WS-cached — previously `report_pnl_tick` could never see an open
   position for these two scripts specifically, since the option symbol was
   never subscribed at all.
+- **2026-07-28, all 6 scripts:** Periodic re-push for legs in error_state.
+  `push_leg_error()` previously only fired once, on the transition into
+  error_state — if that one POST was lost (server busy, transient network
+  blip), the UI's error badge silently never appeared, even though
+  state.json correctly tracked the error the whole time (confirmed in
+  production, 2026-07-28: three legs sat in `exit_failed` for 1-4 hours
+  with no UI error shown). New `StrategyEngine._repush_active_errors()`
+  re-pushes at most once per `config.error_repush_interval_sec` (60s,
+  new config field) for every leg still in `error_state`, called once per
+  `run_cycle()`. Dispatched via the existing `_pnl_executor` (not
+  `_fill_executor`), same reasoning as `report_pnl_tick`: must never queue
+  behind a fill-watcher stuck for minutes in a reprice loop. New
+  `_last_error_push: dict[str, datetime]` tracks per-leg last-push time and
+  self-clears once a leg's error is resolved. Covered by
+  `test/test_strategy_pnl_executor.py`.
 - **2026-07-28, all 6 scripts:** `threading.stack_size(1024 * 1024)` set at
   module load, before any thread is created. Python's default (8MB per
   thread) reserves ~96MB of virtual address space across the ~12 threads

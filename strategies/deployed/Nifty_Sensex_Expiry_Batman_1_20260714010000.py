@@ -301,6 +301,15 @@ class Config:
     place_order_max_attempts: int = 3
     place_order_retry_delay: float = 1.5
 
+    # push_leg_error() only pushed once, on the transition into error_state --
+    # a single lost POST (server busy, transient network blip) left the UI's
+    # error badge silently blank for hours even though state.json correctly
+    # tracked the error the whole time (confirmed in production, 2026-07-28:
+    # three legs sat in exit_failed for 1-4 hours with no UI error shown).
+    # Re-pushing at this interval for every leg still in error_state means a
+    # single lost push self-heals within a minute instead of indefinitely.
+    error_repush_interval_sec: float = 60.0
+
     state_file: str = "strategy_state.json"
     log_level: int = logging.INFO
 
@@ -1342,6 +1351,7 @@ class StrategyEngine:
         # active watcher so run_cycle doesn't submit a duplicate one next cycle.
         self._state_lock = threading.Lock()
         self._pending_fills: set[str] = set()
+        self._last_error_push: dict[str, datetime] = {}
         self._fill_executor = ThreadPoolExecutor(
             max_workers=len(INSTRUMENTS) * 4, thread_name_prefix="fillwatch"
         )
@@ -1605,6 +1615,43 @@ class StrategyEngine:
         exit_action = "SELL" if direction == "LONG" else "BUY"
         action = entry_action if error_state == "entry_failed" else exit_action
         push_leg_error(self.env, leg_key, leg, action=action)
+        self._last_error_push[leg_key] = datetime.now(IST)
+
+    def _repush_active_errors(self):
+        """push_leg_error() only fires once, on the transition into
+        error_state (above) -- if that one POST is lost (server busy,
+        transient network blip), the UI's error badge silently never
+        appears, even though state.json correctly tracks the error the
+        whole time (confirmed in production, 2026-07-28: three legs sat in
+        exit_failed for 1-4 hours with no UI error shown). Re-pushes at
+        most once per config.error_repush_interval_sec for every leg still
+        in error_state, so a single lost push self-heals within a minute
+        instead of leaving the UI blind indefinitely. Dispatched via
+        _pnl_executor (not _fill_executor) -- same reasoning as
+        report_pnl_tick: must never queue behind a fill-watcher stuck for
+        minutes in a reprice loop."""
+        now = datetime.now(IST)
+        for inst in INSTRUMENTS:
+            inst_state = self.store.state.instruments[inst.name]
+            for leg_key_suffix, leg, direction in (
+                ("PE", inst_state.pe, "LONG"), ("CE", inst_state.ce, "LONG"),
+                ("PE_repair", inst_state.pe_repair, "SHORT"), ("CE_repair", inst_state.ce_repair, "SHORT"),
+            ):
+                leg_key = f"{inst.name}_{leg_key_suffix}"
+                if not leg.error_state:
+                    self._last_error_push.pop(leg_key, None)
+                    continue
+                last = self._last_error_push.get(leg_key)
+                if last is not None and (now - last).total_seconds() < config.error_repush_interval_sec:
+                    continue
+                self._last_error_push[leg_key] = now
+                entry_action = "BUY" if direction == "LONG" else "SELL"
+                exit_action = "SELL" if direction == "LONG" else "BUY"
+                action = entry_action if leg.error_state == "entry_failed" else exit_action
+                try:
+                    self._pnl_executor.submit(push_leg_error, self.env, leg_key, leg, action=action)
+                except Exception as exc:
+                    Log.warning(f"[{leg_key}] Failed to dispatch periodic error re-push: {exc}")
 
     # ---- repair (search-and-sell, at most once per side per day) -----------
     def _maybe_fire_repair_bg(self, inst: InstrumentConfig, inst_state: InstrumentState,
@@ -2394,6 +2441,7 @@ class StrategyEngine:
     def run_cycle(self):
         try:
             self._reset_day_if_needed()
+            self._repush_active_errors()
 
             self._refresh_force_exit_check_bg()
             if self._force_exit_pending:
