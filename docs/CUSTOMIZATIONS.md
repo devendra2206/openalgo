@@ -95,6 +95,19 @@ git push origin custom-strategies
 ```
 
 **Sync log:**
+- **2026-07-29**: 39 commits pulled from upstream (broker funds/order-API
+  fixes across Angel/Dhan/Kotak/Upstox/Zerodha, Kotak order-streaming
+  adapter, Strategy Builder payoff audit, frontend `frontend/dist` rebuild).
+  Zero conflicts, including `frontend/dist/` — git resolved it automatically
+  this time. Confirmed via `git log upstream-old..upstream-new -- <file>`
+  that upstream touched none of this fork's customized core files
+  (`app.py`, `blueprints/python_strategy.py`,
+  `services/option_chain_service.py`, `services/websocket_client.py`,
+  `sandbox/websocket_execution_engine.py`, `websocket_proxy/server.py`,
+  `broker/fyers/streaming/fyers_websocket_adapter.py`) or `CLAUDE.md` in
+  this batch — 0-line diff against the pre-merge tip on all of them,
+  compiling clean, and this fork's full test suite (29 tests) still passing
+  post-merge.
 - **2026-07-26**: 22 commits pulled from upstream (skills additions, broker
   fixes, dependency bumps, `CLAUDE.md` restructure). Zero conflicts outside
   `frontend/dist/`. Verified `app.py`/`blueprints/python_strategy.py`/
