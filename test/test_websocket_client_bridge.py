@@ -128,6 +128,18 @@ def test_future_result_is_only_ever_read_on_the_loop_thread(client_with_running_
     monkeypatch.setattr(concurrent.futures.Future, "result", _tracking_result)
 
     async def coro():
+        # A tiny delay, not a correctness requirement of the fix itself --
+        # it exists purely so the loop thread can't possibly finish and
+        # mark the Future done before the calling thread has even
+        # registered add_done_callback(). concurrent.futures.Future runs a
+        # done callback immediately, in whichever thread calls
+        # add_done_callback(), if the future is ALREADY done at that
+        # point -- a bare `return 42` coroutine can race that, making this
+        # assertion flaky through no fault of the fix (an already-done
+        # Future's .result() returns immediately without blocking, so it
+        # never hits the crash-prone wait path either way -- this test is
+        # just about confirming the common case runs on the loop thread).
+        await asyncio.sleep(0.05)
         return 42
 
     calling_thread_id = threading.get_ident()
