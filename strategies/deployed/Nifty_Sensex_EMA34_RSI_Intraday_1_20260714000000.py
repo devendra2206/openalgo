@@ -296,6 +296,23 @@ class Config:
     # WebSocket LTP cache: a tick older than this is treated as stale and
     # falls back to a one-off REST client.quotes() call for that instrument.
     ws_stale_seconds: float = 20.0
+    # NIFTY.NSE_INDEX/SENSEX.BSE_INDEX only get a new tick when their
+    # underlying constituents actually trade and the index recalculates --
+    # in the first ~45 minutes after 09:15 this is naturally burstier than
+    # the rest of the day, with legitimate gaps wider than 20s between
+    # recalculations. At the normal threshold, the watchdog was
+    # misdiagnosing that normal opening-minutes irregularity as a dead
+    # connection and forcing repeated resubscribes/reconnects -- confirmed
+    # in production (2026-07-29) to reach all the way to a real
+    # Unsubscribe/resubscribe cycle at the broker adapter, which itself
+    # takes a moment to recover, compounding the next check's gap. A wider
+    # threshold during this specific window only affects how fast the
+    # WATCHDOG reacts to a genuinely dead connection (up to
+    # ws_stale_seconds_open instead of ws_stale_seconds before it notices
+    # and reconnects) -- it does not affect get_ltp()'s REST-fallback
+    # behavior, which stays at the tighter ws_stale_seconds everywhere.
+    ws_stale_seconds_open: float = 60.0
+    ws_post_open_grace_until: time = time(10, 0)
     ws_watchdog_interval: float = 15.0       # how often the reconnect watchdog checks staleness
     # Consecutive stale watchdog cycles (same symbol, in a row) before giving
     # up on the cheap per-symbol resubscribe and escalating to a full
@@ -463,6 +480,17 @@ def _within_market_hours() -> bool:
         return True
     now = datetime.now(IST).time()
     return time(9, 15) <= now <= config.market_close
+
+
+def _current_ws_stale_threshold() -> float:
+    """Widened staleness threshold for PriceStream's watchdog during the
+    post-open grace window (see config.ws_stale_seconds_open's docstring)
+    -- only affects how fast the watchdog reacts to a stale symbol, not
+    get_ltp()'s REST-fallback threshold, which stays at ws_stale_seconds."""
+    now = datetime.now(IST).time()
+    if time(9, 15) <= now < config.ws_post_open_grace_until:
+        return config.ws_stale_seconds_open
+    return config.ws_stale_seconds
 
 
 ###############################################################################
@@ -673,12 +701,13 @@ class PriceStream:
                 continue
 
             now = datetime.now(IST)
+            stale_threshold = _current_ws_stale_threshold()
             with self._lock:
                 tracked = list(self._instruments.items())
             stale_instruments = []
             for key, inst in tracked:
                 entry = self._cache.get(key)
-                if entry is None or (now - entry[1]).total_seconds() > config.ws_stale_seconds:
+                if entry is None or (now - entry[1]).total_seconds() > stale_threshold:
                     stale_instruments.append(inst)
 
             all_keys = {key for key, _ in tracked}

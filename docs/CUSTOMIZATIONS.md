@@ -444,3 +444,25 @@ Summary of what's in them (all 5 original scripts, unless noted):
   production as a repeating ~45-50s "connection down" cycle that never
   settled (70-100+ reconnects in a single session). The watchdog is now the
   sole owner of reconnect for every script.
+- **2026-07-29, 5 scripts (Combined, EMA34_RSI, Pivot_Supertrend, VWAP_NoHA,
+  Expiry_Batman — NOT MCX, which never subscribes to `NSE_INDEX`/
+  `BSE_INDEX`):** widened WebSocket staleness threshold during the first
+  ~45 minutes after market open. `NIFTY.NSE_INDEX`/`SENSEX.BSE_INDEX` only
+  tick when the index actually recalculates off its constituents trading,
+  which is naturally burstier right at 09:15 open than the rest of the day
+  — legitimate gaps wider than the flat `ws_stale_seconds` (20s) threshold.
+  `PriceStream`'s watchdog was misreading that normal opening-minutes
+  irregularity as a dead connection and forcing repeated resubscribes;
+  confirmed in production (2026-07-29) all the way down to real
+  Unsubscribe/resubscribe cycles at the broker adapter
+  (`fyers_websocket_adapter`), 23-53 events per script, all confined to the
+  09:15-09:52 window and self-resolving once tick cadence settled.
+  New `Config.ws_stale_seconds_open` (60.0) and
+  `Config.ws_post_open_grace_until` (`time(10, 0)`); new module-level
+  `_current_ws_stale_threshold()` returns `ws_stale_seconds_open` for
+  `09:15 <= now < ws_post_open_grace_until` and the normal
+  `ws_stale_seconds` otherwise. Only `_watchdog_loop()`'s
+  reconnect-triggering staleness check uses this — `get_ltp()`'s
+  REST-fallback `max_age` is untouched everywhere, since a REST fallback is
+  cheap and harmless regardless of time of day. Covered by
+  `test/test_ws_stale_threshold.py`.
