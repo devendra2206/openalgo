@@ -498,3 +498,27 @@ Summary of what's in them (all 5 original scripts, unless noted):
   REST-fallback `max_age` is untouched everywhere, since a REST fallback is
   cheap and harmless regardless of time of day. Covered by
   `test/test_ws_stale_threshold.py`.
+- **2026-07-29, same 5 scripts — follow-up found during a targeted PnL-review
+  pass:** `report_pnl_tick()`'s own `get_ltp()` call still used the flat
+  `config.ws_stale_seconds` (20s), not `_current_ws_stale_threshold()`
+  introduced by the fix above. Result: a leg entered during the 09:15-10:00
+  post-open grace window could flicker in and out of the pushed PnL payload
+  every ~20s even on a connection the watchdog now correctly judges healthy
+  (up to 60s of gap tolerated there) — the exact visual symptom of the WS
+  bug already fixed today, but recurring every morning from this threshold
+  mismatch alone, independent of any actual connection problem. Changed the
+  `max_age` argument in each script's `report_pnl_tick()` to call
+  `_current_ws_stale_threshold()` instead, so both the watchdog's
+  reconnect-triggering check and the PnL-reporting freshness check agree on
+  what counts as stale at any given moment. Deliberately did NOT add a REST
+  fallback to `report_pnl_tick()` itself — it stays WS-only by design (a
+  1-second job doing a REST `quotes()` call per open leg would spam the
+  broker all day); this fix only aligns the threshold, not the fallback
+  behavior. Covered by `test_report_pnl_tick_uses_current_ws_stale_threshold`
+  in `test/test_strategy_pnl_executor.py`.
+
+  **Noted but explicitly out of scope for this fix:** `Expiry_Batman`'s
+  `_aggregate_unrealized_pnl()` has the exact same `config.ws_stale_seconds`
+  gap, but it's a decision-affecting function (drives the
+  universal-exit-PnL breach check), not a display-only one — changing it
+  needs separate, more careful consideration and was not requested.

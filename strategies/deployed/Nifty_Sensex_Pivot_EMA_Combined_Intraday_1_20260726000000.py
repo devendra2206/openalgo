@@ -1533,7 +1533,7 @@ class StrategyEngine:
                     continue
                 _, inst, _ = LEG_META[leg_key]
                 current_px = self.price_stream.get_ltp(
-                    pos.symbol, inst.options_exchange, max_age=config.ws_stale_seconds
+                    pos.symbol, inst.options_exchange, max_age=_current_ws_stale_threshold()
                 )
                 if current_px is None:
                     continue

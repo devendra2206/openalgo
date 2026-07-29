@@ -2349,7 +2349,7 @@ class StrategyEngine:
                     if not leg.entry_filled or leg.closed:
                         continue
                     ltp = self.price_stream.get_ltp(
-                        leg.symbol, inst.options_exchange, max_age=config.ws_stale_seconds
+                        leg.symbol, inst.options_exchange, max_age=_current_ws_stale_threshold()
                     )
                     if ltp is None:
                         continue

@@ -147,6 +147,33 @@ def test_report_pnl_tick_dispatches_via_pnl_executor_not_fill_executor(engine, s
     )
 
 
+def test_report_pnl_tick_uses_current_ws_stale_threshold(engine, script_module, monkeypatch):
+    """report_pnl_tick() must ask price_stream.get_ltp() for the SAME
+    time-aware threshold the watchdog uses (_current_ws_stale_threshold()),
+    not the flat config.ws_stale_seconds -- otherwise a leg entered during
+    the 09:15-10:00 post-open grace window can flicker out of the PnL push
+    every ~20s even while the watchdog correctly judges the connection
+    healthy (see docs/CUSTOMIZATIONS.md's 2026-07-29 entry). Freezes
+    _current_ws_stale_threshold() itself (rather than the wall clock) so
+    this test is time-of-day independent and directly pins the call site's
+    argument to whatever that function currently returns."""
+    leg_key = script_module.LEG_KEYS[0]
+    pos = engine.store.state.legs[leg_key].position
+    pos.symbol = "NIFTY04AUG2624000PE"
+    pos.quantity = 65
+    pos.entry_px = 100.0
+    pos.entry_filled = True
+
+    monkeypatch.setattr(script_module, "_current_ws_stale_threshold", lambda: 987.0)
+    engine.price_stream.get_ltp.return_value = 95.0
+
+    engine.report_pnl_tick()
+
+    assert engine.price_stream.get_ltp.called
+    _, kwargs = engine.price_stream.get_ltp.call_args
+    assert kwargs["max_age"] == 987.0
+
+
 def test_report_pnl_tick_not_delayed_by_saturated_fill_executor(engine, script_module, monkeypatch):
     """The core regression check: saturate EVERY _fill_executor worker with
     a long-running blocking task (simulating stuck fill-watchers/reprice

@@ -1521,7 +1521,7 @@ class StrategyEngine:
                     if not pos.symbol or not pos.entry_filled:
                         continue
                     ltp = self.price_stream.get_ltp(
-                        pos.symbol, inst.options_exchange, max_age=config.ws_stale_seconds
+                        pos.symbol, inst.options_exchange, max_age=_current_ws_stale_threshold()
                     )
                     if ltp is None:
                         continue

@@ -1819,7 +1819,7 @@ class StrategyEngine:
                 inst_name = leg_key.split("_")[0]
                 inst = next(i for i in INSTRUMENTS if i.name == inst_name)
                 current_px = self.price_stream.get_ltp(
-                    pos.symbol, inst.options_exchange, max_age=config.ws_stale_seconds
+                    pos.symbol, inst.options_exchange, max_age=_current_ws_stale_threshold()
                 )
                 if current_px is None:
                     continue
