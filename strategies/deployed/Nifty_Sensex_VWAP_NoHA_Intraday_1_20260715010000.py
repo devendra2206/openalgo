@@ -187,7 +187,7 @@ import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, asdict, field
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -505,6 +505,43 @@ def _current_ws_stale_threshold() -> float:
     if time(9, 15) <= now < config.ws_post_open_grace_until:
         return config.ws_stale_seconds_open
     return config.ws_stale_seconds
+
+
+def _current_candle_boundary(interval_minutes: int) -> datetime:
+    """Start-of-bucket timestamp for the current wall-clock candle -- e.g.
+    for interval_minutes=2 at 16:16:42 IST, returns 16:16:00. Used by
+    _get_option_signal() to detect "a new candle has just closed"
+    precisely, instead of relying solely on a rolling
+    indicator_refresh_interval timer that has no awareness of where the
+    actual 2-minute candle boundaries fall -- that rolling-only approach
+    fetches ~8 times per 2m candle (120s / 15s), ~7 of them wasted (the
+    candle hasn't closed yet), and the one useful fetch can land anywhere
+    up to indicator_refresh_interval late relative to the true close,
+    depending on timing phase. Comparing against this boundary lets
+    _get_option_signal() fetch on the very first cycle after a new bucket
+    begins, cutting both the wasted-fetch count and the worst-case
+    detection latency down to ~scheduler_interval + one broker
+    round-trip."""
+    now = datetime.now(IST)
+    total_minutes = now.hour * 60 + now.minute
+    bucket_start_minutes = (total_minutes // interval_minutes) * interval_minutes
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight + timedelta(minutes=bucket_start_minutes)
+
+
+def _candle_key_boundary(candle_key: str) -> Optional[datetime]:
+    """Parses a signal's candle_key (str(bars.index[-1]), e.g.
+    '2026-07-29 16:16:00+05:30') back into a datetime for comparison
+    against _current_candle_boundary()'s output -- lets _get_option_signal()
+    know whether the CACHED signal already reflects the current candle, or
+    is still one (or more) candle(s) behind. Returns None if parsing ever
+    fails (unexpected format) -- callers must treat that as "don't know,"
+    never as "have fresh data," so a parse failure can't silently suppress
+    a needed refresh."""
+    try:
+        return datetime.fromisoformat(candle_key)
+    except (ValueError, TypeError):
+        return None
 
 
 ###############################################################################
@@ -1721,7 +1758,14 @@ class StrategyEngine:
                             ltp: Optional[float] = None) -> Optional[OptionSignal]:
         now = datetime.now(IST)
         last = self._option_signal_refresh.get(leg_key)
-        due = last is None or (now - last).total_seconds() >= config.indicator_refresh_interval
+        current_boundary = _current_candle_boundary(config.candle_bucket_minutes)
+        cached_for_boundary = self._option_signal_cache.get(leg_key)
+        cached_boundary = (
+            _candle_key_boundary(cached_for_boundary.candle_key)
+            if cached_for_boundary is not None else None
+        )
+        have_current_candle = cached_boundary is not None and cached_boundary >= current_boundary
+        due = last is None or not have_current_candle
         if due and leg_key not in self._option_signal_refresh_pending:
             self._option_signal_refresh_pending.add(leg_key)
             self._fill_executor.submit(

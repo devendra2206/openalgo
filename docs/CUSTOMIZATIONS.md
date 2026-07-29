@@ -117,6 +117,37 @@ git push origin custom-strategies
 
 ---
 
+## Test Cases
+
+Regression tests for anything touching the deployed strategy scripts live
+under **`strategies/test/`** (a second `testpaths` entry in
+`pyproject.toml`, alongside the top-level `test/` used for everything
+else) — run either with `uv run pytest strategies/test/` or just
+`uv run pytest`, which picks up both locations automatically.
+
+| File | Covers |
+|---|---|
+| `strategies/test/test_strategy_pnl_executor.py` | Dedicated `_pnl_executor` isolation from `_fill_executor`, reduced thread stack size, periodic error re-push (`_repush_active_errors`), `report_pnl_tick`'s staleness threshold |
+| `strategies/test/test_ws_stale_threshold.py` | `_current_ws_stale_threshold()`'s post-open grace window (widened threshold 09:15-10:00, normal threshold otherwise) |
+| `strategies/test/test_candle_boundary_refresh.py` | `_current_candle_boundary()`/`_candle_key_boundary()`, `get_signal()`'s cache-based refresh dispatch, and a full simulated one-day session confirming the fetch-count reduction |
+
+Core-code (non-strategy-script) regression tests stay in the top-level
+`test/` directory as usual, e.g.:
+- `test/test_websocket_client_bridge.py` — the eventlet cross-thread
+  `concurrent.futures.Future` bridge fix in `services/websocket_client.py`
+- `test/test_fyers_reconnect.py` — the Fyers adapter's non-blocking
+  background reconnect
+
+These two sets are loaded by different script-import helpers
+(`strategies/test/*` loads a deployed script by file path via
+`importlib.util.spec_from_file_location`, working around the `openalgo`
+package-name collision described in each file's own
+`_ensure_real_openalgo_sdk_loaded()` docstring; `test/*` imports core
+modules normally) — keep new strategy-script tests in `strategies/test/`
+and new core-code tests in `test/`, matching what they exercise.
+
+---
+
 ## `app.py` (+21 lines)
 
 One addition: a CSRF exemption for the new Force Exit completion endpoint,
@@ -448,7 +479,7 @@ Summary of what's in them (all 5 original scripts, unless noted):
   behind a fill-watcher stuck for minutes in a reprice loop. New
   `_last_error_push: dict[str, datetime]` tracks per-leg last-push time and
   self-clears once a leg's error is resolved. Covered by
-  `test/test_strategy_pnl_executor.py`.
+  `strategies/test/test_strategy_pnl_executor.py`.
 - **2026-07-28, all 6 scripts:** `threading.stack_size(1024 * 1024)` set at
   module load, before any thread is created. Python's default (8MB per
   thread) reserves ~96MB of virtual address space across the ~12 threads
@@ -510,7 +541,7 @@ Summary of what's in them (all 5 original scripts, unless noted):
   reconnect-triggering staleness check uses this — `get_ltp()`'s
   REST-fallback `max_age` is untouched everywhere, since a REST fallback is
   cheap and harmless regardless of time of day. Covered by
-  `test/test_ws_stale_threshold.py`.
+  `strategies/test/test_ws_stale_threshold.py`.
 - **2026-07-29, same 5 scripts — follow-up found during a targeted PnL-review
   pass:** `report_pnl_tick()`'s own `get_ltp()` call still used the flat
   `config.ws_stale_seconds` (20s), not `_current_ws_stale_threshold()`
@@ -528,10 +559,47 @@ Summary of what's in them (all 5 original scripts, unless noted):
   1-second job doing a REST `quotes()` call per open leg would spam the
   broker all day); this fix only aligns the threshold, not the fallback
   behavior. Covered by `test_report_pnl_tick_uses_current_ws_stale_threshold`
-  in `test/test_strategy_pnl_executor.py`.
+  in `strategies/test/test_strategy_pnl_executor.py`.
 
   **Noted but explicitly out of scope for this fix:** `Expiry_Batman`'s
   `_aggregate_unrealized_pnl()` has the exact same `config.ws_stale_seconds`
   gap, but it's a decision-affecting function (drives the
   universal-exit-PnL breach check), not a display-only one — changing it
   needs separate, more careful consideration and was not requested.
+- **2026-07-29, 5 scripts (Combined, EMA34_RSI, Pivot_Supertrend, MCX,
+  VWAP_NoHA — NOT Expiry_Batman, which has no candle-based indicator
+  signal at all: confirmed by grep, it's a pure straddle-entry +
+  spot-move-triggered repair strategy with zero `client.history()`/
+  `get_signal()` calls):** `get_signal()`/`_get_option_signal()`'s
+  indicator-refresh throttle replaced a pure rolling timer ("has
+  `indicator_refresh_interval` (15s) passed since the last fetch?") with
+  one that's aware of where the actual candle boundaries fall. The old
+  timer had no idea a 3-minute (2-minute for VWAP_NoHA's option-level
+  signal) candle only closes once every 180s (120s) — it fetched roughly
+  12 (8) times per candle, ~11 (7) of them wasted re-confirming the same
+  still-open candle, and the one useful fetch could land anywhere up to
+  15s late relative to the true close depending on timing phase.
+
+  New `_current_candle_boundary(interval_minutes)` computes the
+  start-of-bucket timestamp for "now" (e.g. 16:16:42 → 16:15:00 for a 3m
+  bucket). New `_candle_key_boundary(candle_key)` parses a cached signal's
+  own `candle_key` (`str(bars.index[-1])`) back into a datetime for direct
+  comparison. `get_signal()` now fetches only when the CACHED signal's own
+  candle is behind the current boundary — once it catches up, no further
+  fetches happen until the next boundary arrives, and if a fetch attempt
+  doesn't yield the new candle yet (broker-side finalization lag), it
+  keeps retrying every tick instead of waiting out a fixed interval
+  (bounded by the pre-existing `_signal_refresh_pending` guard, so at most
+  one fetch is ever in flight per instrument/leg). Net effect, confirmed
+  by a full simulated 09:15-15:30 session in
+  `strategies/test/test_candle_boundary_refresh.py`: ~151 fetches over the whole
+  session versus ~1500 under the old rolling-only throttle — roughly a
+  10x reduction — while also cutting worst-case new-candle detection
+  latency to ~`scheduler_interval` (10s) + one broker round-trip, down
+  from up to `indicator_refresh_interval` (15s) + round-trip + a possible
+  extra scheduler cycle.
+
+  Combined/Pivot_Supertrend's independent `due_daily` check (daily pivot
+  refresh, its own 600s cadence) is unaffected — it still triggers on its
+  own schedule regardless of candle-boundary state, since the daily pivot
+  has nothing to do with 3-minute candles.

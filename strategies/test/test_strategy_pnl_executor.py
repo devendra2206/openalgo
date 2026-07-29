@@ -32,7 +32,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SCRIPT_PATH = (
     REPO_ROOT
     / "strategies"

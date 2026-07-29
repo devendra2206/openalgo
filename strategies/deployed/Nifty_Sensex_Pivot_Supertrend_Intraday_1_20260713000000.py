@@ -580,6 +580,42 @@ def _current_ws_stale_threshold() -> float:
     return config.ws_stale_seconds
 
 
+def _current_candle_boundary(interval_minutes: int) -> datetime:
+    """Start-of-bucket timestamp for the current wall-clock candle -- e.g.
+    for interval_minutes=3 at 16:16:42 IST, returns 16:15:00. Used by
+    get_signal() to detect "a new candle has just closed" precisely,
+    instead of relying solely on a rolling indicator_refresh_interval timer
+    that has no awareness of where the actual 3-minute candle boundaries
+    fall -- that rolling-only approach fetches ~12 times per 3m candle
+    (180s / 15s), ~11 of them wasted (the candle hasn't closed yet), and
+    the one useful fetch can land anywhere up to indicator_refresh_interval
+    late relative to the true close, depending on timing phase. Comparing
+    against this boundary lets get_signal() fetch on the very first cycle
+    after a new bucket begins, cutting both the wasted-fetch count and the
+    worst-case detection latency down to ~scheduler_interval (10s) + one
+    broker round-trip."""
+    now = datetime.now(IST)
+    total_minutes = now.hour * 60 + now.minute
+    bucket_start_minutes = (total_minutes // interval_minutes) * interval_minutes
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight + timedelta(minutes=bucket_start_minutes)
+
+
+def _candle_key_boundary(candle_key: str) -> Optional[datetime]:
+    """Parses a signal's candle_key (str(bars.index[-1]), e.g.
+    '2026-07-29 16:15:00+05:30') back into a datetime for comparison
+    against _current_candle_boundary()'s output -- lets get_signal() know
+    whether the CACHED signal already reflects the current candle, or is
+    still one (or more) candle(s) behind. Returns None if parsing ever
+    fails (unexpected format) -- callers must treat that as "don't know,"
+    never as "have fresh data," so a parse failure can't silently suppress
+    a needed refresh."""
+    try:
+        return datetime.fromisoformat(candle_key)
+    except (ValueError, TypeError):
+        return None
+
+
 ###############################################################################
 # BROKER
 ###############################################################################
@@ -1742,8 +1778,14 @@ class StrategyEngine:
         due_daily = (last_daily is None
                      or (now - last_daily).total_seconds() >= config.daily_refresh_interval)
         last = self._last_indicator_refresh.get(inst.name)
-        due_signal = (last is None
-                      or (now - last).total_seconds() >= config.indicator_refresh_interval)
+        current_boundary = _current_candle_boundary(3)
+        cached_for_boundary = self._signal_cache.get(inst.name)
+        cached_boundary = (
+            _candle_key_boundary(cached_for_boundary.candle_key)
+            if cached_for_boundary is not None else None
+        )
+        have_current_candle = cached_boundary is not None and cached_boundary >= current_boundary
+        due_signal = last is None or not have_current_candle
 
         if (due_daily or due_signal) and inst.name not in self._signal_refresh_pending:
             self._signal_refresh_pending.add(inst.name)
