@@ -603,3 +603,45 @@ Summary of what's in them (all 5 original scripts, unless noted):
   refresh, its own 600s cadence) is unaffected — it still triggers on its
   own schedule regardless of candle-boundary state, since the daily pivot
   has nothing to do with 3-minute candles.
+- **2026-07-29, 4 scripts (Combined, MCX, VWAP_NoHA, Expiry_Batman —
+  EMA34_RSI/Pivot_Supertrend intentionally left untouched, since those
+  standalone scripts are no longer deployed):** `PriceStream._watchdog_loop()`'s
+  full-reconnect escalation rule replaced. The OLD rule was "ANY single
+  tracked symbol stale for `ws_stale_reconnect_after` (3) consecutive
+  cycles → full reconnect," shared across every symbol on the connection.
+  Confirmed in production, 2026-07-29 (MCX): a single thinly-traded option
+  leg stayed stale for an extended stretch — genuine low liquidity, not a
+  broken feed — while the futures contract on the SAME connection ticked
+  fine the whole time. The old rule escalated anyway, tearing down and
+  disrupting the healthy futures stream for no possible benefit, since
+  reconnecting cannot make an illiquid contract start trading.
+
+  Three coordinated changes:
+  1. **Majority-based escalation** — a full reconnect now only fires when
+     more than half of tracked symbols are simultaneously stuck past the
+     streak limit (`len(symbols_at_limit) > len(all_keys) / 2`), a real
+     signal the whole connection is broken, not just one contract. A
+     minority/single stale symbol never escalates on its own.
+  2. **Per-symbol backoff** (`_symbol_backoff_step`/`_symbol_next_retry_at`,
+     new `PriceStream` instance state) — independent retry pacing per
+     `(symbol, exchange)`, using the same `(1, 2, 5, 10, 30)` backoff shape
+     as the connection-wide path, but scoped so one chronically stale
+     symbol's growing wait never slows down retries for a different
+     symbol. Cleared in `remove_instruments()` alongside `_stale_streak`,
+     and reset the moment a symbol produces a fresh tick again.
+  3. **REST cross-check before escalating** — new
+     `_confirm_genuinely_broken_via_rest()` calls the broker's `quotes()`
+     REST endpoint for the majority-stale symbols before actually
+     reconnecting. If REST shows the price has genuinely moved since the
+     last cached tick, the WS feed really is failing to deliver and the
+     reconnect proceeds. If REST also shows the exact same frozen price,
+     it's thin liquidity, not a broken feed — the disruptive reconnect is
+     skipped and per-symbol backoff keeps retrying instead. A REST call
+     that itself errors counts as "can't confirm," not as proof of
+     brokenness (needs only one symbol to show real movement to proceed).
+
+  Covered by `strategies/test/test_pricestream_reconnect_backoff.py`,
+  including a full simulated 09:15-15:30 session with one permanently
+  thin symbol confirming zero full reconnects across the entire day, and
+  a companion test confirming a genuine simultaneous outage across all
+  tracked symbols still correctly escalates.

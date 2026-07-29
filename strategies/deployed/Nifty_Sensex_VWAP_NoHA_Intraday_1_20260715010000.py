@@ -629,6 +629,12 @@ class PriceStream:
         # Consecutive watchdog cycles a given (symbol, exchange) has been
         # found stale IN A ROW -- see _watchdog_loop's escalation policy.
         self._stale_streak: dict[tuple, int] = {}
+        # Per-symbol backoff for the per-symbol resubscribe retry path --
+        # independent of any OTHER symbol's own backoff, so one chronically
+        # stale symbol's growing wait never slows down retries for a
+        # different symbol that just started going stale.
+        self._symbol_backoff_step: dict[tuple, int] = {}
+        self._symbol_next_retry_at: dict[tuple, datetime] = {}
 
     def _on_tick(self, msg):
         try:
@@ -690,6 +696,8 @@ class PriceStream:
                     to_remove.append(inst)
                 self._cache.pop(key, None)
                 self._stale_streak.pop(key, None)
+                self._symbol_backoff_step.pop(key, None)
+                self._symbol_next_retry_at.pop(key, None)
         if not to_remove:
             return
         try:
@@ -720,7 +728,57 @@ class PriceStream:
         except Exception as exc:
             Log.warning(f"[PriceStream] disconnect failed during teardown: {exc}")
 
+    def _confirm_genuinely_broken_via_rest(self, stale_instruments: list) -> bool:
+        """Before paying the cost of a disruptive full reconnect (which
+        briefly drops EVERY tracked symbol's stream, not just the stuck
+        ones), confirm via a REST quotes() call that at least one stale
+        symbol's price has genuinely moved since its last cached tick. If
+        it has, the WS feed really is failing to deliver and a reconnect
+        is warranted. If REST also shows the SAME frozen price for every
+        stale symbol, they simply aren't trading right now (thin
+        liquidity) -- reconnecting cannot fix that, so the caller should
+        skip it and let per-symbol backoff keep retrying instead.
+
+        A REST call that itself fails/errors counts as "can't confirm
+        either way" and is skipped for that symbol (not treated as proof
+        of brokenness) -- this only needs ONE symbol to show real
+        movement to return True."""
+        for inst in stale_instruments:
+            key = (inst["symbol"], inst["exchange"])
+            cached = self._cache.get(key)
+            try:
+                resp = self.client.quotes(symbol=inst["symbol"], exchange=inst["exchange"])
+            except Exception as exc:
+                Log.warning(f"[PriceStream] REST confirm-check failed for "
+                            f"{inst['symbol']}.{inst['exchange']}: {exc}")
+                continue
+            data = resp.get("data", resp) if isinstance(resp, dict) else resp
+            rest_ltp = data.get("ltp") if isinstance(data, dict) else None
+            if rest_ltp is None:
+                continue
+            if cached is None or abs(float(rest_ltp) - cached[0]) > 1e-9:
+                return True
+        return False
+
     def _watchdog_loop(self):
+        """Two-tier recovery, escalating only when warranted:
+
+        1. Connection-down (transport itself dead) -> full reconnect
+           immediately.
+        2. Connection alive, but some symbols' ticks are stale -> per-symbol
+           resubscribe, each on its OWN independent backoff
+           (_symbol_backoff_step/_symbol_next_retry_at). Only escalates to a
+           full reconnect if a MAJORITY of tracked symbols are
+           simultaneously stuck past ws_stale_reconnect_after consecutive
+           cycles, AND _confirm_genuinely_broken_via_rest() shows real
+           price movement the WS feed isn't delivering -- not just thin
+           liquidity. Confirmed in production, 2026-07-29 (MCX): a single
+           thinly-traded option leg stayed stale for an extended stretch
+           while the futures contract on the SAME connection ticked fine
+           the whole time -- the OLD "any one symbol escalates" rule would
+           force repeated full reconnects that could never fix a liquidity
+           problem, disrupting the healthy stream for nothing.
+        """
         backoffs = (1, 2, 5, 10, 30)
         failures = 0
         try:
@@ -773,54 +831,78 @@ class PriceStream:
             all_keys = {key for key, _ in tracked}
             stale_keys = {(i["symbol"], i["exchange"]) for i in stale_instruments}
             for key in all_keys:
-                self._stale_streak[key] = self._stale_streak.get(key, 0) + 1 if key in stale_keys else 0
+                if key in stale_keys:
+                    self._stale_streak[key] = self._stale_streak.get(key, 0) + 1
+                else:
+                    self._stale_streak[key] = 0
+                    self._symbol_backoff_step.pop(key, None)
+                    self._symbol_next_retry_at.pop(key, None)
 
             if not stale_instruments:
                 failures = 0
                 continue
 
-            failures += 1
-            wait = backoffs[min(failures - 1, len(backoffs) - 1)]
             names = ", ".join(f"{i['symbol']}.{i['exchange']}" for i in stale_instruments)
+            symbols_at_limit = {
+                k for k in stale_keys
+                if self._stale_streak[k] >= config.ws_stale_reconnect_after
+            }
 
-            # A symbol stuck stale for several consecutive cycles despite
-            # repeated per-symbol resubscribes means whatever's wrong isn't
-            # fixable by resubscribing on the SAME connection -- escalate to
-            # a full reconnect instead of retrying the same narrow fix
-            # forever. This briefly disrupts every OTHER instrument on this
-            # connection too (unavoidable -- the whole connection is being
-            # torn down), but only for this one process; other strategy
-            # processes' own connections are unaffected.
-            if max(self._stale_streak[k] for k in stale_keys) >= config.ws_stale_reconnect_after:
+            if len(symbols_at_limit) > len(all_keys) / 2:
+                if self._confirm_genuinely_broken_via_rest(stale_instruments):
+                    failures += 1
+                    wait = backoffs[min(failures - 1, len(backoffs) - 1)]
+                    Log.warning(
+                        f"[PriceStream] {names} stale for {config.ws_stale_reconnect_after}+ "
+                        f"consecutive cycles on {len(symbols_at_limit)}/{len(all_keys)} tracked "
+                        f"symbols (a majority), REST-confirmed as genuinely broken -- "
+                        f"escalating to a full reconnect."
+                    )
+                    self._teardown()
+                    try:
+                        self._connect()
+                    except Exception as exc:
+                        Log.warning(f"[PriceStream] full reconnect (escalation) failed: {exc}")
+                    for key in all_keys:
+                        self._stale_streak[key] = 0
+                        self._symbol_backoff_step.pop(key, None)
+                        self._symbol_next_retry_at.pop(key, None)
+                    self._stop.wait(wait)
+                    continue
                 Log.warning(
-                    f"[PriceStream] {names} stale for {config.ws_stale_reconnect_after}+ "
-                    f"consecutive cycles despite per-symbol resubscribe -- escalating to a "
-                    f"full reconnect."
+                    f"[PriceStream] {names} stale on {len(symbols_at_limit)}/{len(all_keys)} "
+                    f"tracked symbols, but REST shows no price movement -- likely thin "
+                    f"liquidity, not a broken feed. Skipping full reconnect; continuing "
+                    f"per-symbol retries."
                 )
-                self._teardown()
-                try:
-                    self._connect()
-                except Exception as exc:
-                    Log.warning(f"[PriceStream] full reconnect (escalation) failed: {exc}")
-                for key in all_keys:
-                    self._stale_streak[key] = 0
-                self._stop.wait(wait)
+
+            due_for_retry = [
+                inst for inst in stale_instruments
+                if now >= self._symbol_next_retry_at.get(
+                    (inst["symbol"], inst["exchange"]), now
+                )
+            ]
+            if not due_for_retry:
                 continue
 
-            Log.warning(
-                f"[PriceStream] stale/missing ticks for: {names} "
-                f"(attempt {failures}) -- resubscribing just this/these symbol(s), "
-                f"then waiting {wait}s."
-            )
+            due_names = ", ".join(f"{i['symbol']}.{i['exchange']}" for i in due_for_retry)
+            Log.warning(f"[PriceStream] stale/missing ticks for: {due_names} -- "
+                        f"resubscribing just this/these symbol(s).")
             try:
-                self.client.unsubscribe_ltp(stale_instruments)
+                self.client.unsubscribe_ltp(due_for_retry)
             except Exception as exc:
                 Log.warning(f"[PriceStream] unsubscribe (stale symbols) failed: {exc}")
             try:
-                self.client.subscribe_ltp(stale_instruments, on_data_received=self._on_tick)
+                self.client.subscribe_ltp(due_for_retry, on_data_received=self._on_tick)
             except Exception as exc:
                 Log.warning(f"[PriceStream] resubscribe (stale symbols) failed: {exc}")
-            self._stop.wait(wait)
+
+            for inst in due_for_retry:
+                key = (inst["symbol"], inst["exchange"])
+                step = self._symbol_backoff_step.get(key, 0)
+                wait = backoffs[min(step, len(backoffs) - 1)]
+                self._symbol_backoff_step[key] = step + 1
+                self._symbol_next_retry_at[key] = now + timedelta(seconds=wait)
 
     def start(self):
         self._watchdog_thread = threading.Thread(
