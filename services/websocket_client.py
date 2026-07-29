@@ -153,6 +153,51 @@ class WebSocketClient:
         self.authenticated = False
         logger.info("Disconnected from WebSocket server")
 
+    def _run_coroutine_and_wait(self, coro, timeout: float):
+        """Bridge a coroutine running on the asyncio loop's real OS thread
+        back to the calling (possibly eventlet-green) thread.
+
+        Deliberately does NOT call concurrent.futures.Future.result() from
+        the calling side: asyncio.run_coroutine_threadsafe() returns a
+        Future whose internal Condition/Lock is the same eventlet-patched
+        threading module as everywhere else in the process (see self.lock's
+        docstring above for the full reasoning). Resolving that Future from
+        the loop's real OS thread while a greenlet blocks in result()'s
+        wait() crashes with "greenlet.error: Cannot switch to a different
+        thread" -- confirmed in production, 2026-07-29: fired 9 times in a
+        single session, each immediately after subscribe()/unsubscribe(),
+        and is the reason two live option legs never received a single WS
+        tick that day despite dozens of reconnects (the crash happens
+        inside eventlet's hub, outside any try/except, so it doesn't just
+        fail the one request -- it can leave the hub's timer/semaphore
+        bookkeeping in a bad state for whatever else is running).
+
+        Fix: never touch the Future itself from this (calling) thread.
+        add_done_callback's callback runs on the loop thread (real OS
+        thread, safe) when the coroutine finishes -- it reads the result
+        there and signals completion via a genuine `_original_threading`
+        Event, which has no greenlet/thread affinity and works correctly
+        from either side.
+        """
+        done = _original_threading.Event()
+        outcome: dict = {}
+
+        def _on_done(fut):
+            try:
+                outcome["result"] = fut.result()
+            except Exception as exc:
+                outcome["error"] = exc
+            done.set()
+
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        future.add_done_callback(_on_done)
+        if not done.wait(timeout):
+            future.cancel()
+            raise TimeoutError("Timed out waiting for asyncio loop thread")
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]
+
     async def _send_and_await_ack(
         self, message: dict, request_id: str, timeout: float
     ) -> dict:
@@ -203,13 +248,12 @@ class WebSocketClient:
                 "mode": mode,
                 "request_id": request_id,
             }
-            future = asyncio.run_coroutine_threadsafe(
-                self._send_and_await_ack(subscription_msg, request_id, timeout=10),
-                self.loop,
-            )
             # Outer timeout slightly longer than the inner ack timeout so the
             # asyncio.wait_for fires first and produces a clean error.
-            ack = future.result(timeout=12)
+            ack = self._run_coroutine_and_wait(
+                self._send_and_await_ack(subscription_msg, request_id, timeout=10),
+                timeout=12,
+            )
         except (TimeoutError, asyncio.TimeoutError):
             logger.warning(
                 f"Subscribe timed out waiting for proxy ack (mode={mode}, "
@@ -273,11 +317,10 @@ class WebSocketClient:
                 "mode": mode,
                 "request_id": request_id,
             }
-            future = asyncio.run_coroutine_threadsafe(
+            ack = self._run_coroutine_and_wait(
                 self._send_and_await_ack(unsubscription_msg, request_id, timeout=10),
-                self.loop,
+                timeout=12,
             )
-            ack = future.result(timeout=12)
         except (TimeoutError, asyncio.TimeoutError):
             logger.warning(
                 f"Unsubscribe timed out waiting for proxy ack (mode={mode}, "
@@ -325,10 +368,9 @@ class WebSocketClient:
 
             # Send unsubscription request
             if self.loop and self.ws:
-                future = asyncio.run_coroutine_threadsafe(
-                    self.ws.send(json.dumps(unsubscription_msg)), self.loop
+                self._run_coroutine_and_wait(
+                    self.ws.send(json.dumps(unsubscription_msg)), timeout=5
                 )
-                future.result(timeout=5)
 
                 # Clear all subscriptions
                 with self.lock:

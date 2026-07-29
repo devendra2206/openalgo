@@ -195,7 +195,7 @@ Low conflict risk unless upstream touches the same ~15 lines of
 
 ---
 
-## `services/websocket_client.py` (+12 / -1 lines)
+## `services/websocket_client.py` (+12 / -1 lines, plus a 2026-07-29 follow-up)
 
 One-line fix (plus comment) to a real production crash: `self.lock` was a
 plain `threading.Lock()` — under gunicorn's eventlet worker that's a
@@ -215,6 +215,38 @@ no greenlet affinity and works from either side.
 
 Low conflict risk — a single-line change plus a comment block, isolated to
 `__init__`.
+
+**2026-07-29 follow-up — a second, distinct instance of the same crash
+class, this time inside a third-party primitive we can't directly patch:**
+`subscribe()`, `unsubscribe()`, and `unsubscribe_all()` each called
+`asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout=N)`
+directly from the calling side to get the result of a coroutine running on
+the loop's real OS thread. `run_coroutine_threadsafe()`'s returned
+`concurrent.futures.Future` uses the same eventlet-patched `threading`
+module as everywhere else in the process for its internal
+Condition/Lock — resolving it from the loop's real thread while a greenlet
+blocks in `result()`'s wait crashes with the identical `greenlet.error:
+Cannot switch to a different thread`. Confirmed in production, 2026-07-29:
+fired 9 times in a single session (`journalctl -u openalgo.service | grep
+-c "Cannot switch to a different thread"`), each immediately after a
+`subscribe()`/`unsubscribe()` call (e.g. right after
+`sandbox/websocket_execution_engine.py`'s `Position feed: subscribing
+NFO:...`/`BFO:...` log lines) — and directly responsible for two live
+option legs never receiving a single WS tick for 45+ minutes that day
+despite ~20 full PriceStream reconnects, since the crash fires unhandled
+inside eventlet's hub (outside any try/except, never reaching
+`log/errors.jsonl`) and can leave the hub's timer/semaphore bookkeeping in
+a bad state for whatever else is running at that moment.
+
+Fix: new `_run_coroutine_and_wait()` helper never touches the
+`concurrent.futures.Future` itself from the calling thread. Its
+`add_done_callback` runs on the loop thread (real OS thread, safe) when the
+coroutine finishes — reads the result there, and signals completion via a
+genuine `_original_threading.Event` (no greenlet/thread affinity, safe from
+either side) that the calling thread waits on instead. `disconnect()`'s own
+`run_coroutine_threadsafe()` call was untouched — it's fire-and-forget,
+never calls `.result()`, so it was never affected. Covered by
+`test/test_websocket_client_bridge.py`.
 
 ---
 
