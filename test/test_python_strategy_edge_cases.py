@@ -814,5 +814,125 @@ def test_strategy_without_schedule_days_field(ps_module, tmp_path):
         ps_module.CONFIG_FILE = original
 
 
+# ---------------------------------------------------------------------------
+# Edge case 17: 2026-07-30 startup-race stagger (multiple strategies sharing
+# a broker adapter subscribing at nearly the same instant).
+# ---------------------------------------------------------------------------
+
+
+def test_stagger_offset_is_zero_for_single_strategy(ps_module):
+    ps_module.STRATEGY_CONFIGS["only_one"] = {"name": "Only"}
+    assert ps_module._stagger_offset_seconds("only_one") == 0
+
+
+def test_stagger_offset_increases_by_position_alphabetically(ps_module):
+    """Order is by sorted strategy_id, not registration/dict order."""
+    ps_module.STRATEGY_CONFIGS["zzz_last"] = {"name": "Z"}
+    ps_module.STRATEGY_CONFIGS["aaa_first"] = {"name": "A"}
+    ps_module.STRATEGY_CONFIGS["mmm_middle"] = {"name": "M"}
+
+    assert ps_module._stagger_offset_seconds("aaa_first") == 0
+    assert ps_module._stagger_offset_seconds("mmm_middle") == 5
+    assert ps_module._stagger_offset_seconds("zzz_last") == 10
+
+
+def test_stagger_offset_zero_for_unknown_strategy_id(ps_module):
+    ps_module.STRATEGY_CONFIGS["known"] = {"name": "K"}
+    assert ps_module._stagger_offset_seconds("not_registered_anywhere") == 0
+
+
+def test_schedule_strategy_applies_stagger_to_cron_second(ps_module):
+    """schedule_strategy must pass a per-strategy `second` derived from
+    _stagger_offset_seconds into the start job's CronTrigger, so strategies
+    sharing an hour:minute start_time don't all fire in the same second."""
+    ps_module.STRATEGY_CONFIGS["aaa_first"] = {"name": "A"}
+    ps_module.STRATEGY_CONFIGS["mmm_middle"] = {"name": "M"}
+
+    ps_module.schedule_strategy("aaa_first", "09:15")
+    ps_module.schedule_strategy("mmm_middle", "09:15")
+
+    job_a = ps_module.SCHEDULER.get_job("start_aaa_first")
+    job_m = ps_module.SCHEDULER.get_job("start_mmm_middle")
+    assert job_a is not None and job_m is not None
+
+    second_a = job_a.trigger.fields[
+        [f.name for f in job_a.trigger.fields].index("second")
+    ]
+    second_m = job_m.trigger.fields[
+        [f.name for f in job_m.trigger.fields].index("second")
+    ]
+    assert str(second_a) == "0"
+    assert str(second_m) == "5"
+
+    ps_module.SCHEDULER.remove_job("start_aaa_first")
+    ps_module.SCHEDULER.remove_job("start_mmm_middle")
+
+
+def test_restore_strategy_states_sleeps_between_restarts_not_before_first(
+    ps_module, monkeypatch, tmp_path
+):
+    """Confirms the core-restart recovery path (restore_strategy_states, as
+    opposed to the daily cron path tested above) staggers back-to-back
+    subprocess restarts -- but doesn't delay the common single-strategy
+    case at all."""
+    strat = tmp_path / "dead_strategy.py"
+    strat.write_text("pass\n")
+
+    for sid in ("first_strategy", "second_strategy", "third_strategy"):
+        ps_module.STRATEGY_CONFIGS[sid] = {
+            "name": sid,
+            "file_path": str(strat),
+            "exchange": "NSE",
+            "is_running": True,
+            "pid": 999999,
+            "last_started": datetime.now(IST).isoformat(),
+        }
+
+    monkeypatch.setattr(
+        ps_module, "check_master_contract_ready", lambda skip_on_startup=False: (True, "ok")
+    )
+    monkeypatch.setattr(ps_module, "save_configs", lambda: None)
+    monkeypatch.setattr(ps_module.psutil, "pid_exists", lambda pid: False)
+    monkeypatch.setattr(ps_module, "start_strategy_process", lambda strategy_id: (True, "ok"))
+
+    sleep_calls = []
+    monkeypatch.setattr(ps_module, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    ps_module.restore_strategy_states()
+
+    # 3 strategies all needed restarting -> 2 gaps between them, none before the first.
+    assert sleep_calls == [5, 5]
+
+
+def test_restore_strategy_states_no_sleep_for_single_restart(
+    ps_module, monkeypatch, tmp_path
+):
+    strat = tmp_path / "dead_strategy.py"
+    strat.write_text("pass\n")
+
+    ps_module.STRATEGY_CONFIGS["only_one"] = {
+        "name": "only_one",
+        "file_path": str(strat),
+        "exchange": "NSE",
+        "is_running": True,
+        "pid": 999999,
+        "last_started": datetime.now(IST).isoformat(),
+    }
+
+    monkeypatch.setattr(
+        ps_module, "check_master_contract_ready", lambda skip_on_startup=False: (True, "ok")
+    )
+    monkeypatch.setattr(ps_module, "save_configs", lambda: None)
+    monkeypatch.setattr(ps_module.psutil, "pid_exists", lambda pid: False)
+    monkeypatch.setattr(ps_module, "start_strategy_process", lambda strategy_id: (True, "ok"))
+
+    sleep_calls = []
+    monkeypatch.setattr(ps_module, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    ps_module.restore_strategy_states()
+
+    assert sleep_calls == []
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

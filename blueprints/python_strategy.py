@@ -1542,6 +1542,39 @@ def cleanup_strategy_logs(strategy_id: str):
         logger.exception(f"Error cleaning up logs for strategy {strategy_id}: {e}")
 
 
+def _stagger_offset_seconds(strategy_id: str, per_strategy_seconds: int = 5) -> int:
+    """
+    Per-strategy second-offset for scheduled auto-start times, based on each
+    strategy's position among all configured strategies (0s, 5s, 10s, 15s, ...).
+
+    Multiple strategies commonly share the same configured start_time
+    (hour:minute only, no seconds) -- e.g. several NIFTY/SENSEX scripts all
+    set to 09:15. Their CronTriggers then fire within the same second, each
+    independently spawning a subprocess that does its own initial
+    PriceStream connect+subscribe to the SAME shared, single-user broker
+    adapter. Confirmed in production (2026-07-30) that this exact condition
+    -- multiple strategies' subscribe requests landing close together --
+    can leave a shared symbol (e.g. NIFTY.NSE_INDEX) stuck with no ticks for
+    several minutes, self-recovering only via websocket_proxy/server.py's
+    stale-bypass retries (see that file's REDUNDANT_SUBSCRIBE_STALE_BYPASS_SEC).
+    This offset spreads each strategy's actual start (and thus its first
+    subscribe call) across a few extra seconds -- immaterial for entry
+    timing, but enough that concurrently-scheduled strategies are much less
+    likely to land in the same instant (or the same 0.15s Fyers HSM batch
+    window, see broker/fyers/streaming/fyers_websocket_adapter.py's
+    HSM_BATCH_DELAY_SEC) every trading day.
+
+    Ordering is by sorted strategy_id (stable across restarts, independent
+    of dict insertion order/config file ordering) -- not by start_time itself,
+    since strategies with DIFFERENT start times don't need staggering at all;
+    this only matters for whichever set happens to share the same minute.
+    """
+    ordered_ids = sorted(STRATEGY_CONFIGS.keys())
+    if strategy_id not in ordered_ids:
+        return 0
+    return ordered_ids.index(strategy_id) * per_strategy_seconds
+
+
 def schedule_strategy(strategy_id, start_time, stop_time=None, days=None):
     """
     Schedule a strategy to run at specific times (IST).
@@ -1572,11 +1605,16 @@ def schedule_strategy(strategy_id, start_time, stop_time=None, days=None):
     if SCHEDULER.get_job(stop_job_id):
         SCHEDULER.remove_job(stop_job_id)
 
-    # Schedule start with holiday check wrapper (time is already in IST from frontend)
+    # Schedule start with holiday check wrapper (time is already in IST from frontend).
+    # `second` staggers strategies that share the same start_time -- see
+    # _stagger_offset_seconds' docstring.
     hour, minute = map(int, start_time.split(":"))
+    second = _stagger_offset_seconds(strategy_id) % 60
     SCHEDULER.add_job(
         func=lambda: scheduled_start_strategy(strategy_id),
-        trigger=CronTrigger(hour=hour, minute=minute, day_of_week=",".join(days), timezone=IST),
+        trigger=CronTrigger(
+            hour=hour, minute=minute, second=second, day_of_week=",".join(days), timezone=IST
+        ),
         id=start_job_id,
         replace_existing=True,
     )
@@ -3420,12 +3458,27 @@ def restore_strategy_states():
         save_configs()
         return
 
+    # 2026-07-30: stagger back-to-back subprocess restarts below -- this is
+    # the path a CORE app restart takes (not the daily cron path, which
+    # schedule_strategy already staggers via _stagger_offset_seconds).
+    # Confirmed in production that multiple strategies restarting within
+    # the same instant all independently subscribe to the same shared
+    # symbols on the SAME single-user broker adapter connection, which can
+    # leave a shared symbol (e.g. NIFTY.NSE_INDEX) stuck with no ticks for
+    # several minutes. A restarted-count-based delay here (not the first
+    # one) keeps the common single-strategy-restart case instant while
+    # spacing out the actual race-prone scenario -- several strategies
+    # restarting together after a core deploy.
+    restarted_this_pass = 0
     for strategy_id, config in STRATEGY_CONFIGS.items():
         if config.get("is_running") and config.get("pid"):
             strategy_restored = strategy_id in RUNNING_STRATEGIES
 
             # If strategy wasn't restored, try to restart it automatically
             if not strategy_restored:
+                if restarted_this_pass > 0:
+                    sleep(5)
+                restarted_this_pass += 1
                 logger.info(f"Attempting to restart strategy {strategy_id}...")
                 try:
                     success, message = start_strategy_process(strategy_id)

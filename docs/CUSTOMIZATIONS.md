@@ -213,6 +213,38 @@ registers routes on the same `python_strategy_bp` via import side-effect,
 shrinking this file's diff down to a single import line. Discussed and agreed
 as the next step when there's time — see the corresponding conversation entry.
 
+**2026-07-30 follow-up — stagger multiple strategies' auto-start so they
+don't all subscribe to shared symbols in the same instant.** Companion fix
+to `websocket_proxy/server.py`'s stale-bypass work above: confirmed in
+production that several strategies auto-starting together (either the daily
+scheduled cron firing for strategies sharing an `hour:minute` start_time, or
+a core app restart re-launching every previously-running strategy) each
+independently subscribe to the same shared symbols (e.g. `NIFTY.NSE_INDEX`)
+on the SAME single-user broker adapter connection at nearly the same
+instant — exactly the condition behind the `NIFTY.NSE_INDEX` staleness
+incidents, and it recurs every trading day at market open, not just during
+manual restarts.
+
+Two call sites, two mechanisms:
+- `schedule_strategy()` (the daily cron path): new `_stagger_offset_seconds()`
+  gives each strategy a deterministic `second` offset (0s, 5s, 10s, ... by
+  sorted `strategy_id` position) added to its `CronTrigger`, so strategies
+  sharing an `hour:minute` start_time fire a few seconds apart instead of in
+  the same second.
+- `restore_strategy_states()` (the core-restart recovery path): a plain
+  `sleep(5)` between each back-to-back subprocess restart in the loop — but
+  only between restarts, never before the first, so the common
+  single-strategy-restart case is unaffected.
+
+A few seconds' stagger is immaterial for entry timing but enough that
+concurrently-launched strategies are much less likely to land in the same
+instant (or the same 0.15s Fyers HSM batch window,
+`fyers_websocket_adapter.py`'s `HSM_BATCH_DELAY_SEC`) every trading day.
+
+Covered by 6 new tests in `test/test_python_strategy_edge_cases.py`
+(offset determinism/ordering, `CronTrigger.second` wiring, and the
+sleep-between-not-before-first behavior via a monkeypatched `sleep`).
+
 ---
 
 ## `services/option_chain_service.py` (+27 / -12 lines)
