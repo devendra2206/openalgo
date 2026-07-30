@@ -271,6 +271,19 @@ class Config:
                                                # scheduler_interval, since it's cache-only/read-only and
                                                # doesn't share the blocking-call risk that interval guards
 
+    # report_pnl_tick()'s WS price cache can stay stale for an EXTENDED
+    # period during a genuine broker-side outage (confirmed in production,
+    # 2026-07-30: both the WS feed AND REST quotes() failed for a specific
+    # NIFTY option contract for 2+ hours, while the broker's OWN historical
+    # data endpoint kept working fine -- a real, if unusual, broker-side
+    # partial outage). Previously such a leg just vanished from the pushed
+    # PnL payload for the ENTIRE outage. Now falls back to a REST quotes()
+    # call, throttled to at most once per this interval per leg -- frequent
+    # enough to recover visibility within a reasonable window, rare enough
+    # that a 1-second job doing this doesn't spam the broker for the whole
+    # outage's duration.
+    pnl_rest_fallback_interval_sec: float = 900.0   # 15 minutes
+
     # WebSocket LTP cache: a tick older than this is treated as stale and
     # falls back to a one-off REST client.quotes() call for that symbol.
     ws_stale_seconds: float = 20.0

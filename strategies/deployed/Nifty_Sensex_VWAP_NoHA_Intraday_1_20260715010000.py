@@ -283,6 +283,20 @@ class Config:
                                             # scheduler_interval, since it's cache-only/read-only and
                                             # doesn't share the blocking-call risk that interval guards
 
+    # report_pnl_tick()'s WS price cache can stay stale for an EXTENDED
+    # period during a genuine broker-side outage (confirmed in production,
+    # 2026-07-30: both the WS feed AND REST quotes() failed for a specific
+    # NIFTY option contract for 2+ hours, while the broker's OWN historical
+    # data endpoint kept working fine -- a real, if unusual, broker-side
+    # partial outage, not a bug in this script or the WS proxy). Previously
+    # such a leg just vanished from the pushed PnL payload for the ENTIRE
+    # outage, silently, with no way to tell it was even still open. Now
+    # falls back to a REST quotes() call, but throttled to at most once per
+    # this interval per leg -- frequent enough to recover visibility within
+    # a reasonable window, rare enough that a 1-second job doing this
+    # doesn't spam the broker for the whole outage's duration.
+    pnl_rest_fallback_interval_sec: float = 900.0   # 15 minutes
+
     # WebSocket LTP cache: a tick older than this is treated as stale and
     # falls back to a one-off REST client.quotes() call for that symbol.
     ws_stale_seconds: float = 20.0
@@ -1553,6 +1567,12 @@ class StrategyEngine:
         self.execution_id = execution_id  # this process run's number -- see main()
         self._option_signal_cache: dict[str, OptionSignal] = {}
         self._option_signal_refresh: dict[str, datetime] = {}
+        # report_pnl_tick()'s throttled REST fallback -- see
+        # config.pnl_rest_fallback_interval_sec's docstring. Keyed by
+        # leg_key; cleared on leg close alongside the leg's other
+        # per-position state.
+        self._pnl_last_known_price: dict[str, float] = {}
+        self._pnl_rest_fallback_last_attempt: dict[str, datetime] = {}
         self._ws_fallback_logged: dict[str, bool] = {}
         # Weekly expiry only rolls at week boundaries, not intraday -- resolving it
         # fresh via client.expiry() on every single entry added a full REST
@@ -1623,11 +1643,17 @@ class StrategyEngine:
         the blocking-call risk scheduler_interval exists to protect
         against. Builds its own open_positions list here (rather than
         reusing run_cycle's) since this job runs independently on its own
-        cadence -- reads ONLY the WebSocket price cache
-        (price_stream.get_ltp), deliberately NEVER a REST fallback, since a
-        1-second job doing a REST quotes() call per open leg would spam the
-        broker all day. If a leg's feed is momentarily stale, its PnL just
-        holds at its last-known value for this tick."""
+        cadence -- reads the WebSocket price cache first, falling back to a
+        THROTTLED REST quotes() call (at most once per
+        config.pnl_rest_fallback_interval_sec per leg) only once the WS
+        cache has gone stale -- frequent enough to recover visibility
+        during a genuine broker-side outage (confirmed in production,
+        2026-07-30: a leg vanished from this payload for 2+ hours straight
+        during one), rare enough that this 0.8s job doesn't spam the broker
+        for the outage's whole duration. Falls back further to the last
+        successfully-fetched price (WS or REST) if even the throttled REST
+        attempt fails or isn't due yet, so a leg stays visible with its
+        best-known price rather than disappearing outright."""
         try:
             open_positions = []
             for inst in INSTRUMENTS:
@@ -1642,6 +1668,19 @@ class StrategyEngine:
                     ltp = self.price_stream.get_ltp(
                         pos.symbol, inst.options_exchange, max_age=_current_ws_stale_threshold()
                     )
+                    if ltp is not None:
+                        self._pnl_last_known_price[leg_key] = ltp
+                    else:
+                        now = datetime.now(IST)
+                        last_attempt = self._pnl_rest_fallback_last_attempt.get(leg_key)
+                        due = (last_attempt is None or (now - last_attempt).total_seconds()
+                               >= config.pnl_rest_fallback_interval_sec)
+                        if due:
+                            self._pnl_rest_fallback_last_attempt[leg_key] = now
+                            rest_ltp = fetch_symbol_ltp(self.ltp_client, pos.symbol, inst.options_exchange)
+                            if rest_ltp is not None:
+                                self._pnl_last_known_price[leg_key] = rest_ltp
+                        ltp = self._pnl_last_known_price.get(leg_key)
                     if ltp is None:
                         continue
                     pnl = (pos.entry_px - ltp) * pos.quantity  # short leg
