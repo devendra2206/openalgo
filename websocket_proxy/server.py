@@ -99,6 +99,13 @@ class WebSocketProxy:
         self._last_stale_check = time.time()
         self._stale_check_interval = 30  # evaluate stale-feed warnings at most every 30s
 
+        # TEMP-DEBUG (2026-07-30, NIFTY.NSE_INDEX staleness investigation):
+        # per-SYMBOL counterpart to _last_stale_warn/_last_stale_check above
+        # -- see _log_stale_symbols' docstring. Remove once root cause is
+        # confirmed/fixed.
+        self._last_stale_symbol_warn: dict[tuple, float] = {}
+        self._last_stale_symbol_check = time.time()
+
         # MODE_MAP retained for any external consumers that imported it from
         # this class. New code should call normalize_mode() / normalize_mode_or_none()
         # at module level — those accept case-insensitive strings AND ints.
@@ -530,6 +537,57 @@ class WebSocketProxy:
                 f"Stale feed: {broker} adapter for user {user_id} reports connected "
                 f"but no ticks for {silent_for:.0f}s while subscribed. If this persists, "
                 f"the broker WebSocket may be silently dead (reconnect/restart may be needed)."
+            )
+
+    def _log_stale_symbols(self):
+        """
+        TEMP-DEBUG (2026-07-30, NIFTY.NSE_INDEX staleness investigation):
+        _log_stale_adapters above only tracks last_tick_time PER USER (any
+        symbol at all) -- so it can never catch a single symbol going silent
+        while the SAME user's other symbols keep ticking fine, which is
+        exactly the reported failure mode (NIFTY.NSE_INDEX stale while other
+        symbols on the same shared connection tick normally). This checks
+        last_message_time PER (symbol, exchange, mode) instead, for every
+        key that currently has at least one subscribed client.
+
+        Answers the key open question directly: does last_message_time for
+        the stuck symbol simply stop advancing (proving the break is
+        upstream -- adapter/broker never publishes it to the ZMQ bus at
+        all), or does it keep advancing normally (proving the tick DOES
+        reach the proxy, and the problem is in delivery to one specific
+        client's WebSocket connection -- see send_message's new exception
+        logging for that side of it).
+
+        Remove once root cause is confirmed/fixed.
+        """
+        current_time = time.time()
+        if current_time - self._last_stale_symbol_check < self._stale_check_interval:
+            return
+        self._last_stale_symbol_check = current_time
+
+        threshold = self._stale_tick_warn_seconds
+        if threshold <= 0:
+            return
+
+        for sub_key, client_ids in list(self.subscription_index.items()):
+            if not client_ids:
+                continue
+            last_tick = self.last_message_time.get(sub_key)
+            if last_tick is None:
+                continue  # never ticked yet since this process started
+            silent_for = current_time - last_tick
+            if silent_for < threshold:
+                continue
+            if current_time - self._last_stale_symbol_warn.get(sub_key, 0) < threshold:
+                continue
+            self._last_stale_symbol_warn[sub_key] = current_time
+            logger.warning(
+                f"[DEBUG-TEMP] Stale SYMBOL (not just adapter): {sub_key} has had no "
+                f"tick reach the proxy for {silent_for:.0f}s, while {len(client_ids)} "
+                f"client(s) ({client_ids}) are still subscribed to it. If other symbols "
+                f"on the same connection are ticking fine, this confirms the break is "
+                f"upstream (adapter/broker never publishes this specific symbol), not a "
+                f"per-client delivery issue."
             )
 
     def get_adapter_health(self) -> dict:
@@ -1633,6 +1691,23 @@ class WebSocketProxy:
                 await websocket.send(json.dumps(message))
             except websockets.exceptions.ConnectionClosed:
                 logger.info(f"Connection closed while sending message to client {client_id}")
+            except Exception as e:
+                # TEMP-DEBUG (2026-07-30, NIFTY.NSE_INDEX staleness
+                # investigation): previously any non-ConnectionClosed
+                # exception here (e.g. a transient send-side error on one
+                # specific client's socket) was completely unlogged --
+                # zmq_listener calls send_message via
+                # aio.gather(..., return_exceptions=True), which silently
+                # swallows it. If a tick is reaching this point (proven by
+                # the DEBUG-TEMP log in zmq_listener just before the
+                # send_tasks batch) but never arrives at one particular
+                # client, this is where that would be lost. Remove once
+                # root cause is confirmed/fixed.
+                logger.warning(
+                    f"[DEBUG-TEMP] send_message to client_id={client_id} raised "
+                    f"{type(e).__name__}: {e} -- message type={message.get('type')}, "
+                    f"symbol={message.get('symbol')}, exchange={message.get('exchange')}"
+                )
 
     async def send_error(self, client_id, code, message):
         """
@@ -1868,6 +1943,7 @@ class WebSocketProxy:
 
                 # OBSERVABILITY: periodically warn on connected-but-silent feeds
                 self._log_stale_adapters()
+                self._log_stale_symbols()
 
                 # OPTIMIZATION 1: Increased timeout to reduce busy-waiting
                 try:
