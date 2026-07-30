@@ -836,12 +836,24 @@ class PriceStream:
             due_names = ", ".join(f"{i['symbol']}.{i['exchange']}" for i in due_for_retry)
             Log.warning(f"[PriceStream] stale/missing ticks for: {due_names} -- "
                         f"resubscribing just this/these symbol(s).")
+            # TEMP-DEBUG (2026-07-30, cross-strategy shared-symbol race
+            # investigation): [COMBINED] tag + before/after markers on the
+            # unsubscribe/subscribe pair, to correlate against MCX/Batman's
+            # matching tags and websocket_proxy/server.py's DEBUG-TEMP logs --
+            # if two strategies' calls for the SAME shared symbol (e.g.
+            # NIFTY.NSE_INDEX) land within the same second, that confirms the
+            # suspected subscription_index refcount race. Remove once root
+            # cause is confirmed/fixed.
+            Log.warning(f"[DEBUG-TEMP][COMBINED] about to unsubscribe_ltp: {due_names}")
             try:
                 self.client.unsubscribe_ltp(due_for_retry)
+                Log.warning(f"[DEBUG-TEMP][COMBINED] unsubscribe_ltp returned: {due_names}")
             except Exception as exc:
                 Log.warning(f"[PriceStream] unsubscribe (stale symbols) failed: {exc}")
+            Log.warning(f"[DEBUG-TEMP][COMBINED] about to subscribe_ltp: {due_names}")
             try:
                 self.client.subscribe_ltp(due_for_retry, on_data_received=self._on_tick)
+                Log.warning(f"[DEBUG-TEMP][COMBINED] subscribe_ltp returned: {due_names}")
             except Exception as exc:
                 Log.warning(f"[PriceStream] resubscribe (stale symbols) failed: {exc}")
 

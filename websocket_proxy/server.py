@@ -1236,6 +1236,18 @@ class WebSocketProxy:
             if self.subscription_index.get(sub_key):
                 response = {"status": "success"}
             else:
+                # TEMP-DEBUG (2026-07-30, VWAP/Batman/Combined staleness
+                # investigation): a real broker-level (re)subscribe is about
+                # to fire for a symbol shared across multiple clients --
+                # capture who triggered it and what the index looked like
+                # just before, to catch a race between two clients'
+                # independent unsubscribe/resubscribe cycles landing back
+                # to back. Remove once root cause is confirmed/fixed.
+                logger.warning(
+                    f"[DEBUG-TEMP] real adapter.subscribe() firing for {sub_key} "
+                    f"triggered by client_id={client_id}, user_id={user_id}. "
+                    f"subscription_index currently empty/missing for this key."
+                )
                 response = adapter.subscribe(symbol, exchange, mode, depth_level)
 
             if response.get("status") == "success":
@@ -1375,11 +1387,21 @@ class WebSocketProxy:
                         sub_key = (symbol, exchange, mode)
                         should_unsubscribe_from_adapter = False
                         if sub_key in self.subscription_index:
+                            remaining_before = set(self.subscription_index[sub_key])
                             self.subscription_index[sub_key].discard(client_id)
                             # Only unsubscribe from adapter when last client unsubscribes
                             if not self.subscription_index[sub_key]:
                                 del self.subscription_index[sub_key]
                                 should_unsubscribe_from_adapter = True
+                                # TEMP-DEBUG (2026-07-30) -- see the specific-symbols
+                                # branch below for the full rationale. Remove once
+                                # root cause is confirmed.
+                                logger.warning(
+                                    f"[DEBUG-TEMP] (unsubscribe_all) real adapter.unsubscribe() "
+                                    f"firing for {sub_key} triggered by client_id={client_id}, "
+                                    f"user_id={user_id}. subscription_index held "
+                                    f"{remaining_before} just before this discard."
+                                )
 
                         # Only call adapter.unsubscribe if this was the last client for this symbol
                         if should_unsubscribe_from_adapter:
@@ -1439,11 +1461,24 @@ class WebSocketProxy:
                 sub_key = (symbol, exchange, mode)
                 should_unsubscribe_from_adapter = False
                 if sub_key in self.subscription_index:
+                    remaining_before = set(self.subscription_index[sub_key])
                     self.subscription_index[sub_key].discard(client_id)
                     # Only unsubscribe from adapter when last client unsubscribes
                     if not self.subscription_index[sub_key]:
                         del self.subscription_index[sub_key]
                         should_unsubscribe_from_adapter = True
+                        # TEMP-DEBUG (2026-07-30, VWAP/Batman/Combined staleness
+                        # investigation): a real broker-level unsubscribe is
+                        # about to fire because this client was the last one
+                        # holding sub_key -- capture who else held it just
+                        # before, to catch a race between two clients'
+                        # independent unsubscribe/resubscribe cycles landing
+                        # back to back. Remove once root cause is confirmed.
+                        logger.warning(
+                            f"[DEBUG-TEMP] real adapter.unsubscribe() firing for {sub_key} "
+                            f"triggered by client_id={client_id}, user_id={user_id}. "
+                            f"subscription_index held {remaining_before} just before this discard."
+                        )
 
                 # Remove from client's subscription list
                 if client_id in self.subscriptions:
