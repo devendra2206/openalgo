@@ -317,6 +317,54 @@ Low conflict risk — an isolated ~15-line change inside one method's loop
 body; only conflicts if upstream also touches `subscribe_client`'s
 subscribe-vs-index-update ordering.
 
+**2026-07-30 follow-up — the refcount skip above is permanent and
+unrecoverable once the underlying broker-level subscription itself goes
+bad.** Confirmed in production: Batman and Combined both independently
+subscribe to `NIFTY.NSE_INDEX`; a fresh manual `/websocket/test` subscribe to
+the same symbol got live ticks (ruling out a broker outage), yet both
+strategies retried their own unsubscribe/resubscribe cycle every 15-30s for
+7+ minutes straight with zero recovery. Root cause: each one's resubscribe
+attempt saw the OTHER's still-present bookkeeping entry in
+`subscription_index` and got silently skipped by the fix above — neither
+could ever force a real `adapter.subscribe()` call, because "someone already
+holds this" was being trusted as proof the feed was healthy, with no check
+that data was actually still flowing. (Two earlier, narrower theories —
+Fyers' batch-subscribe token/symbol mixing, and a dead-code `unsubscribe_symbols()`
+never clearing stale HSM mappings — were investigated and fixed first, see
+the `broker/fyers/streaming/` section below, but turned out not to be the
+operative cause of *this* specific incident: proxy-level `DEBUG-TEMP` logging
+showed zero real adapter-level subscribe/unsubscribe calls firing at all
+during the stale window, meaning the Fyers-layer fixes were never even being
+exercised.)
+
+Fix: new `_is_subscription_genuinely_stale()` — a symbol currently held by
+another client is only trusted as healthy if `last_message_time` shows a
+tick within `REDUNDANT_SUBSCRIBE_STALE_BYPASS_SEC` (30s). New
+`subscription_first_held_at` dict (set when a sub_key transitions from
+unheld to held, cleared alongside `subscription_index` in all three places
+it goes back to empty — `unsubscribe_client`'s two branches and
+`cleanup_client`) lets this distinguish "just subscribed, too early to
+judge" from "held a long time with zero ticks ever," treating both
+"never ticked" and "used to tick, now silent" as equally stale. When stale,
+the skip is bypassed and a real `adapter.subscribe()` fires regardless of
+who else's bookkeeping entry is present.
+
+Also corrected a related bug caught mid-investigation in `_log_stale_symbols()`
+(added earlier in this same investigation as a diagnostic): its first version
+skipped any sub_key with `last_message_time` still `None`, reasoning "too
+early to judge" — which meant a symbol broken from its very first subscribe
+would never get flagged, since that field would stay `None` for its entire
+remaining lifetime. Now uses `subscription_first_held_at` as a fallback
+clock so "never ticked, held a long time" is flagged too.
+
+Covered by `test/test_websocket_proxy_stale_symbol_bypass.py` (7 tests,
+constructing `WebSocketProxy` via `__new__()` to exercise the real decision
+methods without the ZMQ socket bind/port checks in `__init__`).
+
+Still carries the `[DEBUG-TEMP]`-tagged correlation/diagnostic logging from
+earlier in the same investigation (not yet removed — left in place to
+confirm this fix in production).
+
 ---
 
 ## `sandbox/websocket_execution_engine.py` (+24 / -1 lines)

@@ -38,6 +38,21 @@ class WebSocketProxy:
     Supports dynamic broker selection based on user configuration.
     """
 
+    # 2026-07-30, NIFTY.NSE_INDEX staleness investigation: the redundant-
+    # subscribe skip in subscribe_client() assumes "another client already
+    # holds this symbol" means the feed is healthy. Confirmed in production
+    # that assumption is false once the underlying broker-level subscription
+    # itself has silently gone bad -- two INDEPENDENT strategy processes
+    # (Batman, Combined) both retried unsubscribe/subscribe for the same
+    # symbol every 15-30s for 7+ minutes straight with zero recovery,
+    # because each one's attempt saw the OTHER's stale bookkeeping entry
+    # and was silently skipped -- neither could ever force a real
+    # adapter.subscribe() call. This is how long a symbol may sit
+    # subscribed-but-silent (whether it's ticked before and gone quiet, or
+    # never ticked at all) before subscribe_client() stops trusting "someone
+    # already holds it" and forces a real broker-level resubscribe anyway.
+    REDUNDANT_SUBSCRIBE_STALE_BYPASS_SEC = 30.0
+
     def __init__(self, host: str = "127.0.0.1", port: int = 8765):
         """
         Initialize the WebSocket Proxy
@@ -74,6 +89,17 @@ class WebSocketProxy:
         # Maps (symbol, exchange, mode) -> set of client_ids
         # This eliminates the need for nested loops in zmq_listener
         self.subscription_index: dict[tuple[str, str, int], set[int]] = defaultdict(set)
+
+        # 2026-07-30: when a sub_key FIRST gets a subscriber (transitions
+        # from unheld to held), records that timestamp -- lets
+        # subscribe_client() tell "has been subscribed a while with zero
+        # ticks ever" apart from "just subscribed, too early to judge" when
+        # last_message_time has no entry yet. Cleared whenever the sub_key's
+        # client set goes back to empty, alongside subscription_index, so a
+        # genuinely fresh future occupancy doesn't inherit a stale timestamp
+        # from a completely different period. See
+        # REDUNDANT_SUBSCRIBE_STALE_BYPASS_SEC's docstring above.
+        self.subscription_first_held_at: dict[tuple[str, str, int], float] = {}
 
         # Order-update subscribers: user_id -> set of client_ids that sent
         # {"action": "subscribe_orders"}. Account-scoped (no symbol/mode),
@@ -539,6 +565,35 @@ class WebSocketProxy:
                 f"the broker WebSocket may be silently dead (reconnect/restart may be needed)."
             )
 
+    def _is_subscription_genuinely_stale(self, sub_key: tuple, now: float) -> bool:
+        """
+        2026-07-30: decision extracted from subscribe_client's
+        redundant-subscribe skip -- see REDUNDANT_SUBSCRIBE_STALE_BYPASS_SEC's
+        class docstring for the full production incident this fixes. A
+        symbol currently held by at least one client is "genuinely stale"
+        (and should bypass the skip, forcing a real adapter.subscribe())
+        when either:
+        - it has NEVER ticked despite being held for longer than the
+          bypass window (subscription_first_held_at is old, last_message_time
+          has no entry at all), or
+        - it USED to tick and has gone silent for longer than the bypass
+          window (last_message_time is older than the window).
+
+        Pulled out as its own method purely so this decision is unit-
+        testable without needing to drive the full async subscribe_client
+        flow. Pure function of instance state + `now` -- no side effects.
+        """
+        held_since = self.subscription_first_held_at.get(sub_key)
+        last_tick = self.last_message_time.get(sub_key)
+        return (
+            last_tick is None
+            and held_since is not None
+            and (now - held_since) > self.REDUNDANT_SUBSCRIBE_STALE_BYPASS_SEC
+        ) or (
+            last_tick is not None
+            and (now - last_tick) > self.REDUNDANT_SUBSCRIBE_STALE_BYPASS_SEC
+        )
+
     def _log_stale_symbols(self):
         """
         TEMP-DEBUG (2026-07-30, NIFTY.NSE_INDEX staleness investigation):
@@ -558,6 +613,19 @@ class WebSocketProxy:
         client's WebSocket connection -- see send_message's new exception
         logging for that side of it).
 
+        CORRECTED (2026-07-30, same investigation): the first version of
+        this check skipped any sub_key with last_message_time still None,
+        reasoning "too early to judge, hasn't ticked YET." That's wrong for
+        a symbol whose very first subscribe already came back broken --
+        last_message_time would then NEVER get set for that key's entire
+        remaining lifetime, so the original check would silently pass over
+        it forever, exactly the case actually observed in production
+        (confirmed via subscription_first_held_at being long-lived with
+        last_message_time staying None). Now uses
+        subscription_first_held_at to also flag "subscribed a long time,
+        zero ticks ever" as equally stale, not just "used to tick, now
+        silent."
+
         Remove once root cause is confirmed/fixed.
         """
         current_time = time.time()
@@ -573,18 +641,25 @@ class WebSocketProxy:
             if not client_ids:
                 continue
             last_tick = self.last_message_time.get(sub_key)
+            held_since = self.subscription_first_held_at.get(sub_key)
             if last_tick is None:
-                continue  # never ticked yet since this process started
-            silent_for = current_time - last_tick
-            if silent_for < threshold:
-                continue
+                if held_since is None or (current_time - held_since) < threshold:
+                    continue  # too early to judge -- genuinely just subscribed
+                silent_for = current_time - held_since
+                never_ticked = True
+            else:
+                silent_for = current_time - last_tick
+                if silent_for < threshold:
+                    continue
+                never_ticked = False
             if current_time - self._last_stale_symbol_warn.get(sub_key, 0) < threshold:
                 continue
             self._last_stale_symbol_warn[sub_key] = current_time
             logger.warning(
-                f"[DEBUG-TEMP] Stale SYMBOL (not just adapter): {sub_key} has had no "
-                f"tick reach the proxy for {silent_for:.0f}s, while {len(client_ids)} "
-                f"client(s) ({client_ids}) are still subscribed to it. If other symbols "
+                f"[DEBUG-TEMP] Stale SYMBOL (not just adapter): {sub_key} has "
+                f"{'NEVER ticked despite being subscribed' if never_ticked else 'had no tick reach the proxy'} "
+                f"for {silent_for:.0f}s, while {len(client_ids)} client(s) "
+                f"({client_ids}) are still subscribed to it. If other symbols "
                 f"on the same connection are ticking fine, this confirms the break is "
                 f"upstream (adapter/broker never publishes this specific symbol), not a "
                 f"per-client delivery issue."
@@ -704,6 +779,7 @@ class WebSocketProxy:
                         # Clean up empty entries and mark for adapter unsubscription
                         if not self.subscription_index[sub_key]:
                             del self.subscription_index[sub_key]
+                            self.subscription_first_held_at.pop(sub_key, None)
                             # Only unsubscribe from adapter when last client unsubscribes
                             should_unsubscribe_from_adapter = True
                             # TEMP-DEBUG (2026-07-30) -- see subscribe_client's
@@ -1294,18 +1370,47 @@ class WebSocketProxy:
                 continue  # Skip invalid symbols
 
             sub_key = (symbol, exchange, mode)
+            now = time.time()
             # Another client already holds this exact (symbol, exchange, mode)
-            # live at the broker -- skip re-sending subscribe to the adapter.
-            # A redundant re-subscribe for an already-streaming token can
-            # reset/interrupt that token's tick delivery at the broker's own
-            # feed (e.g. broker/zerodha/streaming/zerodha_adapter.py's
+            # live at the broker -- normally skip re-sending subscribe to the
+            # adapter. A redundant re-subscribe for an already-streaming token
+            # can reset/interrupt that token's tick delivery at the broker's
+            # own feed (e.g. broker/zerodha/streaming/zerodha_adapter.py's
             # subscribe() unconditionally re-enqueues a fresh subscribe on
             # every call, regardless of whether the token is already
             # streaming), which would otherwise silently disrupt every OTHER
             # client already subscribed to the same symbol. Mirrors the
             # refcount check unsubscribe_client already does in reverse.
-            if self.subscription_index.get(sub_key):
-                response = {"status": "success"}
+            #
+            # BUT (2026-07-30): confirmed in production that this skip is
+            # permanent and unrecoverable once the underlying broker-level
+            # subscription itself has silently gone bad -- Batman and
+            # Combined both independently retried unsubscribe/subscribe for
+            # NIFTY.NSE_INDEX every 15-30s for 7+ minutes with zero recovery,
+            # because each one's attempt always saw the OTHER's stale
+            # bookkeeping entry and got skipped here, so neither could ever
+            # force a real adapter.subscribe() call. "Someone already holds
+            # this" is not proof the feed is healthy. Bypass the skip when
+            # this symbol looks genuinely stuck -- either it's never ticked
+            # despite being held for REDUNDANT_SUBSCRIBE_STALE_BYPASS_SEC, or
+            # it used to tick and has gone silent for that long.
+            currently_held = bool(self.subscription_index.get(sub_key))
+            if currently_held:
+                if self._is_subscription_genuinely_stale(sub_key, now):
+                    held_since = self.subscription_first_held_at.get(sub_key)
+                    last_tick = self.last_message_time.get(sub_key)
+                    logger.warning(
+                        f"[DEBUG-TEMP] bypassing redundant-subscribe skip for {sub_key} -- "
+                        f"looks stuck (last_tick="
+                        f"{'never' if last_tick is None else f'{now - last_tick:.0f}s ago'}, "
+                        f"held_since="
+                        f"{'unknown' if held_since is None else f'{now - held_since:.0f}s ago'}), "
+                        f"forcing real adapter.subscribe() triggered by "
+                        f"client_id={client_id}, user_id={user_id}"
+                    )
+                    response = adapter.subscribe(symbol, exchange, mode, depth_level)
+                else:
+                    response = {"status": "success"}
             else:
                 # TEMP-DEBUG (2026-07-30, VWAP/Batman/Combined staleness
                 # investigation): a real broker-level (re)subscribe is about
@@ -1320,6 +1425,7 @@ class WebSocketProxy:
                     f"subscription_index currently empty/missing for this key."
                 )
                 response = adapter.subscribe(symbol, exchange, mode, depth_level)
+                self.subscription_first_held_at[sub_key] = now
 
             if response.get("status") == "success":
                 # Store the subscription
@@ -1463,6 +1569,7 @@ class WebSocketProxy:
                             # Only unsubscribe from adapter when last client unsubscribes
                             if not self.subscription_index[sub_key]:
                                 del self.subscription_index[sub_key]
+                                self.subscription_first_held_at.pop(sub_key, None)
                                 should_unsubscribe_from_adapter = True
                                 # TEMP-DEBUG (2026-07-30) -- see the specific-symbols
                                 # branch below for the full rationale. Remove once
@@ -1537,6 +1644,7 @@ class WebSocketProxy:
                     # Only unsubscribe from adapter when last client unsubscribes
                     if not self.subscription_index[sub_key]:
                         del self.subscription_index[sub_key]
+                        self.subscription_first_held_at.pop(sub_key, None)
                         should_unsubscribe_from_adapter = True
                         # TEMP-DEBUG (2026-07-30, VWAP/Batman/Combined staleness
                         # investigation): a real broker-level unsubscribe is
