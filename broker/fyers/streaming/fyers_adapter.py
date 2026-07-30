@@ -363,11 +363,22 @@ class FyersAdapter:
             # Map to OpenAlgo format first to get symbol info
             mapped_data = self.data_mapper.map_fyers_data(fyers_data, "Quote")
             if not mapped_data:
+                # TEMP-DEBUG (2026-07-30, VWAP staleness investigation): this is a
+                # silent-drop path -- it returns before any HSM matching runs, which
+                # would explain why "No HSM token match" never fires for a stuck
+                # symbol. Remove once root cause is confirmed/fixed.
+                self.logger.warning(
+                    f"[DEBUG-TEMP] map_fyers_data returned None for raw fyers_data: "
+                    f"{fyers_data}"
+                )
                 return
 
             # Extract symbol information from mapped data
             symbol_str = mapped_data.get("symbol", "")
             if not symbol_str:
+                self.logger.warning(
+                    f"[DEBUG-TEMP] mapped_data has empty symbol, raw fyers_data: {fyers_data}"
+                )
                 return
 
             # Find matching subscription using HSM token or original symbol
@@ -385,8 +396,15 @@ class FyersAdapter:
                         matched_subscription = self.active_subscriptions[full_symbol]
                         self.logger.debug(f"Matched by HSM token: {hsm_token} -> {full_symbol}")
                 else:
-                    # Log missing mapping for debugging
-                    self.logger.debug(f"HSM token {hsm_token} not in mappings")
+                    # TEMP-DEBUG (2026-07-30, VWAP staleness investigation): elevated
+                    # to warning so this surfaces without needing debug-level logging.
+                    # Remove once the staleness root cause is confirmed/fixed.
+                    self.logger.warning(
+                        f"[DEBUG-TEMP] HSM token {hsm_token} not in mappings. "
+                        f"fyers_symbol={fyers_data.get('symbol')} "
+                        f"original_symbol={fyers_data.get('original_symbol')} "
+                        f"exchange_token={fyers_data.get('exchange_token')}"
+                    )
                     self.logger.debug(f"Current HSM->Symbol mappings: {self.hsm_to_symbol}")
                     # Try fallback matching
                     for full_symbol, sub_info in self.active_subscriptions.items():
@@ -397,8 +415,9 @@ class FyersAdapter:
                             matched_subscription = sub_info
                             # Update reverse mapping for future fast lookup
                             self.hsm_to_symbol[hsm_token] = full_symbol
-                            self.logger.debug(
-                                f"Matched by HSM token (fallback): {hsm_token} -> {full_symbol}"
+                            self.logger.warning(
+                                f"[DEBUG-TEMP] Matched by HSM token (fallback): "
+                                f"{hsm_token} -> {full_symbol}"
                             )
                             break
 
@@ -410,6 +429,10 @@ class FyersAdapter:
                     matched_subscription = self.active_subscriptions[original_symbol]
                     self.logger.debug(f"Matched by original_symbol: {original_symbol}")
                 else:
+                    self.logger.warning(
+                        f"[DEBUG-TEMP] hsm_token={hsm_token} no exact original_symbol match "
+                        f"for '{original_symbol}', trying pattern fallback"
+                    )
                     # Try to find a match in active subscriptions
                     # Handle cases like NSE:NIFTY25SEPFUT -> NFO:NIFTY30SEP25FUT
                     for full_symbol, sub_info in self.active_subscriptions.items():
@@ -442,8 +465,9 @@ class FyersAdapter:
                             sub_info["symbol"]
                         ):
                             matched_subscription = sub_info
-                            self.logger.debug(
-                                f"Matched by symbol name: {fyers_symbol} -> {full_symbol}"
+                            self.logger.warning(
+                                f"[DEBUG-TEMP] Matched by symbol name (fuzzy): "
+                                f"{fyers_symbol} -> {full_symbol}"
                             )
                             # Update the mapping for future use
                             if hsm_token and hsm_token not in self.hsm_to_symbol:
@@ -465,8 +489,9 @@ class FyersAdapter:
                             )
                             if fyers_core and sub_core and fyers_core in sub_core:
                                 matched_subscription = sub_info
-                                self.logger.debug(
-                                    f"Matched NFO by core symbol: {fyers_symbol} -> {full_symbol}"
+                                self.logger.warning(
+                                    f"[DEBUG-TEMP] Matched NFO by core symbol (fuzzy): "
+                                    f"{fyers_symbol} -> {full_symbol}"
                                 )
                                 # Update the mapping for future use
                                 if hsm_token and hsm_token not in self.hsm_to_symbol:
@@ -478,7 +503,10 @@ class FyersAdapter:
                 if not matched_subscription and len(self.active_subscriptions) == 1:
                     for full_symbol, sub_info in self.active_subscriptions.items():
                         matched_subscription = sub_info
-                        self.logger.debug(f"Single subscription match: {full_symbol}")
+                        self.logger.warning(
+                            f"[DEBUG-TEMP] Single subscription match (fuzzy): {full_symbol} "
+                            f"(hsm_token={hsm_token}, fyers_symbol={fyers_symbol})"
+                        )
                         break
 
             # Final check - if still no match, log detailed debug info and return

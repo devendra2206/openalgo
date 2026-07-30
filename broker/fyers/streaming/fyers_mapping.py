@@ -174,7 +174,10 @@ class FyersDataMapper:
             return openalgo_data
 
         except Exception as e:
-            logger.debug(f"Error mapping Quote data: {e}")
+            # TEMP-DEBUG (2026-07-30, VWAP staleness investigation): elevated from
+            # debug so an exception here is visible without debug-level logging.
+            # Remove once root cause is confirmed/fixed.
+            logger.warning(f"[DEBUG-TEMP] Error mapping Quote data: {e}, raw data: {fyers_data}")
             return None
 
     def map_to_openalgo_depth(self, fyers_data: dict[str, Any]) -> dict[str, Any] | None:
