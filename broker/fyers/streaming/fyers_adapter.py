@@ -325,12 +325,41 @@ class FyersAdapter:
 
     def unsubscribe_symbols(self, symbols: list[dict[str, str]]):
         """
-        Unsubscribe from symbols
-        Note: HSM protocol doesn't support individual unsubscription easily
-        This would require reconnection for full unsubscribe
+        Clear this adapter's OWN tracking for the given symbols.
+
+        Fyers' HSM WebSocket protocol has no message to selectively stop a
+        single token's ticks on an already-open connection -- Fyers keeps
+        sending them at the wire regardless (only a full disconnect/
+        reconnect with a smaller symbol list actually stops delivery).
+        This method can't change that. What it CAN and must do is drop
+        active_subscriptions/symbol_to_hsm/hsm_to_symbol for these symbols,
+        so a subsequent tick for a token Fyers might later REUSE for a
+        different instrument doesn't get matched against this stale,
+        supposedly-unsubscribed symbol in _on_message's primary hsm_token
+        lookup (checked before any fallback/logging path even runs) --
+        previously this method didn't touch any of these three dicts at
+        all, leaving permanent ghost mappings for the adapter's whole
+        lifetime.
         """
-        self.logger.warning("HSM protocol doesn't support selective unsubscription")
-        self.logger.info("To unsubscribe, disconnect and reconnect with new symbol list")
+        if not symbols:
+            return
+        with self.lock:
+            for symbol_info in symbols:
+                exchange = symbol_info.get("exchange", "")
+                symbol = symbol_info.get("symbol", "")
+                if not symbol:
+                    continue
+                full_symbol = f"{exchange}:{symbol}"
+                self.active_subscriptions.pop(full_symbol, None)
+                hsm_token = self.symbol_to_hsm.pop(full_symbol, None)
+                if hsm_token is not None:
+                    self.hsm_to_symbol.pop(hsm_token, None)
+        self.logger.info(
+            f"Cleared local HSM tracking for {len(symbols)} symbol(s). Fyers has "
+            f"no selective unsubscribe, so ticks for these tokens may still "
+            f"arrive at the wire, but this adapter will no longer route them "
+            f"anywhere until re-subscribed."
+        )
 
     def _on_open(self):
         """Handle WebSocket connection open"""

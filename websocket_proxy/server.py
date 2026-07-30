@@ -641,12 +641,25 @@ class WebSocketProxy:
                     sub_key = (symbol, exchange, mode)
                     should_unsubscribe_from_adapter = False
                     if sub_key in self.subscription_index:
+                        remaining_before = set(self.subscription_index[sub_key])
                         self.subscription_index[sub_key].discard(client_id)
                         # Clean up empty entries and mark for adapter unsubscription
                         if not self.subscription_index[sub_key]:
                             del self.subscription_index[sub_key]
                             # Only unsubscribe from adapter when last client unsubscribes
                             should_unsubscribe_from_adapter = True
+                            # TEMP-DEBUG (2026-07-30) -- see subscribe_client's
+                            # matching comment for the full rationale. This is
+                            # the disconnect/cleanup path, exercised by a full
+                            # strategy restart. Remove once root cause is
+                            # confirmed/fixed.
+                            logger.warning(
+                                f"[DEBUG-TEMP] (cleanup_client/disconnect) real "
+                                f"adapter.unsubscribe() firing for {sub_key} "
+                                f"triggered by client_id={client_id} disconnecting. "
+                                f"subscription_index held {remaining_before} just "
+                                f"before this discard."
+                            )
 
                     # Get the user's broker adapter
                     # Only unsubscribe from adapter if this was the last client for this symbol

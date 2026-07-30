@@ -532,6 +532,27 @@ class FyersWebSocketAdapter(BaseBrokerWebSocketAdapter):
                             f"{data_type_key}_{full_symbol}", None
                         )
 
+                    # Also clear FyersAdapter's own HSM-token tracking
+                    # (active_subscriptions/symbol_to_hsm/hsm_to_symbol) --
+                    # but ONLY once no sibling mode subscription remains for
+                    # this exact symbol (those dicts are keyed by symbol
+                    # alone, not symbol+mode, so clearing them while a
+                    # sibling Quote/Depth subscription is still live would
+                    # break that sibling's routing too). Without this, stale
+                    # HSM-token mappings persist for the adapter's whole
+                    # lifetime and can misdirect a token Fyers later reuses
+                    # for a different instrument.
+                    sibling_prefix = f"{exchange}:{symbol}:"
+                    has_sibling = any(
+                        k.startswith(sibling_prefix) for k in self.subscriptions
+                    )
+                    if not has_sibling and self.fyers_adapter and hasattr(
+                        self.fyers_adapter, "unsubscribe_symbols"
+                    ):
+                        self.fyers_adapter.unsubscribe_symbols(
+                            [{"exchange": exchange, "symbol": symbol}]
+                        )
+
                     # Clean up TBT subscriptions if this was a depth subscription
                     if mode == 3:
                         self._unsubscribe_tbt_depth(symbol, exchange)
@@ -651,11 +672,6 @@ class FyersWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 grouped.setdefault(item["data_type"], {})[full_symbol] = item
 
             for data_type, items in grouped.items():
-                symbol_info = [
-                    {"exchange": it["exchange"], "symbol": it["symbol"]}
-                    for it in items.values()
-                ]
-
                 # Populate the SHARED registry BEFORE registering the dispatcher.
                 # Once subscribe_*() returns, ticks may start arriving immediately,
                 # and the dispatcher needs the registry entries to be visible.
@@ -676,16 +692,37 @@ class FyersWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     if cb:
                         cb(data)
 
-                try:
-                    if data_type == "DepthUpdate":
-                        self.fyers_adapter.subscribe_depth(symbol_info, _dispatch)
-                    else:
-                        self.fyers_adapter.subscribe_quote(symbol_info, _dispatch)
-                    self.logger.debug(
-                        f"Flushed HSM batch: {len(symbol_info)} symbols ({data_type})"
-                    )
-                except Exception as e:
-                    self.logger.error(f"HSM batch subscribe failed for {data_type}: {e}")
+                # One FyersAdapter.subscribe_symbols() call PER symbol, not one
+                # combined call for the whole batch (2026-07-30, production
+                # staleness investigation): Fyers' /data/symbol-token API can
+                # mis-pair tokens when a single request lists multiple symbols
+                # together (documented for index+options mixed in one call --
+                # see FyersAdapter.subscribe_symbols' docstring). Since this
+                # queue collapses requests from EVERY connected strategy
+                # process into the same 0.15s window, two unrelated strategies'
+                # resubscribe attempts for two different symbols could land in
+                # the same flush and get mixed into one multi-symbol call,
+                # silently scrambling the HSM token<->symbol mapping for one or
+                # both -- with no error anywhere, since the tick still matches
+                # something via the primary token lookup, just the wrong
+                # symbol. One symbol per call removes any possibility of that
+                # mixing, at the cost of the batch-call-collapsing efficiency
+                # this queue originally existed for.
+                for full_symbol, it in items.items():
+                    symbol_info = [{"exchange": it["exchange"], "symbol": it["symbol"]}]
+                    try:
+                        if data_type == "DepthUpdate":
+                            self.fyers_adapter.subscribe_depth(symbol_info, _dispatch)
+                        else:
+                            self.fyers_adapter.subscribe_quote(symbol_info, _dispatch)
+                    except Exception as e:
+                        self.logger.error(
+                            f"HSM subscribe failed for {full_symbol} ({data_type}): {e}"
+                        )
+                self.logger.debug(
+                    f"Flushed HSM batch: {len(items)} symbols ({data_type}), "
+                    f"1 subscribe_symbols() call each"
+                )
         except Exception as e:
             self.logger.error(f"Error in _flush_hsm_batch: {e}")
 

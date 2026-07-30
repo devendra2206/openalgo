@@ -356,6 +356,90 @@ pattern already used in `services/websocket_client.py` and
 
 ---
 
+## `broker/fyers/streaming/fyers_websocket_adapter.py` + `fyers_adapter.py`
+
+**2026-07-30**: root-caused and fixed a production issue where `NIFTY.NSE_INDEX`
+went permanently stale in the Combined and Batman strategies simultaneously
+(other symbols on the same connection kept ticking fine), recovering only
+after a full strategy-process restart — while a fresh manual
+`/websocket/test` subscribe to the identical symbol got live ticks the whole
+time, ruling out a broker-side outage. Both strategies independently
+subscribe to `NIFTY.NSE_INDEX`; since this is a single-user deployment, all
+running strategies share the exact same `FyersAdapter`/`FyersWebSocketAdapter`
+instance and connection.
+
+Root cause, two compounding gaps in the same shared adapter:
+
+1. **`_flush_hsm_batch()` mixed unrelated callers' symbols into one Fyers
+   request.** Subscribe requests are queued and, after a `HSM_BATCH_DELAY_SEC`
+   (0.15s) debounce, flushed as ONE combined `subscribe_symbols()` call per
+   data type — a deliberate optimization so a burst of subscribes collapses
+   into one Fyers symbol-token POST. But the queue has no concept of *which
+   strategy* enqueued an item: if Combined's watchdog resubscribed to
+   `NIFTY.NSE_INDEX` within 0.15s of Batman's watchdog resubscribing to a
+   different symbol, both landed in the same flush and got sent to Fyers as
+   one multi-symbol request. Fyers' `/data/symbol-token` API is documented
+   (see `FyersAdapter.subscribe_symbols`'s existing comment) to not reliably
+   preserve/pair multiple symbols correctly when several are requested
+   together — the same class of bug already known for "index + options mixed
+   in one call," just triggered here by two different strategy processes
+   colliding in time instead of one strategy's own request. Once the HSM
+   token→symbol mapping is scrambled, ticks still match something via the
+   normal fast-path token lookup — they just silently route to the wrong
+   symbol's subscriber, with no error or warning anywhere. This explains why
+   restarting all strategies together after a core deploy reproduces the bug
+   reliably (every process's startup subscribe clusters into the same
+   window), while restarting them one at a time avoids it (each gets an
+   isolated flush).
+
+   **Fix**: `_flush_hsm_batch()` now issues one `subscribe_symbols()` call per
+   symbol instead of grouping every symbol in the window into one call. This
+   removes the batch-mixing condition entirely, at the cost of the call-
+   collapsing efficiency the queue existed for (a mass-restart of several
+   strategies now makes N individual WebSocket subscribe frames over the
+   already-open Fyers connection instead of 1 combined one — cheap local DB
+   token lookups either way, no additional Fyers REST/rate-limit exposure).
+
+2. **`FyersAdapter.unsubscribe_symbols()` was dead code — defined but never
+   called from anywhere** (`grep -rn "unsubscribe_symbols" broker/fyers/`
+   found only its own definition). It logged a message and did nothing,
+   meaning `active_subscriptions`/`symbol_to_hsm`/`hsm_to_symbol` entries were
+   never removed on unsubscribe — permanent "ghost" mappings for the
+   adapter's entire lifetime, which could misdirect a token Fyers later
+   reuses for a different instrument. (The actual production-facing
+   unsubscribe path, `FyersWebSocketAdapter.unsubscribe()`, already did its
+   own separate cleanup of callback-routing dicts correctly — this gap was
+   specifically in `FyersAdapter`'s own token-mapping state, one layer
+   deeper.)
+
+   **Fix**: `unsubscribe_symbols()` now actually clears those three dicts, and
+   `FyersWebSocketAdapter.unsubscribe()` calls it — but only once no sibling
+   mode (Quote vs Depth) subscription remains for the same symbol, since
+   those dicts are keyed by symbol alone, not symbol+mode, and clearing them
+   while a sibling subscription is still live would break that sibling's
+   routing too (the same class of bug issue #1093 already fixed for the
+   callback-registry side).
+
+Covered by `test/test_fyers_hsm_batch_and_unsubscribe.py` (9 tests: one-call-
+per-symbol verification, data-type grouping, dedup-last-writer-wins, the
+not-connected skip path, HSM-tracking clear/preserve-other-symbols/empty-list
+for `unsubscribe_symbols()`, and the sibling-mode-preserved vs
+last-sibling-cleared cases end to end through `FyersWebSocketAdapter.unsubscribe()`).
+Pre-existing `test/test_fyers_reconnect.py` still passes unchanged.
+
+Also carries temporary `[DEBUG-TEMP]`-tagged logging (not yet removed) added
+earlier in the same investigation, in `fyers_adapter.py`'s `_on_message` and
+`websocket_proxy/server.py`'s `subscribe_client`/`unsubscribe_client`/
+`cleanup_client`, plus matching `[COMBINED]`/`[MCX]`/`[BATMAN]` correlation
+tags in those three strategy scripts' `PriceStream` watchdogs — left in place
+to confirm the fix in production; safe to strip once confirmed stable.
+
+Medium conflict risk if upstream touches the same Fyers HSM batching/
+subscription code — isolated to `broker/fyers/streaming/`, no shared
+interface changes.
+
+---
+
 ## Frontend
 
 ### `frontend/src/App.tsx` (+6 lines)
