@@ -265,6 +265,24 @@ class DepthNormalizer:
 class ShoonyaWebSocketAdapter(BaseBrokerWebSocketAdapter):
     """Shoonya WebSocket adapter with improved structure and error handling"""
 
+    # 2026-07-30: companion to websocket_proxy/server.py's
+    # REDUNDANT_SUBSCRIBE_STALE_BYPASS_SEC, applied one layer deeper. That
+    # proxy-level fix makes subscribe_client() force a real adapter.subscribe()
+    # call when a shared symbol looks stuck -- but subscribe() here has its
+    # OWN, independent "already_ws_subscribed" check (matching by
+    # correlation_id prefix) that can ALSO silently skip sending the actual
+    # WS subscribe frame, even when the proxy correctly decided a real
+    # attempt was needed. Unlike Fyers, Shoonya's unsubscribe() genuinely
+    # clears this bookkeeping -- but the strategy-side PriceStream fix
+    # (2026-07-30, dropping the unsubscribe_ltp() call before subscribe_ltp(),
+    # since that call was a pure no-op for Fyers) means that reset no longer
+    # happens automatically for ANY broker, Shoonya included. Without this,
+    # a stuck token's "already subscribed" bookkeeping here would never
+    # clear, and subscribe()'s cheap per-symbol retry path would be
+    # permanently unable to force a real resubscribe -- the same class of
+    # bug just fixed at the proxy layer, recurring one layer deeper.
+    SUBSCRIBE_STALE_BYPASS_SEC = 30.0
+
     def __init__(self):
         super().__init__()
         self.logger = logging.getLogger("shoonya_websocket")
@@ -286,6 +304,18 @@ class ShoonyaWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.ws_subscription_refs = {}  # Reference counting for WebSocket subscriptions
         # SA-R7-10 fix: Index for O(1) subscription lookup by token on hot message path
         self._token_to_cids = {}  # token -> set of correlation_ids
+        # 2026-07-30: per-token last-tick timestamp, updated in
+        # _process_market_message the moment a genuine tick for that token
+        # is received. Used by subscribe()'s already_ws_subscribed check to
+        # tell "genuinely still streaming" apart from "registered as
+        # subscribed but silently dead" -- see SUBSCRIBE_STALE_BYPASS_SEC's
+        # docstring for the production incident this guards against.
+        self._token_last_tick: dict[str, float] = {}
+        # When a token FIRST became subscribed (no prior self.subscriptions
+        # entry for it) -- lets _is_token_genuinely_stale tell "just
+        # subscribed, too early to judge" apart from "subscribed a while
+        # with zero ticks ever".
+        self._token_first_subscribed_at: dict[str, float] = {}
 
     def _setup_connection_management(self):
         """Initialize connection management"""
@@ -436,6 +466,26 @@ class ShoonyaWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         self.logger.info("Disconnected from Shoonya WebSocket")
 
+    def _is_token_genuinely_stale(self, token: str) -> bool:
+        """
+        2026-07-30: decision extracted from subscribe()'s already_ws_subscribed
+        check so it's unit-testable without needing a live WebSocket. See
+        SUBSCRIBE_STALE_BYPASS_SEC's class docstring for the full incident
+        this guards against. A token registered as already subscribed is
+        only trusted as genuinely streaming if it has ticked recently.
+        Mirrors websocket_proxy/server.py's _is_subscription_genuinely_stale.
+        """
+        now = time.time()
+        last_tick = self._token_last_tick.get(token)
+        first_subscribed = self._token_first_subscribed_at.get(token)
+        return (
+            last_tick is None
+            and first_subscribed is not None
+            and (now - first_subscribed) > self.SUBSCRIBE_STALE_BYPASS_SEC
+        ) or (
+            last_tick is not None and (now - last_tick) > self.SUBSCRIBE_STALE_BYPASS_SEC
+        )
+
     def subscribe(
         self, symbol: str, exchange: str, mode: int = Config.MODE_QUOTE, depth_level: int = 5
     ) -> dict[str, Any]:
@@ -473,6 +523,21 @@ class ShoonyaWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     for cid in self.subscriptions.keys()
                 )
 
+                # 2026-07-30: "already subscribed" is only trustworthy if the
+                # token is genuinely still streaming -- see
+                # SUBSCRIBE_STALE_BYPASS_SEC's class docstring. Bypass this
+                # bookkeeping-only check and force a real WS resubscribe when
+                # the token looks stuck.
+                if already_ws_subscribed and self._is_token_genuinely_stale(
+                    subscription["token"]
+                ):
+                    self.logger.warning(
+                        f"[DEBUG-TEMP] {base_correlation_id} (token={subscription['token']}) "
+                        f"registered as already_ws_subscribed but looks stuck -- "
+                        f"bypassing and forcing a real WS resubscribe."
+                    )
+                    already_ws_subscribed = False
+
                 if already_ws_subscribed:
                     self.logger.info(
                         f"[SUBSCRIBE] WebSocket already subscribed for {base_correlation_id}, adding client subscription {correlation_id}"
@@ -496,6 +561,7 @@ class ShoonyaWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
                 if self.connected and not already_ws_subscribed:
                     need_ws_subscribe = True
+                    self._token_first_subscribed_at[token] = time.time()
                 elif not self.connected:
                     self.logger.warning(
                         f"[SUBSCRIBE] Not connected, cannot subscribe to {subscription['scrip']}"
@@ -564,6 +630,11 @@ class ShoonyaWebSocketAdapter(BaseBrokerWebSocketAdapter):
             if token not in self._token_to_cids:
                 self.token_to_symbol.pop(token, None)
                 token_to_clear = token
+                # 2026-07-30: clear alongside, so a genuinely fresh future
+                # subscribe doesn't inherit a stale baseline from this
+                # unrelated earlier occupancy.
+                self._token_last_tick.pop(token, None)
+                self._token_first_subscribed_at.pop(token, None)
 
             # SA-R8-3 note: Only call _websocket_unsubscribe for the last
             # correlation_id. The ref count inside _websocket_unsubscribe is a
@@ -1198,6 +1269,9 @@ class ShoonyaWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     for cid in cids
                     if cid in self.subscriptions
                 ]
+                # 2026-07-30: mark this token as genuinely streaming --
+                # see SUBSCRIBE_STALE_BYPASS_SEC's docstring.
+                self._token_last_tick[token] = time.time()
 
             for subscription in matching_subscriptions:
                 if self._should_process_message(msg_type, subscription["mode"]):

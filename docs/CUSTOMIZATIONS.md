@@ -558,6 +558,58 @@ interface changes.
 
 ---
 
+## `broker/shoonya/streaming/shoonya_adapter.py`
+
+**2026-07-30**, ahead of a planned live deployment on Shoonya: found and
+fixed the same bug *class* as `websocket_proxy/server.py`'s
+`REDUNDANT_SUBSCRIBE_STALE_BYPASS_SEC` fix above, recurring one layer
+deeper, specific to this broker.
+
+Shoonya's `subscribe()` has its own, independent "already subscribed" check
+(`already_ws_subscribed`, matched by correlation_id prefix) — if a
+`(symbol, exchange, mode)` already has a tracked subscription, it skips
+sending the real WebSocket subscribe frame entirely, registering only new
+client-side bookkeeping. This is a second, broker-specific instance of
+"bookkeeping says subscribed" being trusted as proof of health, independent
+of and invisible to the proxy-level fix, which only forces a real
+`adapter.subscribe()` *call* — it can't see or override what Shoonya's own
+adapter code does once that call arrives.
+
+This interacts badly with the same-day PriceStream fix (`strategies/`
+section below): unlike Fyers, Shoonya's `unsubscribe()` genuinely clears
+this bookkeeping — but PriceStream no longer calls `unsubscribe_ltp()`
+before `subscribe_ltp()` (a correct fix for Fyers, where that call was a
+pure no-op). For Shoonya, that reset used to be exactly what let a stuck
+token's `already_ws_subscribed` bookkeeping clear so a real resubscribe
+could go out. Without a matching fix here, Shoonya's cheap per-symbol retry
+path would become **permanently** unable to force a real resubscribe once a
+token's bookkeeping goes stale — the same failure mode just fixed for
+Fyers/the proxy, reintroduced for Shoonya by a fix that was correct for a
+different broker.
+
+Fix: new `_is_token_genuinely_stale()` — an `already_ws_subscribed` token is
+only trusted as healthy if `_token_last_tick` (new, updated in
+`_process_market_message` the moment a genuine tick for that token is
+received) shows activity within `SUBSCRIBE_STALE_BYPASS_SEC` (30s).
+Otherwise `subscribe()` bypasses the skip and sends a real WS resubscribe
+frame regardless of existing bookkeeping. New `_token_first_subscribed_at`
+(set the moment a token is genuinely freshly subscribed, cleared alongside
+`token_to_symbol`/`market_cache` on full unsubscribe) lets this distinguish
+"just subscribed, too early to judge" from "subscribed a while with zero
+ticks ever" — mirrors `websocket_proxy/server.py`'s
+`subscription_first_held_at`/`_is_subscription_genuinely_stale` exactly.
+
+Covered by `test/test_shoonya_subscribe_stale_bypass.py` (9 tests:
+staleness-decision determinism, fresh-subscribe sends a real WS frame,
+already-subscribed-and-healthy correctly skips a redundant frame,
+already-subscribed-but-stuck correctly bypasses and resends, and
+`_process_market_message` updating `_token_last_tick`).
+
+Low conflict risk — isolated to `broker/shoonya/streaming/`, no shared
+interface changes.
+
+---
+
 ## Frontend
 
 ### `frontend/src/App.tsx` (+6 lines)
