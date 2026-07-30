@@ -184,6 +184,20 @@ class FyersHSMWebSocket:
         # Track pending subscriptions for resubscription after reconnect
         self._pending_hsm_symbols = []
 
+        # TEMP-DEBUG (2026-07-30, PriceStream/NIFTY.NSE_INDEX staleness
+        # investigation): raw per-token last-seen timestamps, updated the
+        # moment a snapshot or update frame for that HSM token is parsed --
+        # i.e. proof Fyers actually sent SOMETHING for it at the wire level,
+        # before any of OpenAlgo's own symbol-mapping/dispatch logic runs.
+        # _health_check_loop already periodically checks _last_message_time
+        # (connection-wide "is ANYTHING arriving"); this is the same idea
+        # but per-token, so a symbol whose OWN data never arrives can be
+        # told apart from "the whole connection is dead." Remove once root
+        # cause is confirmed/fixed.
+        self._token_last_seen: dict[str, float] = {}
+        self._token_stale_warn_threshold = 60.0  # seconds, same order as HEALTH_CHECK_INTERVAL
+        self._token_stale_last_warn: dict[str, float] = {}
+
         # Callbacks
         self.on_message_callback = None
         self.on_error_callback = None
@@ -455,6 +469,7 @@ class FyersHSMWebSocket:
             # Store mapping
             self.subscriptions[topic_id] = topic_name
             self.logger.debug(f"Mapped topic_id {topic_id} -> {topic_name}")
+            self._token_last_seen[topic_name] = time.time()
 
             # Parse based on topic type
             if topic_name.startswith("sf|"):
@@ -710,6 +725,7 @@ class FyersHSMWebSocket:
             # Determine data type based on topic ID
             if topic_id in self.subscriptions:
                 topic_name = self.subscriptions[topic_id]
+                self._token_last_seen[topic_name] = time.time()
 
                 if topic_name.startswith("sf|") and topic_id in self.scrips_data:
                     # Update scrip data
@@ -776,6 +792,26 @@ class FyersHSMWebSocket:
                                         f"Sending live depth update: {update_data.get('symbol', 'Unknown')}"
                                     )
                                     self.on_message_callback(update_data)
+                else:
+                    # TEMP-DEBUG (2026-07-30, PriceStream/NIFTY.NSE_INDEX
+                    # staleness investigation): topic_id IS a known
+                    # subscription (a frame for it genuinely arrived at the
+                    # wire), but none of the sf|/if|/dp| + snapshot-dict-
+                    # membership conditions matched -- meaning this token's
+                    # initial snapshot was never successfully parsed into
+                    # scrips_data/index_data/depth_data. Every update frame
+                    # for it from here on is silently dropped with NO log
+                    # anywhere in the previous code -- this is the exact
+                    # "ticks arrive at the wire but never reach anything
+                    # above this layer" mechanism the investigation is
+                    # trying to catch. Remove once root cause is
+                    # confirmed/fixed.
+                    self.logger.warning(
+                        f"[DEBUG-TEMP] update frame for known topic_id={topic_id} "
+                        f"(topic_name={topic_name}) has no matching snapshot data "
+                        f"structure -- initial snapshot for this token was likely "
+                        f"never parsed successfully. This update is being dropped."
+                    )
             else:
                 # Skip unknown data
                 offset += field_count * 4
@@ -1041,11 +1077,64 @@ class FyersHSMWebSocket:
                     else:
                         self.logger.debug(f"HSM health check OK - last data {elapsed:.1f}s ago")
 
+                self._log_stale_tokens()
+
             except Exception as e:
                 self.logger.error(f"HSM health check error: {e}")
                 break
 
         self.logger.debug("HSM health check loop exited")
+
+    def _log_stale_tokens(self):
+        """
+        TEMP-DEBUG (2026-07-30, PriceStream/NIFTY.NSE_INDEX staleness
+        investigation): per-token counterpart to the connection-wide check
+        above. _last_message_time proves the SOCKET is alive (any frame at
+        all, including pings/other tokens); this checks whether each
+        individually SUBSCRIBED token (_pending_hsm_symbols) has actually
+        had its OWN frame seen recently (_token_last_seen, updated in
+        _parse_snapshot_data/_parse_update_data the moment a frame
+        referencing that exact topic_name is parsed).
+
+        This is the most direct possible evidence for the open question:
+        does Fyers genuinely never send anything for a stuck token (this
+        never fires -- _token_last_seen has no fresh entry, meaning the
+        problem is upstream of this entire file, at Fyers' own server), or
+        does it arrive here fine while getting lost further up the chain
+        (this WOULD show a recent _token_last_seen even though
+        fyers_adapter.py's _on_message shows zero corresponding activity --
+        pointing at the callback dispatch between this file and
+        fyers_adapter.py, or the update-frame snapshot-dict-membership gap
+        logged in _parse_update_data above).
+
+        Remove once root cause is confirmed/fixed.
+        """
+        if not self._pending_hsm_symbols:
+            return
+        now = time.time()
+        for hsm_symbol in self._pending_hsm_symbols:
+            last_seen = self._token_last_seen.get(hsm_symbol)
+            if last_seen is not None and (now - last_seen) < self._token_stale_warn_threshold:
+                continue
+            if now - self._token_stale_last_warn.get(hsm_symbol, 0) < self._token_stale_warn_threshold:
+                continue
+            self._token_stale_last_warn[hsm_symbol] = now
+            original = self.symbol_mappings.get(hsm_symbol, "unknown")
+            if last_seen is None:
+                self.logger.warning(
+                    f"[DEBUG-TEMP] RAW HSM token never seen at all: {hsm_symbol} "
+                    f"(original_symbol={original}) -- subscribed but zero frames "
+                    f"for this exact token have ever been parsed since this "
+                    f"connection was established. Points upstream of this file, "
+                    f"at Fyers' own server."
+                )
+            else:
+                self.logger.warning(
+                    f"[DEBUG-TEMP] RAW HSM token silent for {now - last_seen:.0f}s: "
+                    f"{hsm_symbol} (original_symbol={original}) -- was seen before "
+                    f"but has gone quiet for longer than "
+                    f"{self._token_stale_warn_threshold:.0f}s."
+                )
 
     def _force_reconnect(self):
         """Force a reconnection by closing the current WebSocket"""

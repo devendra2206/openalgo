@@ -514,6 +514,44 @@ earlier in the same investigation, in `fyers_adapter.py`'s `_on_message` and
 tags in those three strategy scripts' `PriceStream` watchdogs — left in place
 to confirm the fix in production; safe to strip once confirmed stable.
 
+**2026-07-30, second follow-up — the recovery mechanism is now confirmed
+fixed (self-heals within minutes instead of staying broken permanently),
+but the ORIGINAL question — why a symbol's feed goes dead for those minutes
+in the first place — was still unconfirmed.** Every diagnostic added until
+now lived above `broker/fyers/streaming/fyers_hsm_websocket.py` — the actual
+raw binary WebSocket client that decodes Fyers' HSM protocol frames — so
+none of them could distinguish "Fyers never sent anything for this token"
+from "it arrived at the wire but got lost somewhere in OpenAlgo's own
+dispatch chain above this file."
+
+New in `fyers_hsm_websocket.py`:
+- `_token_last_seen: dict[str, float]` — per-HSM-token-string last-seen
+  timestamp, updated in `_parse_snapshot_data` and `_parse_update_data` the
+  moment a frame referencing that exact `topic_name` is parsed, before any
+  symbol-mapping or callback dispatch runs.
+- `_log_stale_tokens()` — run periodically from the existing
+  `_health_check_loop` (which already checks connection-wide
+  `_last_message_time`, i.e. "is ANYTHING arriving") — this checks each
+  individually subscribed token instead, so a symbol whose own data never
+  arrives can be told apart from "the whole connection is dead." Warns
+  distinctly for "never seen at all" (points upstream, at Fyers' own
+  server) vs. "was seen before, went silent for Ns" (same conclusion, with
+  a duration), throttled to once per `_token_stale_warn_threshold` (60s)
+  per token.
+- A new `else` branch in `_parse_update_data`'s inner `sf|`/`if|`/`dp|`
+  dispatch: previously, if a topic_id was a known subscription but its
+  initial snapshot was never successfully parsed into
+  `scrips_data`/`index_data`/`depth_data` (e.g. an exception during the
+  first snapshot), every subsequent update frame for that exact token fell
+  through the if/elif chain with **zero logging anywhere** — a second,
+  independent silent-drop mechanism this closes visibility on.
+
+Covered by `test/test_fyers_hsm_raw_token_staleness.py` (6 tests). This is
+pure diagnostic logging — no behavior change, no fix — added specifically
+to gather the one piece of evidence this investigation never actually
+collected: what Fyers is doing at the wire level during the next
+occurrence.
+
 Medium conflict risk if upstream touches the same Fyers HSM batching/
 subscription code — isolated to `broker/fyers/streaming/`, no shared
 interface changes.
