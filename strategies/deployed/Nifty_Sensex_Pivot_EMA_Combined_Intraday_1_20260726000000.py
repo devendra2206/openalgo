@@ -836,20 +836,19 @@ class PriceStream:
             due_names = ", ".join(f"{i['symbol']}.{i['exchange']}" for i in due_for_retry)
             Log.warning(f"[PriceStream] stale/missing ticks for: {due_names} -- "
                         f"resubscribing just this/these symbol(s).")
-            # TEMP-DEBUG (2026-07-30, cross-strategy shared-symbol race
-            # investigation): [COMBINED] tag + before/after markers on the
-            # unsubscribe/subscribe pair, to correlate against MCX/Batman's
-            # matching tags and websocket_proxy/server.py's DEBUG-TEMP logs --
-            # if two strategies' calls for the SAME shared symbol (e.g.
-            # NIFTY.NSE_INDEX) land within the same second, that confirms the
-            # suspected subscription_index refcount race. Remove once root
-            # cause is confirmed/fixed.
-            Log.warning(f"[DEBUG-TEMP][COMBINED] about to unsubscribe_ltp: {due_names}")
-            try:
-                self.client.unsubscribe_ltp(due_for_retry)
-                Log.warning(f"[DEBUG-TEMP][COMBINED] unsubscribe_ltp returned: {due_names}")
-            except Exception as exc:
-                Log.warning(f"[PriceStream] unsubscribe (stale symbols) failed: {exc}")
+            # 2026-07-30: dropped the unsubscribe_ltp() call that used to run
+            # before this subscribe. Fyers' HSM protocol has no real
+            # per-symbol unsubscribe -- unsubscribe_symbols() only clears
+            # OpenAlgo's own tracking, it never tells Fyers to actually stop
+            # the token. So every 15-30s retry cycle was telling Fyers
+            # "give me this token" for a token Fyers already considered
+            # active, right after wiping our own bookkeeping for it --
+            # confirmed in production that this redundant unsub/resub
+            # churn, repeated for minutes, never once self-recovered the
+            # feed, while a single clean subscribe (no preceding
+            # unsubscribe) via manual /websocket/test consistently did,
+            # every time it was tried. A subscribe to an already-subscribed
+            # token is a safe, idempotent re-affirmation on its own.
             Log.warning(f"[DEBUG-TEMP][COMBINED] about to subscribe_ltp: {due_names}")
             try:
                 self.client.subscribe_ltp(due_for_retry, on_data_received=self._on_tick)

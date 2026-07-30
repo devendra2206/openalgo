@@ -847,3 +847,27 @@ Summary of what's in them (all 5 original scripts, unless noted):
   thin symbol confirming zero full reconnects across the entire day, and
   a companion test confirming a genuine simultaneous outage across all
   tracked symbols still correctly escalates.
+
+- **2026-07-30, same 4 scripts — per-symbol retry no longer calls
+  `unsubscribe_ltp()` before `subscribe_ltp()`.** Confirmed in production
+  (Combined and Batman both stuck on `NIFTY.NSE_INDEX` for 7+ minutes,
+  retrying every 15-30s) that this unsubscribe/subscribe pair never once
+  self-recovered a stuck feed, while a single clean manual subscribe (no
+  preceding unsubscribe) via `/websocket/test` recovered it every time it
+  was tried — a fully consistent pattern across multiple occurrences.
+  Root cause: Fyers' HSM protocol has no real per-symbol unsubscribe (see
+  the `broker/fyers/streaming/` section's `unsubscribe_symbols()` entry
+  above) — the "unsubscribe" step only ever cleared OpenAlgo's own
+  tracking dicts, it never told Fyers to actually stop the token. So every
+  retry cycle was, from Fyers' perspective, a redundant re-subscribe
+  request for a token it already considered active, sent immediately
+  after OpenAlgo wiped its own bookkeeping for it — plausibly confusing or
+  rate-limited by Fyers' server given it repeated every 15-30s for
+  minutes on end. The per-symbol retry path now calls `subscribe_ltp()`
+  alone, since a subscribe to an already-subscribed token is a safe,
+  idempotent re-affirmation on its own.
+
+  Covered by a new test in `strategies/test/test_pricestream_reconnect_backoff.py`
+  (`test_per_symbol_retry_never_calls_unsubscribe`) asserting
+  `unsubscribe_ltp` is never called on the per-symbol retry path while
+  `subscribe_ltp` still is; all 11 tests in that file pass.

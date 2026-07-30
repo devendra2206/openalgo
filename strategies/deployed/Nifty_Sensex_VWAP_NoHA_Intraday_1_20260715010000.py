@@ -902,10 +902,19 @@ class PriceStream:
             due_names = ", ".join(f"{i['symbol']}.{i['exchange']}" for i in due_for_retry)
             Log.warning(f"[PriceStream] stale/missing ticks for: {due_names} -- "
                         f"resubscribing just this/these symbol(s).")
-            try:
-                self.client.unsubscribe_ltp(due_for_retry)
-            except Exception as exc:
-                Log.warning(f"[PriceStream] unsubscribe (stale symbols) failed: {exc}")
+            # 2026-07-30: dropped the unsubscribe_ltp() call that used to run
+            # before this subscribe. Fyers' HSM protocol has no real
+            # per-symbol unsubscribe -- unsubscribe_symbols() only clears
+            # OpenAlgo's own tracking, it never tells Fyers to actually stop
+            # the token. So every 15-30s retry cycle was telling Fyers
+            # "give me this token" for a token Fyers already considered
+            # active, right after wiping our own bookkeeping for it --
+            # confirmed in production that this redundant unsub/resub
+            # churn, repeated for minutes, never once self-recovered the
+            # feed, while a single clean subscribe (no preceding
+            # unsubscribe) via manual /websocket/test consistently did,
+            # every time it was tried. A subscribe to an already-subscribed
+            # token is a safe, idempotent re-affirmation on its own.
             try:
                 self.client.subscribe_ltp(due_for_retry, on_data_received=self._on_tick)
             except Exception as exc:

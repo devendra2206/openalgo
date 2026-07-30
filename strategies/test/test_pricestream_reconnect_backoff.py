@@ -454,3 +454,54 @@ def test_one_day_simulation_genuine_outage_still_recovers(
         "a genuine simultaneous outage across all tracked symbols must "
         "still escalate to a full reconnect"
     )
+
+
+# ---- per-symbol retry no longer unsubscribes first (2026-07-30) ------------
+
+
+def test_per_symbol_retry_never_calls_unsubscribe(
+    script_module, market_hours_always_open, frozen_clock
+):
+    """Regression for the 2026-07-30 fix: PriceStream's per-symbol stale
+    retry used to call unsubscribe_ltp() immediately before subscribe_ltp().
+    Fyers' HSM protocol has no real per-symbol unsubscribe -- that call
+    only cleared OpenAlgo's own tracking, never telling Fyers to actually
+    stop the token -- so every retry cycle was a redundant re-subscribe to
+    a token Fyers already considered active, right after wiping our own
+    bookkeeping for it. Confirmed in production that this churn, repeated
+    for minutes, never once self-recovered a stuck feed, while a single
+    clean subscribe (no preceding unsubscribe) always did. The retry path
+    must now call subscribe_ltp() only."""
+    client = MagicMock()
+    client.connected = True
+    client.authenticated = True
+    client.quotes.return_value = _quotes_response(100.0)
+
+    # Multiple healthy symbols alongside the one stale symbol, so it stays a
+    # minority and never escalates to a full reconnect (which legitimately
+    # still calls unsubscribe_ltp during teardown -- that's a separate,
+    # correct code path from the per-symbol retry this test targets).
+    instruments = [
+        {"symbol": "HEALTHY_1", "exchange": "NFO"},
+        {"symbol": "HEALTHY_2", "exchange": "NFO"},
+        {"symbol": "THIN_A", "exchange": "NFO"},
+    ]
+    ps = _make_price_stream(script_module, client, instruments)
+
+    def before_cycle(_i):
+        now = frozen_clock.now()
+        ps._cache[("HEALTHY_1", "NFO")] = (100.0, now)
+        ps._cache[("HEALTHY_2", "NFO")] = (100.0, now)
+
+    _run_watchdog_cycles(script_module, ps, n_cycles=5, before_cycle=before_cycle)
+
+    assert client.connect.call_count == 1, "must not escalate to a full reconnect"
+
+    assert client.unsubscribe_ltp.call_count == 0, (
+        "per-symbol retry must not call unsubscribe_ltp -- it's a no-op "
+        "against Fyers and only wipes our own tracking"
+    )
+    assert client.subscribe_ltp.call_count >= 1, (
+        "per-symbol retry must still call subscribe_ltp as the sole "
+        "recovery attempt"
+    )
