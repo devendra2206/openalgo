@@ -307,6 +307,19 @@ class Config:
     # state needs a clean reset, not another poke at the same symbol.
     ws_stale_reconnect_after: int = 3
 
+    # report_pnl_tick()'s WS price cache can stay stale for an EXTENDED
+    # period during a genuine broker-side outage (confirmed in production,
+    # 2026-07-30: both the WS feed AND REST quotes() failed for a specific
+    # NIFTY option contract for 2+ hours, while the broker's OWN historical
+    # data endpoint kept working fine -- a real, if unusual, broker-side
+    # partial outage). Previously such a leg just vanished from the pushed
+    # PnL payload for the ENTIRE outage. Now falls back to a REST quotes()
+    # call, throttled to at most once per this interval per leg -- frequent
+    # enough to recover visibility within a reasonable window, rare enough
+    # that a 1-second job doing this doesn't spam the broker for the whole
+    # outage's duration.
+    pnl_rest_fallback_interval_sec: float = 900.0   # 15 minutes
+
     fill_poll_interval: float = 2.0
     # 5s per wait-cycle (1 initial + 59 reprices) = 60 x 5s = 300s (5 min)
     # total before giving up and raising OrderNeedsAttention -- each reprice
@@ -1480,6 +1493,12 @@ class StrategyEngine:
         # (reprice loop) can never make the live PnL display go stale too;
         # PnL pushes are small/fast and only need to run one at a time.
         self._pnl_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pnltick")
+        # report_pnl_tick()'s throttled REST fallback -- see
+        # config.pnl_rest_fallback_interval_sec's docstring. Keyed by
+        # leg_key; not cleared on leg close, same as _last_error_push above --
+        # a fixed, small leg-key-space dict, structurally bounded regardless.
+        self._pnl_last_known_price: dict[str, float] = {}
+        self._pnl_rest_fallback_last_attempt: dict[str, datetime] = {}
         # Guards the entry/repair chain-fetch background dispatch (see
         # _enter_straddle_bg/_maybe_fire_repair_bg) -- separate from
         # _pending_fills since it tracks "a chain fetch is in flight", not
@@ -2414,12 +2433,16 @@ class StrategyEngine:
         breach check, stays in _aggregate_unrealized_pnl, untouched) -- so
         this can refresh far more often than the main cycle without any of
         the blocking-call risk scheduler_interval exists to protect
-        against. Reads ONLY the WebSocket price cache (price_stream.get_ltp)
-        -- deliberately NEVER a REST fallback here, since a 1-second job
-        doing a REST quotes() call per open leg would spam the broker all
-        day. If a leg's feed is momentarily stale, its PnL just holds at
-        its last-known value for this tick rather than making a network
-        call from this job."""
+        against. Reads the WebSocket price cache first, falling back to a
+        THROTTLED REST quotes() call (at most once per
+        config.pnl_rest_fallback_interval_sec per leg) only once the WS
+        cache has gone stale -- frequent enough to recover visibility
+        during a genuine broker-side outage, rare enough that this 0.8s
+        job doesn't spam the broker for the outage's whole duration. Falls
+        back further to the last successfully-fetched price (WS or REST)
+        if even the throttled REST attempt fails or isn't due yet, so a
+        leg stays visible with its best-known price rather than
+        disappearing outright."""
         try:
             open_positions = []
             for inst in INSTRUMENTS:
@@ -2430,15 +2453,29 @@ class StrategyEngine:
                 ):
                     if not leg.entry_filled or leg.closed:
                         continue
+                    leg_key = f"{inst.name}_{leg_key_suffix}"
                     ltp = self.price_stream.get_ltp(
                         leg.symbol, inst.options_exchange, max_age=_current_ws_stale_threshold()
                     )
+                    if ltp is not None:
+                        self._pnl_last_known_price[leg_key] = ltp
+                    else:
+                        now = datetime.now(IST)
+                        last_attempt = self._pnl_rest_fallback_last_attempt.get(leg_key)
+                        due = (last_attempt is None or (now - last_attempt).total_seconds()
+                               >= config.pnl_rest_fallback_interval_sec)
+                        if due:
+                            self._pnl_rest_fallback_last_attempt[leg_key] = now
+                            rest_ltp = fetch_symbol_ltp(self.ltp_client, leg.symbol, inst.options_exchange)
+                            if rest_ltp is not None:
+                                self._pnl_last_known_price[leg_key] = rest_ltp
+                        ltp = self._pnl_last_known_price.get(leg_key)
                     if ltp is None:
                         continue
                     pnl = ((ltp - leg.entry_px) * leg.quantity if direction == "LONG"
                            else (leg.entry_px - ltp) * leg.quantity)
                     open_positions.append({
-                        "leg_key": f"{inst.name}_{leg_key_suffix}", "symbol": leg.symbol, "direction": direction,
+                        "leg_key": leg_key, "symbol": leg.symbol, "direction": direction,
                         "quantity": leg.quantity, "entry_price": leg.entry_px, "current_price": ltp, "pnl": pnl,
                         "entry_time": leg.entry_time, "execution_id": leg.execution_id,
                     })
