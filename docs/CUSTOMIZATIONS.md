@@ -923,3 +923,55 @@ Summary of what's in them (all 5 original scripts, unless noted):
   (`test_per_symbol_retry_never_calls_unsubscribe`) asserting
   `unsubscribe_ltp` is never called on the per-symbol retry path while
   `subscribe_ltp` still is; all 11 tests in that file pass.
+
+- **2026-08-01, `broker/fyers/streaming/fyers_token_converter.py` —
+  `FyersTokenConverter.convert_symbols_to_hsm()` no longer trusts Fyers'
+  echoed symbol string as the HSM-token-to-symbol mapping key for
+  unambiguous single-symbol requests.** Root-caused via production log
+  evidence: `CRUDEOIL17AUG267850CE`/`PE` and the NIFTY index showed "HSM
+  token not in mappings" on every single tick (11,646 occurrences in one
+  ~3.5 hour window), while other MCX symbols on the same connection
+  (`CRUDEOIL17AUG267900PE`, `CRUDEOIL19AUG26FUT`) ticked fine. The warning
+  log itself carried the smoking gun: `fyers_symbol=CRUDEOIL17AUG26C7850`
+  (the correct live-tick format) vs. `original_symbol=MCX:CRUDEOIL26AUG7850CE`
+  (day-of-month dropped) — same instrument (numeric HSM token matched the
+  DB's token exactly), different string.
+
+  This is the same class of Fyers `/data/symbol-token` API unreliability
+  already documented in the 2026-07-30 entry above (that fix stopped
+  trusting the API to preserve symbol *order/pairing* across a
+  multi-symbol request), just one layer deeper: even a single, unbatched
+  request — confirmed via `_flush_hsm_batch()`, which already sends one
+  symbol per call in production — can get back a `validSymbol` key that
+  doesn't match what was sent, while the fytoken/HSM token underneath
+  still resolves to the correct instrument. `FyersAdapter.subscribe_symbols()`
+  joins on that returned string against its own `get_br_symbol()` output
+  (a DB lookup), so any mismatch silently breaks the HSM-token-to-symbol
+  join forever for that token.
+
+  Side effect confirmed by reading the fallback chain in
+  `fyers_adapter.py`'s tick-routing code: when exactly one symbol is
+  subscribed, a last-resort "single subscription match" fallback papers
+  over the failure. MCX's normal trading pattern is **two** concurrent
+  subscriptions (futures contract + whichever option leg is open), so
+  that fallback doesn't apply — the tick is logged as "No HSM token
+  match" and silently dropped, forcing the strategy onto its REST-quotes
+  fallback ("WS LTP stale/missing") for the rest of that instrument's
+  life on the connection. No wrong orders or corrupted positions result
+  (REST fallback still drives PnL/exits correctly), but it defeats the
+  live WS feed for that symbol during an open trade.
+
+  **Fix**: when the request is unambiguous (exactly one brsymbol sent,
+  exactly one valid symbol returned), `token_mappings[hsm_token]` is set
+  to the brsymbol we sent, not the string Fyers echoed back. Batched
+  multi-symbol requests (no real caller does this today, but kept for
+  safety) keep the prior behavior rather than risk guessing a wrong
+  pairing among several ambiguous candidates.
+
+  Covered by `test/test_fyers_token_converter_symbol_echo.py` (4 tests:
+  single-symbol echo-mismatch uses our own sent brsymbol, matching-echo
+  case is unchanged, ambiguous multi-symbol batch keeps old behavior, and
+  a mismatch logs a warning). Pre-existing
+  `test/test_fyers_hsm_batch_and_unsubscribe.py`,
+  `test/test_fyers_hsm_raw_token_staleness.py`, and
+  `test/test_fyers_reconnect.py` (21 tests total) still pass unchanged.

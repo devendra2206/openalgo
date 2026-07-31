@@ -209,12 +209,42 @@ class FyersTokenConverter:
                             f"API returned {len(valid_symbols)} valid symbols, {len(api_invalid)} invalid symbols"
                         )
 
+                        # Fyers' /data/symbol-token API does not reliably echo back
+                        # the exact symbol string it was given -- confirmed in
+                        # production for MCX option contracts, where `validSymbol`
+                        # returned e.g. "MCX:CRUDEOIL26AUG7850CE" for a request of
+                        # "MCX:CRUDEOIL17AUG267850CE" (day-of-month dropped), even
+                        # though the underlying fytoken/HSM token resolved to the
+                        # correct instrument and ticks kept flowing. Downstream code
+                        # joins on this returned string against our own
+                        # get_br_symbol() output, so any mismatch breaks that join
+                        # permanently for the symbol's HSM token (see
+                        # docs/CUSTOMIZATIONS.md's 2026-07-30 entry for the earlier,
+                        # narrower case of this same API's unreliability). When the
+                        # request is unambiguous -- exactly one brsymbol requested,
+                        # exactly one valid symbol returned -- prefer our own sent
+                        # brsymbol as the mapping value instead of trusting Fyers'
+                        # echoed key. Every real caller already subscribes one
+                        # symbol per call (see fyers_websocket_adapter._flush_hsm_batch),
+                        # so this covers production; batched multi-symbol callers
+                        # keep the old (still-fallible) behavior rather than risk
+                        # mis-pairing across ambiguous multi-symbol responses.
+                        unambiguous_single = len(brsymbols) == 1 and len(valid_symbols) == 1
+
                         # Process valid symbols with API tokens
                         for symbol, fytoken in valid_symbols.items():
                             hsm_token = self._convert_to_hsm_token(symbol, fytoken, data_type)
                             if hsm_token:
                                 hsm_tokens.append(hsm_token)
-                                token_mappings[hsm_token] = symbol
+                                mapping_value = brsymbols[0] if unambiguous_single else symbol
+                                if mapping_value != symbol:
+                                    self.logger.warning(
+                                        f"Fyers echoed a different symbol string than "
+                                        f"requested: sent={brsymbols[0]!r} "
+                                        f"echoed={symbol!r} -- using the sent brsymbol "
+                                        f"for the HSM mapping."
+                                    )
+                                token_mappings[hsm_token] = mapping_value
                                 # self.logger.info(f"Converted: {symbol} -> {hsm_token} (fytoken: {fytoken})")
                             else:
                                 invalid_symbols.append(symbol)
