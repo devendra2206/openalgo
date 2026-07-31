@@ -1593,7 +1593,8 @@ class StrategyEngine:
         return datetime.now(IST).time() >= config.universal_exit_time
 
     # ---- entry (long straddle, once/day/instrument) -------------------------
-    def _enter_straddle_bg(self, inst: InstrumentConfig, inst_state: InstrumentState, spot: float):
+    def _enter_straddle_bg(self, inst: InstrumentConfig, inst_state: InstrumentState, spot: float,
+                            condition_desc: str = ""):
         """Dispatch wrapper for _enter_straddle -- its chain fetch
         (fetch_chain -> client.optionchain()) is a real broker round-trip on
         the main client (up to Environment.timeout), so it runs on
@@ -1608,7 +1609,7 @@ class StrategyEngine:
 
         def _run():
             try:
-                self._enter_straddle(inst, inst_state, spot)
+                self._enter_straddle(inst, inst_state, spot, condition_desc=condition_desc)
             except Exception as exc:
                 Log.exception(f"[{inst.name}] Straddle entry (background) failed: {exc}")
             finally:
@@ -1616,7 +1617,8 @@ class StrategyEngine:
 
         self._fill_executor.submit(_run)
 
-    def _enter_straddle(self, inst: InstrumentConfig, inst_state: InstrumentState, spot: float):
+    def _enter_straddle(self, inst: InstrumentConfig, inst_state: InstrumentState, spot: float,
+                         condition_desc: str = ""):
         strategy_tag = self.env.strategy_tag
         # The CURRENT (expiring-today) week's expiry -- per explicit
         # instruction, reverting the earlier next-week-roll choice for this
@@ -1634,7 +1636,8 @@ class StrategyEngine:
                 atm_leg = pick_atm_leg(chain, option_type, spot)
                 quantity = config.lot_multiplier * atm_leg["lotsize"]
                 Log.info(f"[{inst.name}_{option_type}] Straddle entry: "
-                         f"strike={atm_leg['strike']} symbol={atm_leg['symbol']}@{atm_leg['ltp']} qty={quantity}")
+                         f"strike={atm_leg['strike']} symbol={atm_leg['symbol']}@{atm_leg['ltp']} qty={quantity}"
+                         + (f" | condition: {condition_desc}" if condition_desc else ""))
                 new_leg = OptionLeg(
                     symbol=atm_leg["symbol"], quantity=quantity,
                     entry_time=datetime.now(IST).isoformat(), entry_px=float(atm_leg["ltp"]),
@@ -2714,7 +2717,11 @@ class StrategyEngine:
                 if spot is None:
                     continue
 
-                self._enter_straddle_bg(inst, inst_state, spot)
+                condition_desc = (
+                    f"now={now_time} > entry_start={config.entry_start}, "
+                    f"expiry_date={expiry_date} == today={today}, spot={spot:.2f}"
+                )
+                self._enter_straddle_bg(inst, inst_state, spot, condition_desc=condition_desc)
 
         except Exception as exc:
             Log.exception(f"Cycle failed: {exc}")

@@ -1748,7 +1748,8 @@ class StrategyEngine:
             Log.exception(f"report_pnl_tick failed: {exc}")
 
     # ---- entry / exit (single naked leg, resumable) -------------------------
-    def _enter_leg(self, leg_key: str, inst: InstrumentConfig, option_type: str, spot: float):
+    def _enter_leg(self, leg_key: str, inst: InstrumentConfig, option_type: str, spot: float,
+                    condition_desc: str = ""):
         leg = self.store.state.legs[leg_key]
         strategy_tag = self.env.strategy_tag
         pos = leg.position
@@ -1772,7 +1773,8 @@ class StrategyEngine:
                     return
             quantity = config.lot_multiplier * atm_leg["lotsize"]
 
-            Log.info(f"[{leg_key}] Entry: strike={atm_leg['strike']} symbol={atm_leg['symbol']}@{atm_leg['ltp']} qty={quantity}")
+            Log.info(f"[{leg_key}] Entry: strike={atm_leg['strike']} symbol={atm_leg['symbol']}@{atm_leg['ltp']} "
+                     f"qty={quantity}" + (f" | condition: {condition_desc}" if condition_desc else ""))
 
             pos = LegPosition(
                 symbol=atm_leg["symbol"],
@@ -2403,7 +2405,36 @@ class StrategyEngine:
                                 continue
 
                             leg.last_entry_ref_close = ref_close
-                            self._enter_leg(leg_key, inst, option_type, spot=signal.ltp)
+                            if engine == "PIVOT":
+                                if option_type == "PE":
+                                    condition_desc = (
+                                        f"last_close={sig.last_close:.2f} > r1={sig.r1:.2f}, "
+                                        f"supertrend={sig.supertrend:.2f} < last_close={sig.last_close:.2f}, "
+                                        f"ltp={signal.ltp:.2f} > last_high={sig.last_high:.2f}"
+                                    )
+                                else:
+                                    condition_desc = (
+                                        f"s1={sig.s1:.2f} > last_close={sig.last_close:.2f}, "
+                                        f"supertrend={sig.supertrend:.2f} > last_close={sig.last_close:.2f}, "
+                                        f"ltp={signal.ltp:.2f} < last_low={sig.last_low:.2f}"
+                                    )
+                            else:  # EMA
+                                if option_type == "PE":
+                                    condition_desc = (
+                                        f"close_prev2={sig.close_prev2:.2f} > ema_high34_prev2={sig.ema_high34_prev2:.2f}, "
+                                        f"ltp={signal.ltp:.2f} > close_prev1={sig.close_prev1:.2f}, "
+                                        f"close_prev1={sig.close_prev1:.2f} > high_prev2={sig.high_prev2:.2f}, "
+                                        f"rsi_prev1={sig.rsi_prev1:.2f} > pe_rsi_entry_threshold={config.pe_rsi_entry_threshold}"
+                                    )
+                                else:
+                                    condition_desc = (
+                                        f"close_prev2={sig.close_prev2:.2f} < ema_low34_prev2={sig.ema_low34_prev2:.2f}, "
+                                        f"ltp={signal.ltp:.2f} < close_prev1={sig.close_prev1:.2f}, "
+                                        f"close_prev1={sig.close_prev1:.2f} < low_prev2={sig.low_prev2:.2f}, "
+                                        f"rsi_prev1={sig.rsi_prev1:.2f} < ce_rsi_entry_threshold={config.ce_rsi_entry_threshold}"
+                                    )
+                            self._enter_leg(leg_key, inst, option_type, spot=signal.ltp,
+                                             condition_desc=condition_desc)
                 except Exception as exc:
                     Log.exception(f"[{inst.name}] Cycle failed for this instrument (other "
                                    f"instrument/engine unaffected): {exc}")

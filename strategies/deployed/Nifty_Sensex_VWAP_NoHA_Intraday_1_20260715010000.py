@@ -1961,7 +1961,10 @@ class StrategyEngine:
             quantity = config.lot_multiplier * lotsize
             entry_high = max(signal.high_prev2, signal.high_prev1)
 
-            Log.info(f"[{leg_key}] Entry: symbol={symbol}@{signal.ltp} qty={quantity} entry_high={entry_high}")
+            Log.info(f"[{leg_key}] Entry: symbol={symbol}@{signal.ltp} qty={quantity} entry_high={entry_high} | "
+                     f"condition: vwap_prev2={signal.vwap_prev2:.2f} > close_prev2={signal.close_prev2:.2f}, "
+                     f"low_prev2={signal.low_prev2:.2f} > close_prev1={signal.close_prev1:.2f}, "
+                     f"ltp={signal.ltp:.2f} < close_prev1={signal.close_prev1:.2f}")
 
             pos = LegPosition(
                 symbol=symbol,

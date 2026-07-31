@@ -1865,7 +1865,7 @@ class StrategyEngine:
 
     # ---- entry / exit (single naked leg, resumable) -------------------------
     def _enter_leg(self, leg_key: str, inst: InstrumentConfig, option_type: str, spot: float,
-                    futures_symbol: str):
+                    futures_symbol: str, condition_desc: str = ""):
         leg = self.store.state.legs[leg_key]
         strategy_tag = self.env.strategy_tag
         pos = leg.position
@@ -1911,7 +1911,8 @@ class StrategyEngine:
                     return
             quantity = config.lot_multiplier * atm_leg["lotsize"]
 
-            Log.info(f"[{leg_key}] Entry: strike={atm_leg['strike']} symbol={atm_leg['symbol']}@{atm_leg['ltp']} qty={quantity}")
+            Log.info(f"[{leg_key}] Entry: strike={atm_leg['strike']} symbol={atm_leg['symbol']}@{atm_leg['ltp']} "
+                     f"qty={quantity}" + (f" | condition: {condition_desc}" if condition_desc else ""))
 
             pos = LegPosition(
                 symbol=atm_leg["symbol"],
@@ -2647,7 +2648,22 @@ class StrategyEngine:
                     if not entry_condition:
                         continue
 
-                    self._enter_leg(leg_key, inst, option_type, spot=signal.ltp, futures_symbol=futures_symbol)
+                    if option_type == "PE":
+                        condition_desc = (
+                            f"close_prev2={signal.close_prev2:.2f} > ema_high_prev2={signal.ema_high_prev2:.2f}, "
+                            f"ltp={signal.ltp:.2f} > close_prev1={signal.close_prev1:.2f}, "
+                            f"close_prev1={signal.close_prev1:.2f} > high_prev2={signal.high_prev2:.2f}, "
+                            f"rsi_prev1={signal.rsi_prev1:.2f} > pe_rsi_entry_threshold={config.pe_rsi_entry_threshold}"
+                        )
+                    else:
+                        condition_desc = (
+                            f"close_prev2={signal.close_prev2:.2f} < ema_low_prev2={signal.ema_low_prev2:.2f}, "
+                            f"ltp={signal.ltp:.2f} < close_prev1={signal.close_prev1:.2f}, "
+                            f"close_prev1={signal.close_prev1:.2f} < low_prev2={signal.low_prev2:.2f}, "
+                            f"rsi_prev1={signal.rsi_prev1:.2f} < ce_rsi_entry_threshold={config.ce_rsi_entry_threshold}"
+                        )
+                    self._enter_leg(leg_key, inst, option_type, spot=signal.ltp, futures_symbol=futures_symbol,
+                                     condition_desc=condition_desc)
 
         except Exception as exc:
             Log.exception(f"Cycle failed: {exc}")
