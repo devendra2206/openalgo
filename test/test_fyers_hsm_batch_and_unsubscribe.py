@@ -176,6 +176,50 @@ def raw_adapter(monkeypatch):
     return a
 
 
+def test_subscribe_symbols_warns_when_get_br_symbol_returns_none(monkeypatch):
+    """Regression for the 2026-07-31 MCX/NIFTY-index mapping investigation:
+    confirmed in production that 3 MCX CRUDEOIL contracts and the NIFTY
+    index show 'HSM token not in mappings' on EVERY tick -- the root cause
+    is get_br_symbol() returning None for these symbols at subscribe time,
+    which silently drops them from brsymbol_to_openalgo, so their HSM token
+    can never be resolved back to an OpenAlgo symbol on any subsequent tick.
+    This one-shot subscribe-time warning is what pinpoints that, instead of
+    inferring it from thousands of per-tick downstream messages."""
+    a = FyersAdapter(access_token="dummy", userid="dummy")
+    a.connected = True
+    a.token_converter = _StubTokenConverter()
+    a.ws_client = type(
+        "WS", (), {"subscribe_symbols": lambda self, tokens, mappings: None, "disconnect": lambda self: None}
+    )()
+
+    def flaky_get_br_symbol(symbol, exchange):
+        return None if symbol == "CRUDEOIL17AUG26C7850" else f"BR_{symbol}"
+
+    monkeypatch.setattr(
+        "broker.fyers.streaming.fyers_adapter.get_br_symbol", flaky_get_br_symbol
+    )
+
+    warnings = []
+    a.logger.warning = lambda msg: warnings.append(msg)
+
+    symbols = [
+        {"exchange": "MCX", "symbol": "CRUDEOIL17AUG26C7850"},
+        {"exchange": "MCX", "symbol": "CRUDEOIL19AUG26"},
+    ]
+    a.subscribe_symbols(symbols, "SymbolUpdate", callback=lambda d: None)
+
+    matching = [m for m in warnings if "get_br_symbol() returned None" in m]
+    assert matching, f"expected a get_br_symbol warning, got: {warnings}"
+    assert "CRUDEOIL17AUG26C7850" in matching[0]
+
+    # The symbol get_br_symbol failed for must never get a resolvable HSM
+    # mapping -- active_subscriptions is still recorded (set earlier,
+    # independent of this join), but symbol_to_hsm/hsm_to_symbol must not be.
+    assert "MCX:CRUDEOIL17AUG26C7850" not in a.symbol_to_hsm
+    # The other, healthy symbol in the SAME batch must be unaffected.
+    assert "MCX:CRUDEOIL19AUG26" in a.symbol_to_hsm
+
+
 def test_unsubscribe_symbols_clears_hsm_tracking(raw_adapter):
     """The core fix: unsubscribe_symbols() must actually remove
     active_subscriptions/symbol_to_hsm/hsm_to_symbol for the given symbol --

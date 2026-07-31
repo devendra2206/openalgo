@@ -254,6 +254,29 @@ class FyersAdapter:
                     br = get_br_symbol(s["symbol"], s["exchange"])
                     if br:
                         brsymbol_to_openalgo[br] = (s["exchange"], s["symbol"])
+                    else:
+                        # TEMP-DEBUG (2026-07-31, MCX/NIFTY-index HSM-mapping
+                        # investigation): get_br_symbol() returning None here
+                        # means THIS symbol never gets an entry in
+                        # brsymbol_to_openalgo, so the keyed join below can
+                        # never resolve its HSM token on ANY subsequent tick --
+                        # not intermittently, permanently, for the rest of
+                        # this adapter's connection lifetime. Confirmed in
+                        # production: 3 MCX CRUDEOIL contracts and the NIFTY
+                        # index show "HSM token not in mappings" on every
+                        # single tick (thousands/day), all falling back to
+                        # fragile last-resort fuzzy matching. This is a
+                        # one-shot log at subscribe time (not per-tick) to
+                        # pinpoint whether the failure is here (DB/cache
+                        # lookup genuinely has no brsymbol for this exact
+                        # symbol/exchange) rather than downstream. Remove
+                        # once root cause is confirmed/fixed.
+                        self.logger.warning(
+                            f"[DEBUG-TEMP] get_br_symbol() returned None/empty for "
+                            f"symbol={s['symbol']!r} exchange={s['exchange']!r} -- "
+                            f"this symbol's HSM token can never be mapped back to "
+                            f"an OpenAlgo symbol until this resolves to something."
+                        )
 
                 mapped_count = 0
                 for hsm_token in hsm_tokens:
