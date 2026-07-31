@@ -151,6 +151,7 @@ dependencies = [
   "zipp==3.23.1",
   "zmq==0.0.0",
   "opengreeks>=0.2.0",
+  "openstatz==0.4.1",
 ]
 
 [build-system]
@@ -198,6 +199,9 @@ packages = []
 
 # Pytest configuration
 [tool.pytest.ini_options]
+# The repo root must be importable: tests import `services`, `database`, and
+# `utils` directly, which otherwise only works if PYTHONPATH is set by hand.
+pythonpath = ["."]
 testpaths = ["test", "strategies/test"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
