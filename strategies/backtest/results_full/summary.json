@@ -1,0 +1,36 @@
+{
+  "range": {
+    "start": "2023-01-02",
+    "end": "2026-03-24"
+  },
+  "total_trades": 2190,
+  "wins": 471,
+  "losses": 1719,
+  "win_rate_pct": 21.5,
+  "total_pnl_rupees": -38711.4,
+  "max_drawdown_rupees": -122161.0,
+  "by_leg": {
+    "WEEKLY_PE": {
+      "count": 1099,
+      "pnl_rupees": 1088.75
+    },
+    "WEEKLY_CE": {
+      "count": 1085,
+      "pnl_rupees": -52140.4
+    },
+    "MONTHLY_PE": {
+      "count": 5,
+      "pnl_rupees": 468.0
+    },
+    "MONTHLY_CE": {
+      "count": 1,
+      "pnl_rupees": 11872.25
+    }
+  },
+  "exit_reason_counts": {
+    "opposite_signal": 1603,
+    "profit_target": 110,
+    "universal_exit_time": 475,
+    "backtest_window_end": 2
+  }
+}

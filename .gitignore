@@ -55,6 +55,11 @@ db/backups/
 !symbols.csv
 !all_symbols.csv
 !data/qtyfreeze.csv
+# Required test fixtures (test_oi_weekly_monthly_simulation.py loads these at
+# import time -- regenerate via strategies/test/data/export_csv.py, don't
+# hand-edit) and the OI strategy's historical backtest evidence.
+!strategies/test/data/*.csv
+!strategies/backtest/results_full/trades.csv
 !docs/migration/*.csv
 
 # Environments 
