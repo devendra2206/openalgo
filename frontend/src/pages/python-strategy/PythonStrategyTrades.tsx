@@ -241,29 +241,29 @@ export default function PythonStrategyTrades() {
                 <SelectValue placeholder="Select a run or trade date" />
               </SelectTrigger>
               <SelectContent>
-                {executions.length > 0 && (
+                {tradeDates.length > 0 && (
                   <SelectGroup>
-                    <SelectLabel>Runs</SelectLabel>
-                    <SelectItem value={ALL_EXECUTIONS}>All runs (open + closed)</SelectItem>
-                    <SelectItem value={TODAY_FILTER}>Today (all runs)</SelectItem>
-                    {executions.map((execution) => (
-                      <SelectItem key={execution.execution_id} value={execution.execution_id}>
-                        {formatExecutionLabel(execution)}
+                    <SelectLabel>Trade Dates</SelectLabel>
+                    {tradeDates.map((tradeDate) => (
+                      <SelectItem
+                        key={tradeDate.date}
+                        value={`${DATE_VALUE_PREFIX}${tradeDate.date}`}
+                      >
+                        {formatTradeDateLabel(tradeDate)}
                       </SelectItem>
                     ))}
                   </SelectGroup>
                 )}
-                {tradeDates.length > 0 && (
+                {executions.length > 0 && (
                   <>
-                    {executions.length > 0 && <SelectSeparator />}
+                    {tradeDates.length > 0 && <SelectSeparator />}
                     <SelectGroup>
-                      <SelectLabel>Trade Dates</SelectLabel>
-                      {tradeDates.map((tradeDate) => (
-                        <SelectItem
-                          key={tradeDate.date}
-                          value={`${DATE_VALUE_PREFIX}${tradeDate.date}`}
-                        >
-                          {formatTradeDateLabel(tradeDate)}
+                      <SelectLabel>Runs</SelectLabel>
+                      <SelectItem value={ALL_EXECUTIONS}>All runs (open + closed)</SelectItem>
+                      <SelectItem value={TODAY_FILTER}>Today (all runs)</SelectItem>
+                      {executions.map((execution) => (
+                        <SelectItem key={execution.execution_id} value={execution.execution_id}>
+                          {formatExecutionLabel(execution)}
                         </SelectItem>
                       ))}
                     </SelectGroup>
