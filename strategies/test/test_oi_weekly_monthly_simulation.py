@@ -243,7 +243,13 @@ class FakeClient:
             f"optionchain() called with a dash-form expiry ({expiry_date!r}) -- "
             f"expected the compact form (e.g. '13AUG26'), matching the real API."
         )
-        return {"status": "success", "data": [{"strike": s} for s in self.chain_strikes]}
+        # Chain rows live under "chain", NOT "data" -- an earlier version of
+        # this fake used "data" here too, matching the strategy's own (wrong)
+        # assumption rather than the real API response shape (confirmed in
+        # production 2026-08-03: optionchain() actually returns {"status":
+        # "success", "chain": [...], ...}), which is why this bug also slipped
+        # past 92 passing tests.
+        return {"status": "success", "chain": [{"strike": s} for s in self.chain_strikes]}
 
     def optiongreeks(self, symbol, exchange, **kwargs):
         delta = self.greeks_by_symbol.get(symbol)

@@ -888,9 +888,16 @@ def fetch_option_chain_strikes(client, expiry_compact: str, strike_count: int = 
         underlying=UNDERLYING_SYMBOL, exchange=UNDERLYING_SPOT_EXCHANGE,
         expiry_date=expiry_compact, strike_count=strike_count,
     )
-    if resp.get("status") != "success" or not resp.get("data"):
+    # The chain rows live under the "chain" key, NOT "data" -- confirmed
+    # against Nifty_Sensex_Expiry_Batman's working _legs_with_strike(), which
+    # reads chain["chain"]. Checking "data" here (this function's own
+    # earlier bug, 2026-08-03) meant a genuinely successful response
+    # (status="success", real strikes under "chain") was always
+    # misread as a failure, since "data" is never present in this response
+    # shape at all.
+    if resp.get("status") != "success" or not resp.get("chain"):
         raise RuntimeError(f"optionchain() failed for expiry {expiry_compact}: {resp}")
-    chain = resp["data"]
+    chain = resp["chain"]
     strikes = sorted({float(row["strike"]) for row in chain if "strike" in row})
     if not strikes:
         raise RuntimeError(f"optionchain() returned no strikes for expiry {expiry_compact}")
