@@ -218,10 +218,10 @@ class Config:
 
     market_open: time = time(9, 15)
     market_close: time = time(15, 30)
-    weekly_universal_exit_time: time = time(15, 15)   # spec SS5.B
+    weekly_universal_exit_time: time = time(15, 25)   # spec SS5.B
     # No NEW entries (Weekly or Monthly, either side) from this time onward --
     # existing open legs are still managed/exited normally by their own rules.
-    entry_cutoff_time: time = time(14, 45)
+    entry_cutoff_time: time = time(15, 10)
 
     scheduler_interval: int = 10
     pnl_tick_interval: float = 0.8
