@@ -3469,45 +3469,64 @@ def restore_strategy_states():
     # one) keeps the common single-strategy-restart case instant while
     # spacing out the actual race-prone scenario -- several strategies
     # restarting together after a core deploy.
+    #
+    # 2026-08-03: snapshot the "needs restarting" list ONCE, before the
+    # sleep-staggered loop below, instead of re-reading config.get(
+    # "is_running")/("pid") fresh on every iteration. Confirmed in
+    # production: this loop can take 10s of seconds across several
+    # strategies (the sleep(5) stagger above, deliberately), and
+    # cleanup_dead_processes() -- triggered by ANY concurrent request
+    # (e.g. the dashboard polling status right after a restart) -- holds
+    # PROCESS_LOCK and re-checks every config's stored (pre-restart, now
+    # dead) PID, correctly concluding it's stale and setting is_running=
+    # False. This function was reading that SAME live, mutable dict on
+    # each iteration, so a strategy not yet reached by this loop could
+    # have its is_running flag flipped out from under it by that
+    # concurrent cleanup, causing the `if` below to silently skip
+    # restarting it -- no error, no log line, just never restarted (seen
+    # in production 2026-08-03: 2 of 5 strategies silently dropped this
+    # way after a restart, needing a manual start). Snapshotting fixes
+    # this by deciding, once, exactly which strategies were running
+    # before this pass started, and honoring that decision regardless of
+    # what cleanup_dead_processes() does to the live dict afterward.
+    strategies_needing_restart = [
+        (strategy_id, config)
+        for strategy_id, config in STRATEGY_CONFIGS.items()
+        if config.get("is_running") and config.get("pid")
+    ]
     restarted_this_pass = 0
-    for strategy_id, config in STRATEGY_CONFIGS.items():
-        if config.get("is_running") and config.get("pid"):
-            strategy_restored = strategy_id in RUNNING_STRATEGIES
+    for strategy_id, config in strategies_needing_restart:
+        strategy_restored = strategy_id in RUNNING_STRATEGIES
 
-            # If strategy wasn't restored, try to restart it automatically
-            if not strategy_restored:
-                if restarted_this_pass > 0:
-                    sleep(5)
-                restarted_this_pass += 1
-                logger.info(f"Attempting to restart strategy {strategy_id}...")
-                try:
-                    success, message = start_strategy_process(strategy_id)
-                    if success:
-                        logger.info(f"Successfully restarted strategy {strategy_id}")
-                        restored_count += 1
-                    else:
-                        # Mark as error state
-                        config["is_running"] = False
-                        config["is_error"] = True
-                        config["error_message"] = f"Failed to restart: {message}"
-                        config["error_time"] = get_ist_time().isoformat()
-                        config["pid"] = None
-                        logger.error(f"Failed to restart strategy {strategy_id}: {message}")
-                        error_count += 1
-                except Exception as e:
+        # If strategy wasn't restored, try to restart it automatically
+        if not strategy_restored:
+            if restarted_this_pass > 0:
+                sleep(5)
+            restarted_this_pass += 1
+            logger.info(f"Attempting to restart strategy {strategy_id}...")
+            try:
+                success, message = start_strategy_process(strategy_id)
+                if success:
+                    logger.info(f"Successfully restarted strategy {strategy_id}")
+                    restored_count += 1
+                else:
                     # Mark as error state
                     config["is_running"] = False
                     config["is_error"] = True
-                    config["error_message"] = f"Restart exception: {str(e)}"
+                    config["error_message"] = f"Failed to restart: {message}"
                     config["error_time"] = get_ist_time().isoformat()
                     config["pid"] = None
-                    logger.exception(f"Exception restarting strategy {strategy_id}: {e}")
+                    logger.error(f"Failed to restart strategy {strategy_id}: {message}")
                     error_count += 1
-
-        # Clear error state for strategies that are not marked as running
-        elif config.get("is_error") and not config.get("is_running"):
-            # Keep error state until user manually clears it
-            pass
+            except Exception as e:
+                # Mark as error state
+                config["is_running"] = False
+                config["is_error"] = True
+                config["error_message"] = f"Restart exception: {str(e)}"
+                config["error_time"] = get_ist_time().isoformat()
+                config["pid"] = None
+                logger.exception(f"Exception restarting strategy {strategy_id}: {e}")
+                error_count += 1
 
     if restored_count > 0 or error_count > 0:
         save_configs()

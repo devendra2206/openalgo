@@ -904,6 +904,69 @@ def test_restore_strategy_states_sleeps_between_restarts_not_before_first(
     assert sleep_calls == [5, 5]
 
 
+def test_restore_strategy_states_survives_concurrent_cleanup_during_stagger(
+    ps_module, monkeypatch, tmp_path
+):
+    """Regression for a production incident (2026-08-03): the sleep(5)
+    stagger above creates a multi-second window, per restart pass, where
+    this loop used to re-read config.get("is_running")/("pid") live on
+    each iteration. cleanup_dead_processes() -- triggered by ANY
+    concurrent request (e.g. the dashboard polling status right after a
+    restart) -- holds PROCESS_LOCK, sees the same pre-restart (now dead)
+    PID, and correctly concludes it's stale, setting is_running=False.
+    If that lands on a strategy this loop hasn't reached yet, the old
+    code silently skipped restarting it -- no error, no log line. Two of
+    five strategies were dropped this way in production, needing a
+    manual start. Fixed by snapshotting which strategies need restarting
+    ONCE, before the stagger loop, instead of re-reading the live dict.
+    This test simulates the race by having a concurrent "cleanup" run
+    inside the mocked sleep() call itself -- the exact moment the real
+    race window opens -- and asserts the not-yet-processed strategy
+    still gets restarted anyway."""
+    strat = tmp_path / "dead_strategy.py"
+    strat.write_text("pass\n")
+
+    for sid in ("first_strategy", "second_strategy", "third_strategy"):
+        ps_module.STRATEGY_CONFIGS[sid] = {
+            "name": sid,
+            "file_path": str(strat),
+            "exchange": "NSE",
+            "is_running": True,
+            "pid": 999999,
+            "last_started": datetime.now(IST).isoformat(),
+        }
+
+    monkeypatch.setattr(
+        ps_module, "check_master_contract_ready", lambda skip_on_startup=False: (True, "ok")
+    )
+    monkeypatch.setattr(ps_module, "save_configs", lambda: None)
+    monkeypatch.setattr(ps_module.psutil, "pid_exists", lambda pid: False)
+
+    restart_calls = []
+
+    def _fake_start(strategy_id):
+        restart_calls.append(strategy_id)
+        return True, "ok"
+
+    monkeypatch.setattr(ps_module, "start_strategy_process", _fake_start)
+
+    def _sleep_with_concurrent_cleanup(seconds):
+        # Simulates cleanup_dead_processes() racing in during the stagger
+        # gap and clearing a not-yet-processed strategy's flags, exactly
+        # as it would under PROCESS_LOCK in production.
+        ps_module.STRATEGY_CONFIGS["third_strategy"]["is_running"] = False
+        ps_module.STRATEGY_CONFIGS["third_strategy"]["pid"] = None
+
+    monkeypatch.setattr(ps_module, "sleep", _sleep_with_concurrent_cleanup)
+
+    ps_module.restore_strategy_states()
+
+    # All 3 were running before this pass started -- the concurrent
+    # "cleanup" mid-loop must not cause third_strategy to be silently
+    # skipped.
+    assert restart_calls == ["first_strategy", "second_strategy", "third_strategy"]
+
+
 def test_restore_strategy_states_no_sleep_for_single_restart(
     ps_module, monkeypatch, tmp_path
 ):
