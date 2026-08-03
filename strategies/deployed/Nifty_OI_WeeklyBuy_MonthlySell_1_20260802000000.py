@@ -2766,8 +2766,8 @@ class StrategyEngine:
             is_short = leg_key.startswith("MONTHLY_")
             pnl = (ltp - pos.entry_px) * pos.quantity if not is_short else (pos.entry_px - ltp) * pos.quantity
             open_positions.append({
-                "leg": leg_key, "symbol": pos.symbol, "quantity": pos.quantity,
-                "entry_px": pos.entry_px, "ltp": ltp, "pnl": pnl,
+                "leg_key": leg_key, "symbol": pos.symbol, "direction": "SHORT" if is_short else "LONG",
+                "quantity": pos.quantity, "entry_price": pos.entry_px, "current_price": ltp, "pnl": pnl,
             })
         return open_positions
 

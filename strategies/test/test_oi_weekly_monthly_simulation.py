@@ -1242,7 +1242,7 @@ def test_all_four_legs_open_simultaneously(script_module, clock, tmp_path):
 
     open_positions = engine._open_positions_for_pnl()
     assert len(open_positions) == 4
-    by_leg = {p["leg"]: p for p in open_positions}
+    by_leg = {p["leg_key"]: p for p in open_positions}
     # Weekly legs are LONG: pnl = (ltp - entry_px) x qty, positive when price rises.
     # Monthly legs are SHORT: pnl = (entry_px - ltp) x qty, positive when price falls.
     # PriceStream is a stub here (always None -> falls back to entry_px as
@@ -1613,6 +1613,6 @@ def test_pnl_snapshot_excludes_a_leg_still_awaiting_entry_confirmation(script_mo
 
     open_positions = engine._open_positions_for_pnl()
 
-    by_leg = {p["leg"] for p in open_positions}
+    by_leg = {p["leg_key"] for p in open_positions}
     assert "WEEKLY_CE" not in by_leg  # still mid-entry -- excluded
     assert "WEEKLY_PE" in by_leg      # confirmed filled -- included
