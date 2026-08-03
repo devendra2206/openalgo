@@ -700,9 +700,14 @@ def test_restart_resumes_already_open_leg_without_reentering(script_module, cloc
         script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
         WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
     )
-    # WEEKLY_CE enters at 09:35 and is still open at 09:40 (exit doesn't
-    # happen until 09:50 -- see the Day-1 CE walk).
-    _run_day(script_module, engine1, clock, sim.DAY1, "09:15", "09:40")
+    # WEEKLY_CE enters at 09:35 and is still open at 09:35 (exit doesn't
+    # happen until 09:50 -- see the Day-1 CE walk). Stops right at the entry
+    # candle, not 09:40, so the post-restart engine's first (discarded --
+    # see _new_candle_closed()'s "never trust the first read after a
+    # restart" guard) candle is 09:40, which only resets an already-zero
+    # streak either way -- the REAL 2-candle weakening streak at 09:45/09:50
+    # is unaffected.
+    _run_day(script_module, engine1, clock, sim.DAY1, "09:15", "09:35")
     assert engine1.state.legs["WEEKLY_CE"].position.symbol == sim.WEEKLY_CE_SYMBOL
     assert len([o for o in client1.placed_orders if o[0] == sim.WEEKLY_CE_SYMBOL]) == 1
 
@@ -724,14 +729,53 @@ def test_restart_resumes_already_open_leg_without_reentering(script_module, cloc
     engine2.reconcile_pending_orders()  # no-op here -- leg was already fully filled
     assert client2.placed_orders == []  # confirms reconcile itself placed nothing
 
-    # Resume the SAME day's remaining candles (09:45 through the 09:50 exit).
-    _run_day(script_module, engine2, clock, sim.DAY1, "09:45", "09:50")
+    # Resume the SAME day's remaining candles (09:40 through the 09:50 exit)
+    # -- 09:40 is the discarded post-restart candle, see the comment above.
+    _run_day(script_module, engine2, clock, sim.DAY1, "09:40", "09:50")
 
     ce_orders = [o for o in client2.placed_orders if o[0] == sim.WEEKLY_CE_SYMBOL]
     # Exactly ONE order after resuming -- the exit. No second entry.
     assert ce_orders == [(sim.WEEKLY_CE_SYMBOL, "SELL", 65)]
     assert engine2.state.legs["WEEKLY_CE"].position.symbol == ""
     assert engine2.state.legs["WEEKLY_CE"].trade_count == 1  # never incremented again on resume
+
+
+def test_new_candle_closed_never_fires_on_the_first_call_after_a_restart(
+    script_module, clock, tmp_path
+):
+    """A fresh process (re)start can land anywhere inside an already-in-
+    progress 5-min candle -- client.history()'s last row for that still-
+    forming candle is the broker's live/incomplete OHLC+OI, not a
+    genuinely closed reading (confirmed against real production logs: a
+    candle read 98s after its own boundary showed a materially different
+    close/OI than the same candle once it had actually finished forming).
+    _new_candle_closed() must therefore treat the very first call after
+    construction as "just record where we are", never as "a candle just
+    closed" -- only a LATER call, once the wall clock has moved into a
+    genuinely new boundary, may return True."""
+    engine, _client, _store = _build_engine(
+        script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
+        WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
+    )
+    clock._current = script_module.IST.localize(
+        real_datetime.strptime(f"{sim.DAY1} 09:37", "%Y-%m-%d %H:%M")
+    )
+    assert engine._new_candle_closed() is False  # first call ever -- must not fire
+
+    # Same 5-min bucket (09:35-09:40) two minutes later -- still no new
+    # boundary crossed, so still no fire.
+    clock._current = script_module.IST.localize(
+        real_datetime.strptime(f"{sim.DAY1} 09:39", "%Y-%m-%d %H:%M")
+    )
+    assert engine._new_candle_closed() is False
+
+    # Wall clock crosses into the NEXT bucket (09:40-09:45) -- the 09:35
+    # candle active at startup has now genuinely finished. This is the
+    # first legitimate "a candle just closed" signal.
+    clock._current = script_module.IST.localize(
+        real_datetime.strptime(f"{sim.DAY1} 09:41", "%Y-%m-%d %H:%M")
+    )
+    assert engine._new_candle_closed() is True
 
 
 def test_reconcile_pending_orders_recovers_a_crash_mid_fill(script_module, clock, tmp_path):

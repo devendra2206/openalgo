@@ -2567,6 +2567,18 @@ class StrategyEngine:
 
     def _new_candle_closed(self) -> bool:
         boundary = _current_candle_boundary(5)
+        if self._last_candle_boundary is None:
+            # First call after a fresh process start/restart -- the candle
+            # active RIGHT NOW may have started only seconds ago and be
+            # still forming at the broker (client.history()'s last row for
+            # an in-progress candle is live/incomplete OHLC+OI, not a
+            # genuinely closed reading). Treating "no boundary recorded
+            # yet" the same as "boundary changed" made every restart
+            # evaluate (and even enter) on that partial candle immediately.
+            # Just record where we are and wait for the NEXT real crossing,
+            # i.e. once the candle active at startup has actually finished.
+            self._last_candle_boundary = boundary
+            return False
         if self._last_candle_boundary != boundary:
             self._last_candle_boundary = boundary
             return True
