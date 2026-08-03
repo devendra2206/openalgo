@@ -502,7 +502,20 @@ class BrokerData:
 
                     if response.get("s") != "ok":
                         error_msg = response.get("message", "Unknown error")
-                        logger.error(f"Error for chunk {chunk_start} to {chunk_end}: {error_msg}")
+                        # Log the full response, not just `message` -- Fyers
+                        # can return s="no_data"/other non-"ok" statuses with
+                        # an EMPTY message (seen in production, 2026-08-03:
+                        # NIFTY.NSE_INDEX history repeatedly came back with a
+                        # blank message while quotes/LTP for the same symbol
+                        # worked fine), leaving nothing to diagnose from
+                        # after the fact. `code`/`s` are the fields worth
+                        # having when `message` is blank.
+                        logger.error(
+                            f"Error for chunk {chunk_start} to {chunk_end} "
+                            f"({exchange}:{br_symbol}, resolution={resolution}): "
+                            f"s={response.get('s')!r} code={response.get('code')!r} "
+                            f"message={error_msg!r} full_response={response}"
+                        )
 
                         if retry_count < max_retries:
                             retry_count += 1
