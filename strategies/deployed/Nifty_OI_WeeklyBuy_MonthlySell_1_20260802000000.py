@@ -218,10 +218,11 @@ class Config:
 
     market_open: time = time(9, 15)
     market_close: time = time(15, 30)
-    weekly_universal_exit_time: time = time(15, 25)   # spec SS5.B
+    weekly_universal_exit_time: time = time(15, 15)   # spec SS5.B
+    monthly_universal_exit_time: time = time(15, 15)
     # No NEW entries (Weekly or Monthly, either side) from this time onward --
     # existing open legs are still managed/exited normally by their own rules.
-    entry_cutoff_time: time = time(15, 10)
+    entry_cutoff_time: time = time(14, 45)
 
     scheduler_interval: int = 10
     pnl_tick_interval: float = 0.8
@@ -2298,8 +2299,16 @@ class MonthlySideEngine:
     def _manage_open_position(self):
         pos = self.leg.position
         # No profit target, no stop-loss -- exactly as specified (plan doc
-        # SS7#2). The ONLY exit is 2 consecutive opposite-verdict candles on
-        # this leg's own frozen strike.
+        # SS7#2). The two exits are 2 consecutive opposite-verdict candles on
+        # this leg's own frozen strike, OR the universal exit time (MIS
+        # intraday -- must not be left open into broker auto-square-off).
+        if datetime.now(IST).time() >= config.monthly_universal_exit_time:
+            ltp = self.engine.price_stream.get_ltp(pos.symbol, OPTIONS_EXCHANGE, config.ws_stale_seconds)
+            if ltp is None:
+                ltp = fetch_symbol_ltp(self.engine.client, pos.symbol, OPTIONS_EXCHANGE)
+            self._exit(pos, ltp if ltp is not None else pos.entry_px, "universal_exit_time")
+            return
+
         current = fetch_candle_oi_premium(self.engine.client, pos.symbol, OPTIONS_EXCHANGE)
         if current is None:
             return
