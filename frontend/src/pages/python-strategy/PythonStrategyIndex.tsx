@@ -882,6 +882,7 @@ export default function PythonStrategyIndex() {
                             <tr className="text-muted-foreground border-b">
                               <th className="text-left py-1 pr-2 font-medium">Leg</th>
                               <th className="text-left py-1 px-2 font-medium">Symbol</th>
+                              <th className="text-right py-1 px-2 font-medium">Qty</th>
                               <th className="text-right py-1 px-2 font-medium">Entry</th>
                               <th className="text-right py-1 px-2 font-medium">LTP/Exit</th>
                               <th className="text-right py-1 px-2 font-medium">PnL</th>
@@ -902,6 +903,7 @@ export default function PythonStrategyIndex() {
                                     <td className="py-1 px-2 font-mono text-[10px] text-muted-foreground">
                                       {trade.symbol}
                                     </td>
+                                    <td className="text-right py-1 px-2">{trade.quantity}</td>
                                     <td className="text-right py-1 px-2">{trade.entry_px}</td>
                                     <td className="text-right py-1 px-2">
                                       {trade.exit_px}

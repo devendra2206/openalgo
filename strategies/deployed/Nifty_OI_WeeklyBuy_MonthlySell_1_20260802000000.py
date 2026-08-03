@@ -1131,11 +1131,15 @@ def _trade_log_writer_loop():
             # accordingly per leg type.
             pnl_points = (exit_px - entry_px) if not is_short else (entry_px - exit_px)
             pnl_rupees = pnl_points * quantity
+            # Display quantity signed (-ve for a short/Monthly leg) so the
+            # Trades UI reads correctly without a separate direction column --
+            # pnl above already used the unsigned quantity and is unaffected.
+            display_quantity = -quantity if is_short else quantity
             with log_path.open("a", newline="") as fp:
                 writer = csv.writer(fp)
                 if is_new:
                     writer.writerow(_TRADE_LOG_HEADER)
-                writer.writerow([leg_key, symbol, quantity, entry_time, round(entry_px, 2),
+                writer.writerow([leg_key, symbol, display_quantity, entry_time, round(entry_px, 2),
                                   exit_time, round(exit_px, 2), round(pnl_points, 2),
                                   round(pnl_rupees, 2), exit_reason, execution_id])
         except Exception as exc:
@@ -2776,7 +2780,12 @@ class StrategyEngine:
             pnl = (ltp - pos.entry_px) * pos.quantity if not is_short else (pos.entry_px - ltp) * pos.quantity
             open_positions.append({
                 "leg_key": leg_key, "symbol": pos.symbol, "direction": "SHORT" if is_short else "LONG",
-                "quantity": pos.quantity, "entry_price": pos.entry_px, "current_price": ltp, "pnl": pnl,
+                # Display quantity signed (-ve for a short/Monthly leg) so it
+                # reads correctly wherever this feeds a UI table -- the pnl
+                # calc above already uses the unsigned pos.quantity with its
+                # own is_short sign flip and is unaffected by this.
+                "quantity": -pos.quantity if is_short else pos.quantity,
+                "entry_price": pos.entry_px, "current_price": ltp, "pnl": pnl,
             })
         return open_positions
 
