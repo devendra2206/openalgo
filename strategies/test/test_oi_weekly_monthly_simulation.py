@@ -65,6 +65,7 @@ from datetime import datetime as real_datetime
 from datetime import timedelta
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 import oi_simulation_data as sim
@@ -187,6 +188,19 @@ class FakeClient:
         # ordering -- a merged multi-day dataset assembled out of
         # chronological order (an easy authoring mistake) must not silently
         # produce a wrong "latest candle" read.
+        #
+        # Returns a pandas DataFrame (timestamp as a tz-aware DatetimeIndex)
+        # on success and an error dict on failure -- matching the REAL
+        # openalgo SDK's client.history() exactly (see .venv/Lib/site-
+        # packages/openalgo/data.py), not the raw REST JSON shape. An
+        # earlier version of this fake returned the raw {"status":...,
+        # "data":[...]} dict on success, which happened to make the
+        # deployed script's (bugged) `isinstance(resp, dict)`-as-success
+        # check pass -- masking a real production bug (confirmed
+        # 2026-08-03: the strategy's own history() parsing had success/
+        # error backwards, silently discarding every real response) that
+        # this simulation should have caught but didn't, precisely because
+        # this fake didn't match the real SDK's return type.
         rows = sorted(self.candles_by_symbol.get(symbol, []), key=lambda r: _parse_ts(r["timestamp"]))
         now = self.clock.now()
         out = [
@@ -196,7 +210,10 @@ class FakeClient:
         ]
         if not out:
             return {"status": "error", "message": "no data"}
-        return {"status": "success", "data": out}
+        df = pd.DataFrame(out)
+        df["timestamp"] = df["timestamp"].apply(_parse_ts)
+        df = df.set_index("timestamp").sort_index()
+        return df
 
     def _latest_close(self, symbol) -> float:
         rows = sorted(self.candles_by_symbol.get(symbol, []), key=lambda r: _parse_ts(r["timestamp"]))

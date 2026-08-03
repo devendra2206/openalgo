@@ -763,6 +763,13 @@ class StateStore:
 # BROKER DATA HELPERS
 ###############################################################################
 def _is_error_response(obj) -> bool:
+    """quotes() always returns a dict; client.history() returns a pandas
+    DataFrame on SUCCESS and an error dict (`{"status": "error", ...}`) on
+    FAILURE -- the opposite of what this module originally assumed for
+    history() (`isinstance(resp, dict)` as the success check), which
+    silently discarded every real response as "no data" regardless of what
+    the broker actually returned. Matches MCX_CrudeOil_EMA9_RSI_Intraday's
+    proven `_is_error_response`, used for both call sites here."""
     return isinstance(obj, dict)
 
 
@@ -940,33 +947,34 @@ def fetch_candle_oi_premium(client, symbol: str, exchange: str,
     end = datetime.now(IST).date()
     start = end - timedelta(days=config.history_lookback_days)
     try:
-        resp = client.history(
+        bars = client.history(
             symbol=symbol, exchange=exchange, interval=config.intraday_interval,
             start_date=start.isoformat(), end_date=end.isoformat(),
         )
     except Exception as exc:
         Log.warning(f"history() failed for {symbol}.{exchange}: {exc}")
         return None
-    data = resp.get("data") if isinstance(resp, dict) else None
-    if not data:
+    if _is_error_response(bars):
+        Log.warning(f"history() error response for {symbol}.{exchange}: {bars}")
+        return None
+    if bars is None or bars.empty:
         Log.warning(f"history() returned no data for {symbol}.{exchange}")
         return None
 
-    rows = data
     if at_or_before is not None:
-        rows = [r for r in data if datetime.fromisoformat(str(r["timestamp"])) <= at_or_before]
-        if not rows:
+        bars = bars[bars.index <= at_or_before]
+        if bars.empty:
             Log.warning(f"No {symbol}.{exchange} candle at/before {at_or_before}")
             return None
 
-    last = rows[-1]
+    last = bars.iloc[-1]
     return {
         "premium": float(last["close"]),
         "open": float(last.get("open", last["close"])),
         "high": float(last.get("high", last["close"])),
         "low": float(last.get("low", last["close"])),
         "oi": float(last.get("oi", 0)),
-        "timestamp": str(last["timestamp"]),
+        "timestamp": str(bars.index[-1]),
     }
 
 
@@ -1321,25 +1329,27 @@ def fetch_reference_oi_premium(client, symbol: str, exchange: str,
     if reference.mode == "prev_close":
         ref_date = datetime.fromisoformat(reference.reference_time_iso).date()
         try:
-            resp = client.history(
+            bars = client.history(
                 symbol=symbol, exchange=exchange, interval=config.intraday_interval,
                 start_date=ref_date.isoformat(), end_date=ref_date.isoformat(),
             )
         except Exception as exc:
             Log.warning(f"history() (reference/prev_close) failed for {symbol}.{exchange}: {exc}")
             return None
-        data = resp.get("data") if isinstance(resp, dict) else None
-        if not data:
+        if _is_error_response(bars):
+            Log.warning(f"history() (reference/prev_close) error response for {symbol}.{exchange}: {bars}")
+            return None
+        if bars is None or bars.empty:
             Log.warning(f"No {symbol}.{exchange} candle found on reference date {ref_date}")
             return None
-        last = data[-1]
+        last = bars.iloc[-1]
         return {
             "premium": float(last["close"]),
             "open": float(last.get("open", last["close"])),
             "high": float(last.get("high", last["close"])),
             "low": float(last.get("low", last["close"])),
             "oi": float(last.get("oi", 0)),
-            "timestamp": str(last["timestamp"]),
+            "timestamp": str(bars.index[-1]),
         }
 
     if reference.mode == "today_0935":
