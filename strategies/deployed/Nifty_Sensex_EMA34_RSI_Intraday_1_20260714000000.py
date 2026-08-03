@@ -1254,11 +1254,14 @@ def _trade_log_writer_loop():
             is_new = not log_path.exists()
             pnl_points = entry_px - exit_px  # short option: sell high, buy back low = profit
             pnl_rupees = pnl_points * quantity
+            # Display quantity signed negative -- every leg in this strategy
+            # is a short option seller.
+            display_quantity = -quantity
             with log_path.open("a", newline="") as fp:
                 writer = csv.writer(fp)
                 if is_new:
                     writer.writerow(_TRADE_LOG_HEADER)
-                writer.writerow([leg_key, symbol, quantity, entry_time, round(entry_px, 2),
+                writer.writerow([leg_key, symbol, display_quantity, entry_time, round(entry_px, 2),
                                   exit_time, round(exit_px, 2), round(pnl_points, 2),
                                   round(pnl_rupees, 2), exit_reason, execution_id])
         except Exception as exc:
@@ -1677,7 +1680,10 @@ class StrategyEngine:
                 pnl = (pos.entry_px - current_px) * pos.quantity  # short leg
                 open_positions.append({
                     "leg_key": leg_key, "symbol": pos.symbol, "direction": "SHORT",
-                    "quantity": pos.quantity, "entry_price": pos.entry_px,
+                    # Display quantity signed negative -- every leg here is a
+                    # short option seller -- so the Trades/PnL UI reads
+                    # correctly without a separate direction column.
+                    "quantity": -pos.quantity, "entry_price": pos.entry_px,
                     "current_price": current_px, "pnl": pnl,
                     "entry_time": pos.entry_time, "execution_id": pos.execution_id,
                 })

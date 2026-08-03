@@ -1229,11 +1229,15 @@ def _trade_log_writer_loop():
             # LONG: sell high, bought low = profit. SHORT: sell high, buy back low = profit.
             pnl_points = (exit_px - entry_px) if direction == "LONG" else (entry_px - exit_px)
             pnl_rupees = pnl_points * quantity
+            # Display quantity signed negative for a SHORT leg so it reads
+            # correctly in the Trades UI even though direction is also its
+            # own column -- pnl above already used the unsigned quantity.
+            display_quantity = -quantity if direction == "SHORT" else quantity
             with log_path.open("a", newline="") as fp:
                 writer = csv.writer(fp)
                 if is_new:
                     writer.writerow(_TRADE_LOG_HEADER)
-                writer.writerow([leg_key, symbol, quantity, direction, entry_time, round(entry_px, 2),
+                writer.writerow([leg_key, symbol, display_quantity, direction, entry_time, round(entry_px, 2),
                                   exit_time, round(exit_px, 2), round(pnl_points, 2),
                                   round(pnl_rupees, 2), exit_reason, execution_id])
         except Exception as exc:
@@ -2490,7 +2494,12 @@ class StrategyEngine:
                            else (leg.entry_px - ltp) * leg.quantity)
                     open_positions.append({
                         "leg_key": leg_key, "symbol": leg.symbol, "direction": direction,
-                        "quantity": leg.quantity, "entry_price": leg.entry_px, "current_price": ltp, "pnl": pnl,
+                        # Display quantity signed negative for a SHORT leg so
+                        # it reads correctly in the Trades/PnL UI -- the pnl
+                        # calc above already uses the unsigned leg.quantity
+                        # with its own direction-based sign flip.
+                        "quantity": -leg.quantity if direction == "SHORT" else leg.quantity,
+                        "entry_price": leg.entry_px, "current_price": ltp, "pnl": pnl,
                         "entry_time": leg.entry_time, "execution_id": leg.execution_id,
                     })
             try:
