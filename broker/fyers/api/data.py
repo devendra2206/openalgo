@@ -564,7 +564,26 @@ class BrokerData:
                             f"Got {len(candles)} candles for period {chunk_start} to {chunk_end}"
                         )
                     else:
-                        logger.debug(f"No data available for period {chunk_start} to {chunk_end}")
+                        # Was logger.debug (invisible at normal log levels) --
+                        # this is a genuinely successful Fyers response
+                        # (s="ok") with zero candles, a DIFFERENT case from
+                        # the s!="ok" error branch above. Confirmed in
+                        # production 2026-08-03: NIFTY.NSE_INDEX history
+                        # requests came back "ok" with empty candles while a
+                        # manual request for the identical symbol/exchange/
+                        # resolution/date-range, made moments apart,
+                        # returned real data -- with this at debug level,
+                        # that was completely invisible in the logs; only
+                        # the downstream "history() returned no data"
+                        # symptom in the calling strategy/service was ever
+                        # seen. Raised to warning so the next occurrence is
+                        # actually visible without enabling debug logging.
+                        logger.warning(
+                            f"No candles for period {chunk_start} to {chunk_end} "
+                            f"({exchange}:{br_symbol}, resolution={resolution}) -- "
+                            f"Fyers responded s={response.get('s')!r} (a successful "
+                            f"status) but with an empty candles list."
+                        )
 
                     # No inter-chunk sleep here: get_api_response already paces
                     # every Fyers call through the process-wide apply_rate_limit
