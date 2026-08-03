@@ -10,6 +10,7 @@ import type {
   PythonStrategy,
   PythonStrategyContent,
   ScheduleConfig,
+  TradeDatesResponse,
   TradesResponse,
 } from '@/types/python-strategy'
 import type { ApiResponse } from '@/types/trading'
@@ -224,6 +225,16 @@ export const pythonStrategyApi = {
     const response = await webClient.get<TradesResponse>(
       `/python/api/strategy/${strategyId}/trades`,
       { params: Object.keys(params).length ? params : undefined }
+    )
+    return response.data
+  },
+
+  /**
+   * List distinct trade dates for a strategy (for the Trades page's dropdown)
+   */
+  getTradeDates: async (strategyId: string): Promise<TradeDatesResponse> => {
+    const response = await webClient.get<TradeDatesResponse>(
+      `/python/api/strategy/${strategyId}/trade-dates`
     )
     return response.data
   },

@@ -3079,6 +3079,62 @@ def api_get_executions(strategy_id):
     return jsonify({"executions": executions})
 
 
+def _entry_time_ist_date(entry_time: str) -> str | None:
+    """entry_time's IST calendar date as YYYY-MM-DD, or None if missing/
+    unparseable. Shared by api_get_trade_dates' grouping."""
+    if not entry_time:
+        return None
+    try:
+        dt = datetime.fromisoformat(entry_time)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = IST.localize(dt)
+    return dt.astimezone(IST).date().isoformat()
+
+
+@python_strategy_bp.route("/api/strategy/<strategy_id>/trade-dates")
+@check_session_validity
+def api_get_trade_dates(strategy_id):
+    """API: List distinct trade (entry) dates found in this strategy's
+    trade log, for the Trades UI's date-filter dropdown -- lets a user pick
+    "3 Aug 2026" directly instead of typing/picking a date that may have no
+    trades at all. Spans every execution_id, same grouping key
+    /api/strategy/<id>/trades' own `?date=` filter uses
+    (_entry_time_matches_date), just grouped by date here instead of
+    filtered by one. Returns dates sorted newest-first, each with its trade
+    count (closed rows plus any still-open legs that opened that day)."""
+    ok, err = verify_strategy_ownership(strategy_id, session.get("user"))
+    if not ok:
+        return err
+
+    try:
+        rows = _read_trade_log_rows(strategy_id)
+    except Exception as e:
+        logger.exception(f"Error reading trade log for {strategy_id}: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+    counts: dict[str, int] = {}
+    for row in rows:
+        d = _entry_time_ist_date(row.get("entry_time", ""))
+        if d:
+            counts[d] = counts.get(d, 0) + 1
+
+    with STRATEGY_PNL_LOCK:
+        snapshot = STRATEGY_PNL.get(strategy_id)
+    for pos in (snapshot or {}).get("open_positions", []):
+        d = _entry_time_ist_date(pos.get("entry_time", ""))
+        if d:
+            counts[d] = counts.get(d, 0) + 1
+
+    dates = sorted(
+        ({"date": d, "trade_count": c} for d, c in counts.items()),
+        key=lambda item: item["date"],
+        reverse=True,
+    )
+    return jsonify({"dates": dates})
+
+
 TODAY_EXECUTION_FILTER = "__today__"
 
 

@@ -102,6 +102,17 @@ export interface ExecutionsResponse {
   executions: Execution[]
 }
 
+// A distinct trade (entry) date found in the strategy's trade log, for the
+// Trades page's date-filter dropdown -- spans every execution_id.
+export interface TradeDate {
+  date: string
+  trade_count: number
+}
+
+export interface TradeDatesResponse {
+  dates: TradeDate[]
+}
+
 // A leg the strategy has pushed into error mode -- poll_fill() exhausted its
 // automatic retries. See docs/prd/python-strategies-order-error-recovery.md.
 export interface LegError {

@@ -1,14 +1,16 @@
-import { ArrowLeft, Receipt, RefreshCw, X } from 'lucide-react'
+import { ArrowLeft, Receipt, RefreshCw } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { pythonStrategyApi } from '@/api/python-strategy'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
-import { Input } from '@/components/ui/input'
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
@@ -21,7 +23,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import type { Execution, PythonStrategy, Trade } from '@/types/python-strategy'
+import type { Execution, PythonStrategy, Trade, TradeDate } from '@/types/python-strategy'
 import { showToast } from '@/utils/toast'
 
 function formatTradeTime(value: string | undefined): string {
@@ -52,6 +54,15 @@ function formatExecutionLabel(execution: Execution): string {
   return `Run #${execution.execution_id} • ${when} • ${execution.trade_count} trade(s)`
 }
 
+function formatTradeDateLabel(tradeDate: TradeDate): string {
+  const when = new Date(`${tradeDate.date}T00:00:00`).toLocaleDateString('en-IN', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+  })
+  return `${when} • ${tradeDate.trade_count} trade(s)`
+}
+
 // Sentinel for "no execution filter" -- Radix Select can't use an empty
 // string as an item value, and this is also the default view: an open
 // position is tagged with whichever run OPENED it, which may not be the
@@ -65,10 +76,16 @@ const ALL_EXECUTIONS = '__all__'
 // restart produced more than one execution_id.
 const TODAY_FILTER = '__today__'
 
+// Trade-date dropdown items share the same Select as execution runs, so
+// each is prefixed to distinguish it from an execution_id (which is either
+// numeric or "legacy"/the two sentinels above -- never this prefix).
+const DATE_VALUE_PREFIX = 'date:'
+
 export default function PythonStrategyTrades() {
   const { strategyId } = useParams<{ strategyId: string }>()
   const [strategy, setStrategy] = useState<PythonStrategy | null>(null)
   const [executions, setExecutions] = useState<Execution[]>([])
+  const [tradeDates, setTradeDates] = useState<TradeDate[]>([])
   const [selectedExecutionId, setSelectedExecutionId] = useState<string>(ALL_EXECUTIONS)
   const [selectedDate, setSelectedDate] = useState<string>('')
   const [trades, setTrades] = useState<Trade[]>([])
@@ -100,12 +117,14 @@ export default function PythonStrategyTrades() {
     if (!strategyId) return
     try {
       setLoading(true)
-      const [strategyData, executionsData] = await Promise.all([
+      const [strategyData, executionsData, tradeDatesData] = await Promise.all([
         pythonStrategyApi.getStrategy(strategyId),
         pythonStrategyApi.getExecutions(strategyId),
+        pythonStrategyApi.getTradeDates(strategyId),
       ])
       setStrategy(strategyData)
       setExecutions(executionsData.executions)
+      setTradeDates(tradeDatesData.dates)
       // Default to the latest run's open + closed trades -- executions are
       // already sorted newest-first, and /executions folds in currently-open
       // legs too (see api_get_executions), so a run with an open position
@@ -169,22 +188,20 @@ export default function PythonStrategyTrades() {
     return () => eventSource.close()
   }, [strategyId])
 
-  const handleExecutionChange = (executionId: string) => {
-    setSelectedExecutionId(executionId)
-    // A date filter takes priority server-side, so picking a run while one
-    // is active would silently do nothing -- clear it for a clear switch.
-    setSelectedDate('')
-    fetchTrades(executionId)
-  }
-
-  const handleDateChange = (date: string) => {
-    setSelectedDate(date)
-    fetchTrades(selectedExecutionId, date)
-  }
-
-  const clearDateFilter = () => {
-    setSelectedDate('')
-    fetchTrades(selectedExecutionId)
+  // Single dropdown covers both filter kinds -- a date-prefixed value
+  // switches to the date filter (execution_id cleared, since the backend
+  // treats date as taking priority anyway); anything else is an
+  // execution_id (date filter cleared).
+  const handleFilterChange = (value: string) => {
+    if (value.startsWith(DATE_VALUE_PREFIX)) {
+      const date = value.slice(DATE_VALUE_PREFIX.length)
+      setSelectedDate(date)
+      fetchTrades(selectedExecutionId, date)
+    } else {
+      setSelectedExecutionId(value)
+      setSelectedDate('')
+      fetchTrades(value)
+    }
   }
 
   if (loading) {
@@ -215,40 +232,46 @@ export default function PythonStrategyTrades() {
           <p className="text-muted-foreground">{strategy.name}</p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          {executions.length > 0 && (
+          {(executions.length > 0 || tradeDates.length > 0) && (
             <Select
-              value={selectedExecutionId}
-              onValueChange={handleExecutionChange}
-              disabled={!!selectedDate}
+              value={selectedDate ? `${DATE_VALUE_PREFIX}${selectedDate}` : selectedExecutionId}
+              onValueChange={handleFilterChange}
             >
               <SelectTrigger className="w-[320px]">
-                <SelectValue placeholder="Select a run" />
+                <SelectValue placeholder="Select a run or trade date" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value={ALL_EXECUTIONS}>All runs (open + closed)</SelectItem>
-                <SelectItem value={TODAY_FILTER}>Today (all runs)</SelectItem>
-                {executions.map((execution) => (
-                  <SelectItem key={execution.execution_id} value={execution.execution_id}>
-                    {formatExecutionLabel(execution)}
-                  </SelectItem>
-                ))}
+                {executions.length > 0 && (
+                  <SelectGroup>
+                    <SelectLabel>Runs</SelectLabel>
+                    <SelectItem value={ALL_EXECUTIONS}>All runs (open + closed)</SelectItem>
+                    <SelectItem value={TODAY_FILTER}>Today (all runs)</SelectItem>
+                    {executions.map((execution) => (
+                      <SelectItem key={execution.execution_id} value={execution.execution_id}>
+                        {formatExecutionLabel(execution)}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                )}
+                {tradeDates.length > 0 && (
+                  <>
+                    {executions.length > 0 && <SelectSeparator />}
+                    <SelectGroup>
+                      <SelectLabel>Trade Dates</SelectLabel>
+                      {tradeDates.map((tradeDate) => (
+                        <SelectItem
+                          key={tradeDate.date}
+                          value={`${DATE_VALUE_PREFIX}${tradeDate.date}`}
+                        >
+                          {formatTradeDateLabel(tradeDate)}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </>
+                )}
               </SelectContent>
             </Select>
           )}
-          <div className="flex items-center gap-1">
-            <Input
-              type="date"
-              value={selectedDate}
-              onChange={(e) => handleDateChange(e.target.value)}
-              className="w-[160px]"
-              aria-label="Filter trades by date"
-            />
-            {selectedDate && (
-              <Button variant="ghost" size="icon" className="h-9 w-9" onClick={clearDateFilter}>
-                <X className="h-4 w-4" />
-              </Button>
-            )}
-          </div>
           <Button
             variant="outline"
             size="sm"
