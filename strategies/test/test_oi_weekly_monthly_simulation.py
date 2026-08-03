@@ -231,6 +231,18 @@ class FakeClient:
         return {"status": "success", "data": [self.weekly_expiry_raw, self.monthly_expiry_raw]}
 
     def optionchain(self, underlying, exchange, expiry_date, strike_count=20):
+        # Enforce the COMPACT expiry format ("13AUG26", no dashes) --
+        # the real optionchain() 404s on the raw dash form ("13-Aug-26"),
+        # confirmed in production 2026-08-03 (select_weekly_otm1_strike was
+        # passing the raw form; the master contract genuinely had the
+        # strike data, another strategy traded the same expiry successfully
+        # the same day, but this call still failed on the format mismatch).
+        # An earlier version of this fake ignored expiry_date entirely,
+        # which is why 92 passing tests never caught it.
+        assert "-" not in expiry_date, (
+            f"optionchain() called with a dash-form expiry ({expiry_date!r}) -- "
+            f"expected the compact form (e.g. '13AUG26'), matching the real API."
+        )
         return {"status": "success", "data": [{"strike": s} for s in self.chain_strikes]}
 
     def optiongreeks(self, symbol, exchange, **kwargs):
@@ -494,7 +506,7 @@ def test_monthly_gate_sees_fresh_weakening_even_on_the_candle_weekly_exits_by_un
         script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
         WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
     )
-    clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY1} 15:15", "%Y-%m-%d %H:%M"))
+    clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY1} 15:25", "%Y-%m-%d %H:%M"))
     engine.state.legs["WEEKLY_CE"].position = script_module.LegPosition(
         symbol=sim.WEEKLY_CE_SYMBOL, quantity=65, entry_px=112.0, entry_filled=True,
         entry_order_id="SIM-entry", reference_oi=50_000.0, reference_premium=100.0,
@@ -502,14 +514,14 @@ def test_monthly_gate_sees_fresh_weakening_even_on_the_candle_weekly_exits_by_un
     # This candle's own OI/premium reading vs. the frozen reference (100/50000)
     # is a clear Weakening quadrant (premium down, OI up).
     client.candles_by_symbol[sim.WEEKLY_CE_SYMBOL] = [
-        {"timestamp": f"{sim.DAY1} 15:15:00+05:30", "open": 100.0, "high": 100.0,
+        {"timestamp": f"{sim.DAY1} 15:25:00+05:30", "open": 100.0, "high": 100.0,
          "low": 85.0, "close": 85.0, "volume": 1000, "oi": 58_000},
     ]
 
     engine.weekly["CE"]._manage_open_position()
     _settle(engine)
 
-    # Universal exit time (15:15) still force-closed the leg as expected --
+    # Universal exit time (15:25) still force-closed the leg as expected --
     # this fix doesn't change WHEN Weekly exits, only whether Monthly's gate
     # got to see the reading first.
     assert engine.state.legs["WEEKLY_CE"].position.symbol == ""
@@ -807,16 +819,16 @@ def test_day4_weekly_pe_force_closed_by_universal_exit_time_only(script_module, 
     """No OI-based exit condition and no profit target ever fires in this
     window (see oi_simulation_data.py's Day 4 PE note -- the reading stays
     perpetually Accumulation vs. its own fixed reference, resetting any
-    weakening streak to 0 every cycle) -- confirms 15:15 alone force-closes
+    weakening streak to 0 every cycle) -- confirms 15:25 alone force-closes
     the leg."""
     engine, client, _store = _build_engine(
         script_module, clock, _CSV_CANDLES, "13-Aug-26", "27-Aug-26",
         WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
     )
-    _run_day(script_module, engine, clock, sim.DAY4, "09:15", "15:10")
-    assert engine.state.legs["WEEKLY_PE"].position.symbol == sim.WEEKLY_PE_SYMBOL_DAY4  # still open right up to 15:10
+    _run_day(script_module, engine, clock, sim.DAY4, "09:15", "15:20")
+    assert engine.state.legs["WEEKLY_PE"].position.symbol == sim.WEEKLY_PE_SYMBOL_DAY4  # still open right up to 15:20
 
-    _run_day(script_module, engine, clock, sim.DAY4, "15:15", "15:15")
+    _run_day(script_module, engine, clock, sim.DAY4, "15:25", "15:25")
     pe_orders = [o for o in client.placed_orders if o[0] == sim.WEEKLY_PE_SYMBOL_DAY4]
     assert pe_orders == [
         (sim.WEEKLY_PE_SYMBOL_DAY4, "BUY", 65),
@@ -1175,16 +1187,18 @@ def test_weekly_otm1_strike_selection_adapts_to_current_spot_while_flat(script_m
     levels against the SAME chain ladder resolve to two different strikes."""
     client = FakeClient(clock, {}, "13-Aug-26", "27-Aug-26", WEEKLY_CHAIN_STRIKES, GREEKS)
     # Ladder: [23100, 23400, 23700, 24300, 24600, 24900]
-    strike_low = script_module.select_weekly_otm1_strike(client, 24072.0, "13-Aug-26", "CE")
-    strike_high = script_module.select_weekly_otm1_strike(client, 24550.0, "13-Aug-26", "CE")
+    # Compact expiry form ("13AUG26") -- what optionchain() actually expects
+    # in production (see FakeClient.optionchain()'s own format assertion).
+    strike_low = script_module.select_weekly_otm1_strike(client, 24072.0, "13AUG26", "CE")
+    strike_high = script_module.select_weekly_otm1_strike(client, 24550.0, "13AUG26", "CE")
     assert strike_low == 24300.0    # nearest listed strike above 24,072
     assert strike_high == 24600.0   # spot has since crossed the 24,300 gap -- OTM1 shifts with it
     assert strike_low != strike_high
 
     # Mirror for PE (OTM = below spot). 23,650 has since crossed BELOW the
     # 23,700 strike, so OTM1 PE shifts down to the next rung, 23,400.
-    pe_high_spot = script_module.select_weekly_otm1_strike(client, 24072.0, "13-Aug-26", "PE")
-    pe_low_spot = script_module.select_weekly_otm1_strike(client, 23650.0, "13-Aug-26", "PE")
+    pe_high_spot = script_module.select_weekly_otm1_strike(client, 24072.0, "13AUG26", "PE")
+    pe_low_spot = script_module.select_weekly_otm1_strike(client, 23650.0, "13AUG26", "PE")
     assert pe_high_spot == 23700.0
     assert pe_low_spot == 23400.0
     assert pe_high_spot != pe_low_spot

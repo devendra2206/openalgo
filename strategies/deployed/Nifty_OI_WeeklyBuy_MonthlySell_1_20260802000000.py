@@ -870,35 +870,45 @@ def resolve_monthly_expiry(client) -> tuple[str, str]:
     return _compact_expiry(raw), raw
 
 
-def fetch_option_chain_strikes(client, expiry_raw: str, strike_count: int = 20) -> list[float]:
+def fetch_option_chain_strikes(client, expiry_compact: str, strike_count: int = 20) -> list[float]:
     """Real listed strikes around current spot, via optionchain() -- used so
     Weekly OTM1 selection picks an actual tradable strike rather than
-    assuming a fixed 50/100-point increment (plan doc SS7 decision 8)."""
+    assuming a fixed 50/100-point increment (plan doc SS7 decision 8).
+
+    optionchain()'s `expiry_date` expects the COMPACT form ("04AUG26", no
+    dashes) -- confirmed against Nifty_Sensex_Expiry_Batman's working
+    `fetch_chain()` call, which passes the same compact string this
+    function's own `resolve_weekly_expiry()` already computes. Passing the
+    raw dash form ("04-Aug-26") here instead was a real production bug
+    (2026-08-03): the master contract genuinely had strike data for that
+    expiry (confirmed -- another strategy traded it successfully the same
+    day), but this call 404'd with "No strikes found" because of the
+    format mismatch, not missing data."""
     resp = client.optionchain(
         underlying=UNDERLYING_SYMBOL, exchange=UNDERLYING_SPOT_EXCHANGE,
-        expiry_date=expiry_raw, strike_count=strike_count,
+        expiry_date=expiry_compact, strike_count=strike_count,
     )
     if resp.get("status") != "success" or not resp.get("data"):
-        raise RuntimeError(f"optionchain() failed for expiry {expiry_raw}: {resp}")
+        raise RuntimeError(f"optionchain() failed for expiry {expiry_compact}: {resp}")
     chain = resp["data"]
     strikes = sorted({float(row["strike"]) for row in chain if "strike" in row})
     if not strikes:
-        raise RuntimeError(f"optionchain() returned no strikes for expiry {expiry_raw}")
+        raise RuntimeError(f"optionchain() returned no strikes for expiry {expiry_compact}")
     return strikes
 
 
-def select_weekly_otm1_strike(client, spot: float, expiry_raw: str, option_type: str) -> float:
+def select_weekly_otm1_strike(client, spot: float, expiry_compact: str, option_type: str) -> float:
     """First REAL listed strike beyond ATM in the OTM direction for
     `option_type` -- CE is OTM above spot, PE is OTM below spot."""
-    strikes = fetch_option_chain_strikes(client, expiry_raw)
+    strikes = fetch_option_chain_strikes(client, expiry_compact)
     if option_type == "CE":
         candidates = [s for s in strikes if s > spot]
         if not candidates:
-            raise RuntimeError(f"No listed CE strike above spot {spot} for expiry {expiry_raw}")
+            raise RuntimeError(f"No listed CE strike above spot {spot} for expiry {expiry_compact}")
         return min(candidates)
     candidates = [s for s in strikes if s < spot]
     if not candidates:
-        raise RuntimeError(f"No listed PE strike below spot {spot} for expiry {expiry_raw}")
+        raise RuntimeError(f"No listed PE strike below spot {spot} for expiry {expiry_compact}")
     return max(candidates)
 
 
@@ -1428,7 +1438,7 @@ class WeeklySideEngine:
             return
         try:
             expiry_compact, expiry_raw = self.engine.get_weekly_expiry()
-            strike = select_weekly_otm1_strike(self.engine.client, spot, expiry_raw, self.option_type)
+            strike = select_weekly_otm1_strike(self.engine.client, spot, expiry_compact, self.option_type)
         except RuntimeError as exc:
             Log.warning(f"[WEEKLY_{self.option_type}] strike selection failed: {exc}")
             return
