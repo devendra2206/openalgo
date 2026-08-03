@@ -517,10 +517,12 @@ def test_monthly_gate_sees_fresh_weakening_even_on_the_candle_weekly_exits_by_un
         symbol=sim.WEEKLY_CE_SYMBOL, quantity=65, entry_px=112.0, entry_filled=True,
         entry_order_id="SIM-entry", reference_oi=50_000.0, reference_premium=100.0,
     )
-    # This candle's own OI/premium reading vs. the frozen reference (100/50000)
-    # is a clear Weakening quadrant (premium down, OI up).
+    # The last CLOSED candle as of 15:15 is the one timestamped 15:10
+    # (fetch_candle_oi_premium() now discards a candle until its own
+    # timestamp + interval <= now). Its OI/premium reading vs. the frozen
+    # reference (100/50000) is a clear Weakening quadrant (premium down, OI up).
     client.candles_by_symbol[sim.WEEKLY_CE_SYMBOL] = [
-        {"timestamp": f"{sim.DAY1} 15:15:00+05:30", "open": 100.0, "high": 100.0,
+        {"timestamp": f"{sim.DAY1} 15:10:00+05:30", "open": 100.0, "high": 100.0,
          "low": 85.0, "close": 85.0, "volume": 1000, "oi": 58_000},
     ]
 
@@ -598,12 +600,15 @@ def test_day1_monthly_ce_exits_on_two_consecutive_opposite_signals_no_target_no_
     opposite-verdict (Accumulation) candles on its own frozen strike -- no
     profit target, no stop-loss. 09:50 and 09:55 both show Long Build-up
     (Accumulation) vs. the entry's own Weakening trigger -> exit at 09:55,
-    buying back to close the short."""
+    buying back to close the short. Runs to 10:00, one candle past 09:55 --
+    fetch_candle_oi_premium() now only trusts a candle once it has actually
+    closed (timestamp + interval <= now), so every reading here lands one
+    tick later than its own label."""
     engine, client, _store = _build_engine(
         script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
         WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
     )
-    _run_day(script_module, engine, clock, sim.DAY1, "09:15", "09:55")
+    _run_day(script_module, engine, clock, sim.DAY1, "09:15", "10:00")
 
     ce_orders = [o for o in client.placed_orders if o[0] == sim.MONTHLY_CE_SYMBOL]
     assert ce_orders == [
@@ -648,11 +653,17 @@ def test_day2_reference_mode_is_today_0935_for_large_gap_and_day1_state_does_not
         WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
     )
     # Day 1 first, so there's real prior-day state to prove doesn't leak.
-    _run_day(script_module, engine, clock, sim.DAY1, "09:15", "09:50")
+    # Runs to 09:55, not 09:50 -- fetch_candle_oi_premium() now only trusts
+    # a candle once it's actually closed, so the exit lands one tick later
+    # than its own label (see test_day1_weekly_ce_entry_then_exit_on_two_
+    # opposite_signals's identical 09:55 window).
+    _run_day(script_module, engine, clock, sim.DAY1, "09:15", "09:55")
     day1_ce_orders = len([o for o in client.placed_orders if o[0] == sim.WEEKLY_CE_SYMBOL])
     assert day1_ce_orders == 2  # entry + exit, confirmed already above
 
-    _run_day(script_module, engine, clock, sim.DAY2, "09:15", "09:40")
+    # 09:45, not 09:40 -- same one-candle-closed-late reasoning; Day 2's
+    # entry candle is labeled 09:40, only trusted once clock reaches 09:45.
+    _run_day(script_module, engine, clock, sim.DAY2, "09:15", "09:45")
 
     assert engine.state.reference.mode == "today_0935"
     assert engine.state.reference.reference_date == sim.DAY2
@@ -677,7 +688,10 @@ def test_day3_reference_mode_is_today_0935_for_a_gap_DOWN(script_module, clock, 
         script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
         WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
     )
-    _run_day(script_module, engine, clock, sim.DAY3, "09:15", "09:40")
+    # 09:45, not 09:40 -- fetch_candle_oi_premium() now only trusts a candle
+    # once it's actually closed; Day 3's PE entry candle is labeled 09:40,
+    # only trusted once clock reaches 09:45.
+    _run_day(script_module, engine, clock, sim.DAY3, "09:15", "09:45")
 
     assert engine.state.reference.mode == "today_0935"
     assert engine.state.reference.reference_date == sim.DAY3
@@ -700,14 +714,15 @@ def test_restart_resumes_already_open_leg_without_reentering(script_module, cloc
         script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
         WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
     )
-    # WEEKLY_CE enters at 09:35 and is still open at 09:35 (exit doesn't
-    # happen until 09:50 -- see the Day-1 CE walk). Stops right at the entry
-    # candle, not 09:40, so the post-restart engine's first (discarded --
-    # see _new_candle_closed()'s "never trust the first read after a
-    # restart" guard) candle is 09:40, which only resets an already-zero
-    # streak either way -- the REAL 2-candle weakening streak at 09:45/09:50
-    # is unaffected.
-    _run_day(script_module, engine1, clock, sim.DAY1, "09:15", "09:35")
+    # WEEKLY_CE's entry candle is labeled 09:35, but fetch_candle_oi_premium()
+    # now only trusts a candle once it's actually closed, so the entry
+    # itself doesn't fire until clock reaches 09:40 (reading the by-then-
+    # closed 09:35 candle). Stops right there, so the post-restart engine's
+    # first (discarded -- see _new_candle_closed()'s "never trust the first
+    # read after a restart" guard) candle is 09:40's own row (labeled 09:40,
+    # premium/OI unchanged from entry -- a no-op reset either way), and the
+    # REAL 2-candle weakening streak (09:45/09:50 rows) is unaffected.
+    _run_day(script_module, engine1, clock, sim.DAY1, "09:15", "09:40")
     assert engine1.state.legs["WEEKLY_CE"].position.symbol == sim.WEEKLY_CE_SYMBOL
     assert len([o for o in client1.placed_orders if o[0] == sim.WEEKLY_CE_SYMBOL]) == 1
 
@@ -729,9 +744,12 @@ def test_restart_resumes_already_open_leg_without_reentering(script_module, cloc
     engine2.reconcile_pending_orders()  # no-op here -- leg was already fully filled
     assert client2.placed_orders == []  # confirms reconcile itself placed nothing
 
-    # Resume the SAME day's remaining candles (09:40 through the 09:50 exit)
-    # -- 09:40 is the discarded post-restart candle, see the comment above.
-    _run_day(script_module, engine2, clock, sim.DAY1, "09:40", "09:50")
+    # Resume the SAME day's remaining candles (09:45 through the 09:55 exit)
+    # -- 09:45 is the discarded post-restart candle (reads the harmless
+    # 09:40 row, see the comment above); the exit itself, like every other
+    # candle read, doesn't fire until one tick after its own candle's label
+    # (09:50's row -> exit confirmed at clock 09:55).
+    _run_day(script_module, engine2, clock, sim.DAY1, "09:45", "09:55")
 
     ce_orders = [o for o in client2.placed_orders if o[0] == sim.WEEKLY_CE_SYMBOL]
     # Exactly ONE order after resuming -- the exit. No second entry.
@@ -776,6 +794,68 @@ def test_new_candle_closed_never_fires_on_the_first_call_after_a_restart(
         real_datetime.strptime(f"{sim.DAY1} 09:41", "%Y-%m-%d %H:%M")
     )
     assert engine._new_candle_closed() is True
+
+
+def test_fetch_candle_oi_premium_discards_a_still_forming_candle(script_module, clock, tmp_path):
+    """Confirmed against real production data: client.history()'s last row
+    can be the broker's LIVE, still-forming current candle -- a candle read
+    <2min after its own start showed premium/OI materially different from
+    its own final values 5min later, once it had actually closed.
+    fetch_candle_oi_premium() must drop a last row whose own implied
+    end-time (timestamp + 5min) hasn't passed yet, and fall back to the
+    previous (guaranteed-closed) row instead -- independent of
+    _new_candle_closed()'s own boundary tracking, so this protects every
+    caller (restart, steady-state, reference reads) uniformly."""
+    _engine, client, _store = _build_engine(
+        script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
+        WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
+    )
+    client.candles_by_symbol[sim.WEEKLY_CE_SYMBOL] = [
+        {"timestamp": f"{sim.DAY1} 09:30:00+05:30", "open": 100.0, "high": 102.0,
+         "low": 99.0, "close": 101.0, "volume": 500, "oi": 50_000},
+        {"timestamp": f"{sim.DAY1} 09:35:00+05:30", "open": 101.0, "high": 108.0,
+         "low": 101.0, "close": 105.0, "volume": 900, "oi": 52_000},
+    ]
+
+    # 98 seconds into the 09:35-09:40 candle -- still forming. Must fall
+    # back to the 09:30 row (fully closed), NOT the live 09:35 one.
+    clock._current = script_module.IST.localize(
+        real_datetime.strptime(f"{sim.DAY1} 09:36:38", "%Y-%m-%d %H:%M:%S")
+    )
+    result = script_module.fetch_candle_oi_premium(client, sim.WEEKLY_CE_SYMBOL, script_module.OPTIONS_EXCHANGE)
+    assert result["premium"] == pytest.approx(101.0)
+    assert result["oi"] == pytest.approx(50_000.0)
+
+    # Wall clock reaches the 09:35 candle's own close (09:40) -- now
+    # genuinely closed, so it's trusted as the last row.
+    clock._current = script_module.IST.localize(
+        real_datetime.strptime(f"{sim.DAY1} 09:40:00", "%Y-%m-%d %H:%M:%S")
+    )
+    result = script_module.fetch_candle_oi_premium(client, sim.WEEKLY_CE_SYMBOL, script_module.OPTIONS_EXCHANGE)
+    assert result["premium"] == pytest.approx(105.0)
+    assert result["oi"] == pytest.approx(52_000.0)
+
+
+def test_fetch_candle_oi_premium_returns_none_when_only_a_forming_candle_exists(
+    script_module, clock, tmp_path
+):
+    """If the ONLY candle available is still forming (e.g. the very first
+    candle of the day, read seconds after it started), there is no prior
+    closed candle to fall back to -- must return None, never fabricate a
+    reading from live/incomplete data."""
+    _engine, client, _store = _build_engine(
+        script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
+        WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
+    )
+    client.candles_by_symbol[sim.WEEKLY_CE_SYMBOL] = [
+        {"timestamp": f"{sim.DAY1} 09:30:00+05:30", "open": 100.0, "high": 101.0,
+         "low": 99.0, "close": 100.5, "volume": 200, "oi": 50_000},
+    ]
+    clock._current = script_module.IST.localize(
+        real_datetime.strptime(f"{sim.DAY1} 09:31:15", "%Y-%m-%d %H:%M:%S")
+    )
+    result = script_module.fetch_candle_oi_premium(client, sim.WEEKLY_CE_SYMBOL, script_module.OPTIONS_EXCHANGE)
+    assert result is None
 
 
 def test_reconcile_pending_orders_recovers_a_crash_mid_fill(script_module, clock, tmp_path):
@@ -849,14 +929,18 @@ def test_day4_weekly_ce_streak_interruption_requires_two_TRUE_consecutive_candle
         script_module, clock, _CSV_CANDLES, "13-Aug-26", "27-Aug-26",
         WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
     )
-    _run_day(script_module, engine, clock, sim.DAY4, "09:15", "09:50")
-    # Not yet exited after only 09:50 -- the reset at 09:45 means this is
-    # only the 1st weakening candle since the reset, not the 2nd overall.
+    # Runs to 09:55, not 09:50 -- fetch_candle_oi_premium() now only trusts
+    # a candle once it's actually closed, so every reading here (entry,
+    # streak, reset) lands one tick later than its own label.
+    _run_day(script_module, engine, clock, sim.DAY4, "09:15", "09:55")
+    # Not yet exited after only 09:55 -- the reset (09:45's row, read at
+    # 09:50) means this is only the 1st weakening candle since the reset
+    # (09:50's row, read at 09:55), not the 2nd overall.
     ce_orders_so_far = [o for o in client.placed_orders if o[0] == sim.WEEKLY_CE_SYMBOL_DAY4]
     assert ce_orders_so_far == [(sim.WEEKLY_CE_SYMBOL_DAY4, "BUY", 65)]  # still just the entry
     assert engine.state.legs["WEEKLY_CE"].position.symbol == sim.WEEKLY_CE_SYMBOL_DAY4  # still open
 
-    _run_day(script_module, engine, clock, sim.DAY4, "09:55", "09:55")
+    _run_day(script_module, engine, clock, sim.DAY4, "10:00", "10:00")
     ce_orders = [o for o in client.placed_orders if o[0] == sim.WEEKLY_CE_SYMBOL_DAY4]
     assert ce_orders == [
         (sim.WEEKLY_CE_SYMBOL_DAY4, "BUY", 65),
@@ -933,12 +1017,16 @@ def test_day1_sequential_pe_then_ce_both_weekly_and_monthly(script_module, clock
     Confirms via exact order sequencing that WEEKLY_CE's 2nd-cycle entry
     (10:10) genuinely comes after WEEKLY_PE's 2nd-cycle exit (10:05), and
     the same hand-off shape holds for MONTHLY_CE/MONTHLY_PE on the sell
-    side."""
+    side. (fetch_candle_oi_premium() now only trusts a candle once it's
+    actually closed, so every event above actually resolves one tick after
+    its own label -- the window below runs 5 minutes past the nominal last
+    event, 10:30, to give it room; the relative ordering between legs is
+    unaffected since every leg is delayed by the exact same one tick.)"""
     engine, client, _store = _build_engine(
         script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
         WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
     )
-    _run_day(script_module, engine, clock, sim.DAY1, "09:15", "10:30")
+    _run_day(script_module, engine, clock, sim.DAY1, "09:15", "10:35")
 
     ce_orders = [o for o in client.placed_orders if o[0] == sim.WEEKLY_CE_SYMBOL]
     assert ce_orders == [

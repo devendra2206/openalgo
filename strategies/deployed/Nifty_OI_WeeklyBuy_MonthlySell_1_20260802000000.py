@@ -985,6 +985,24 @@ def fetch_candle_oi_premium(client, symbol: str, exchange: str,
             Log.warning(f"No {symbol}.{exchange} candle at/before {at_or_before}")
             return None
 
+    # Drop the last row if it hasn't actually closed yet -- confirmed
+    # against real production data that client.history()'s last row can be
+    # the broker's LIVE, still-forming current candle (a candle read <2min
+    # after its own start showed premium/OI materially different from its
+    # own final values 5min later, once it had actually closed). This is
+    # independent of at_or_before/_new_candle_closed()'s own boundary
+    # tracking -- it protects against reading a forming candle no matter
+    # *why* the read happened to land mid-candle (restart, a steady-state
+    # boundary crossing, scheduler jitter, anything), by checking the
+    # candle's own implied end-time against wall-clock now directly.
+    candle_interval = timedelta(minutes=5)  # spec: 5-minute candles throughout (config.intraday_interval)
+    if bars.index[-1] + candle_interval > datetime.now(IST):
+        bars = bars.iloc[:-1]
+        if bars.empty:
+            Log.warning(f"Only a still-forming candle available for {symbol}.{exchange} -- "
+                        f"no closed candle yet.")
+            return None
+
     last = bars.iloc[-1]
     return {
         "premium": float(last["close"]),
