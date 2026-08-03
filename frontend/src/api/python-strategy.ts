@@ -209,12 +209,21 @@ export const pythonStrategyApi = {
   },
 
   /**
-   * Get today's closed trades for a strategy
+   * Get today's closed trades for a strategy. Pass `date` (YYYY-MM-DD) to
+   * filter by trade date instead -- takes priority over `executionId` on
+   * the backend when both are passed.
    */
-  getTrades: async (strategyId: string, executionId?: string): Promise<TradesResponse> => {
+  getTrades: async (
+    strategyId: string,
+    executionId?: string,
+    date?: string
+  ): Promise<TradesResponse> => {
+    const params: Record<string, string> = {}
+    if (date) params.date = date
+    else if (executionId) params.execution_id = executionId
     const response = await webClient.get<TradesResponse>(
       `/python/api/strategy/${strategyId}/trades`,
-      { params: executionId ? { execution_id: executionId } : undefined }
+      { params: Object.keys(params).length ? params : undefined }
     )
     return response.data
   },

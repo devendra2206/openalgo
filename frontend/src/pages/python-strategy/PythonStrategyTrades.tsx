@@ -1,9 +1,10 @@
-import { ArrowLeft, Receipt, RefreshCw } from 'lucide-react'
+import { ArrowLeft, Receipt, RefreshCw, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { pythonStrategyApi } from '@/api/python-strategy'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
 import {
   Select,
   SelectContent,
@@ -69,18 +70,22 @@ export default function PythonStrategyTrades() {
   const [strategy, setStrategy] = useState<PythonStrategy | null>(null)
   const [executions, setExecutions] = useState<Execution[]>([])
   const [selectedExecutionId, setSelectedExecutionId] = useState<string>(ALL_EXECUTIONS)
+  const [selectedDate, setSelectedDate] = useState<string>('')
   const [trades, setTrades] = useState<Trade[]>([])
   const [totalPnl, setTotalPnl] = useState(0)
   const [loading, setLoading] = useState(true)
   const [loadingTrades, setLoadingTrades] = useState(false)
 
-  const fetchTrades = async (executionId: string) => {
+  // date takes priority over executionId on the backend when both are
+  // passed -- pass whichever filter is currently active.
+  const fetchTrades = async (executionId: string, date?: string) => {
     if (!strategyId) return
     try {
       setLoadingTrades(true)
       const tradesData = await pythonStrategyApi.getTrades(
         strategyId,
-        executionId === ALL_EXECUTIONS ? undefined : executionId
+        executionId === ALL_EXECUTIONS ? undefined : executionId,
+        date || undefined
       )
       setTrades(tradesData.trades)
       setTotalPnl(tradesData.total_pnl)
@@ -128,7 +133,7 @@ export default function PythonStrategyTrades() {
   // Exit/LTP column would only refresh when SOME trade closes (trade_update),
   // which could be minutes away, rather than ticking live like the PnL tile
   // on the dashboard already does from the same push.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: fetchTrades/selectedExecutionId change every render; re-subscribing on every change would drop/reopen the connection needlessly
+  // biome-ignore lint/correctness/useExhaustiveDependencies: fetchTrades/selectedExecutionId/selectedDate change every render; re-subscribing on every change would drop/reopen the connection needlessly
   useEffect(() => {
     if (!strategyId) return
     const eventSource = new EventSource('/python/api/events')
@@ -136,7 +141,7 @@ export default function PythonStrategyTrades() {
       try {
         const data = JSON.parse(event.data)
         if (data.type === 'trade_update' && data.strategy_id === strategyId) {
-          fetchTrades(selectedExecutionId)
+          fetchTrades(selectedExecutionId, selectedDate)
           return
         }
         if (data.type === 'pnl_update' && data.strategy_id === strategyId) {
@@ -166,7 +171,20 @@ export default function PythonStrategyTrades() {
 
   const handleExecutionChange = (executionId: string) => {
     setSelectedExecutionId(executionId)
+    // A date filter takes priority server-side, so picking a run while one
+    // is active would silently do nothing -- clear it for a clear switch.
+    setSelectedDate('')
     fetchTrades(executionId)
+  }
+
+  const handleDateChange = (date: string) => {
+    setSelectedDate(date)
+    fetchTrades(selectedExecutionId, date)
+  }
+
+  const clearDateFilter = () => {
+    setSelectedDate('')
+    fetchTrades(selectedExecutionId)
   }
 
   if (loading) {
@@ -196,9 +214,13 @@ export default function PythonStrategyTrades() {
           <h1 className="text-2xl font-bold tracking-tight">Trades</h1>
           <p className="text-muted-foreground">{strategy.name}</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {executions.length > 0 && (
-            <Select value={selectedExecutionId} onValueChange={handleExecutionChange}>
+            <Select
+              value={selectedExecutionId}
+              onValueChange={handleExecutionChange}
+              disabled={!!selectedDate}
+            >
               <SelectTrigger className="w-[320px]">
                 <SelectValue placeholder="Select a run" />
               </SelectTrigger>
@@ -213,10 +235,24 @@ export default function PythonStrategyTrades() {
               </SelectContent>
             </Select>
           )}
+          <div className="flex items-center gap-1">
+            <Input
+              type="date"
+              value={selectedDate}
+              onChange={(e) => handleDateChange(e.target.value)}
+              className="w-[160px]"
+              aria-label="Filter trades by date"
+            />
+            {selectedDate && (
+              <Button variant="ghost" size="icon" className="h-9 w-9" onClick={clearDateFilter}>
+                <X className="h-4 w-4" />
+              </Button>
+            )}
+          </div>
           <Button
             variant="outline"
             size="sm"
-            onClick={() => fetchTrades(selectedExecutionId)}
+            onClick={() => fetchTrades(selectedExecutionId, selectedDate)}
           >
             <RefreshCw className="h-4 w-4 mr-2" />
             Refresh
@@ -238,13 +274,15 @@ export default function PythonStrategyTrades() {
             </span>
           </CardTitle>
           <CardDescription>
-            {executions.length === 0
-              ? 'No trades yet'
-              : selectedExecutionId === ALL_EXECUTIONS
-                ? `${trades.length} trade(s) across all runs`
-                : selectedExecutionId === TODAY_FILTER
-                  ? `${trades.length} trade(s) today (all runs)`
-                  : `${trades.length} trade(s) in this run`}
+            {selectedDate
+              ? `${trades.length} trade(s) on ${selectedDate}`
+              : executions.length === 0
+                ? 'No trades yet'
+                : selectedExecutionId === ALL_EXECUTIONS
+                  ? `${trades.length} trade(s) across all runs`
+                  : selectedExecutionId === TODAY_FILTER
+                    ? `${trades.length} trade(s) today (all runs)`
+                    : `${trades.length} trade(s) in this run`}
           </CardDescription>
         </CardHeader>
         <CardContent>

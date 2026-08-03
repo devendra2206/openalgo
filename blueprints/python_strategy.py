@@ -3082,13 +3082,14 @@ def api_get_executions(strategy_id):
 TODAY_EXECUTION_FILTER = "__today__"
 
 
-def _entry_time_is_today_ist(entry_time: str) -> bool:
+def _entry_time_matches_date(entry_time: str, target_date) -> bool:
     """True if `entry_time` (an IST ISO timestamp string, as every strategy
-    script writes via datetime.now(IST).isoformat()) falls on today's IST
-    date. Used by the `__today__` execution_id filter -- spans EVERY run
-    from today, not just the latest one, so a strategy that restarted a few
-    times during the same trading day still shows everything from today in
-    one view."""
+    script writes via datetime.now(IST).isoformat()) falls on `target_date`
+    (an IST date). Used by the `__today__` execution_id filter and the
+    `?date=` trade-date filter -- both span EVERY run whose entry_time
+    falls on that date, not just one execution_id, so a strategy that
+    restarted a few times during the same trading day still shows
+    everything from that date in one view."""
     if not entry_time:
         return False
     try:
@@ -3097,7 +3098,11 @@ def _entry_time_is_today_ist(entry_time: str) -> bool:
         return False
     if dt.tzinfo is None:
         dt = IST.localize(dt)
-    return dt.astimezone(IST).date() == datetime.now(IST).date()
+    return dt.astimezone(IST).date() == target_date
+
+
+def _entry_time_is_today_ist(entry_time: str) -> bool:
+    return _entry_time_matches_date(entry_time, datetime.now(IST).date())
 
 
 @python_strategy_bp.route("/api/strategy/<strategy_id>/trades")
@@ -3119,6 +3124,11 @@ def api_get_trades(strategy_id):
     produced more than one execution_id. Omitting the param returns every
     trade ever logged for this strategy.
 
+    Optional `?date=YYYY-MM-DD` filters by trade (entry) date instead --
+    spans every execution_id whose entry_time falls on that IST date, same
+    "today" behavior as `__today__` but for an arbitrary caller-chosen date.
+    Takes priority over `execution_id` when both are passed.
+
     Also folds in currently OPEN legs (from the same in-memory PnL snapshot
     /pnl reads) as status="OPEN" rows with no exit_time/exit_px/exit_reason
     yet -- otherwise a strategy that has entered a position but not yet
@@ -3130,6 +3140,14 @@ def api_get_trades(strategy_id):
     execution_id = request.args.get("execution_id")
     today_only = execution_id == TODAY_EXECUTION_FILTER
 
+    trade_date = None
+    date_param = request.args.get("date")
+    if date_param:
+        try:
+            trade_date = datetime.strptime(date_param, "%Y-%m-%d").date()
+        except ValueError:
+            return jsonify({"status": "error", "message": f"Invalid date {date_param!r}, expected YYYY-MM-DD"}), 400
+
     try:
         rows = _read_trade_log_rows(strategy_id)
     except Exception as e:
@@ -3139,7 +3157,10 @@ def api_get_trades(strategy_id):
     trades = []
     total_pnl = 0.0
     for row in rows:
-        if today_only:
+        if trade_date is not None:
+            if not _entry_time_matches_date(row.get("entry_time", ""), trade_date):
+                continue
+        elif today_only:
             if not _entry_time_is_today_ist(row.get("entry_time", "")):
                 continue
         elif execution_id is not None and (row.get("execution_id") or "legacy") != execution_id:
@@ -3155,7 +3176,10 @@ def api_get_trades(strategy_id):
         snapshot = STRATEGY_PNL.get(strategy_id)
     for pos in (snapshot or {}).get("open_positions", []):
         pos_exec_id = str(pos.get("execution_id")) if pos.get("execution_id") else "legacy"
-        if today_only:
+        if trade_date is not None:
+            if not _entry_time_matches_date(pos.get("entry_time", ""), trade_date):
+                continue
+        elif today_only:
             if not _entry_time_is_today_ist(pos.get("entry_time", "")):
                 continue
         elif execution_id is not None and pos_exec_id != execution_id:

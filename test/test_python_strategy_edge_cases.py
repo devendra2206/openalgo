@@ -997,5 +997,44 @@ def test_restore_strategy_states_no_sleep_for_single_restart(
     assert sleep_calls == []
 
 
+# ---------------------------------------------------------------------------
+# /api/strategy/<id>/trades: ?date= filter (_entry_time_matches_date)
+# ---------------------------------------------------------------------------
+
+
+def test_entry_time_matches_date_true_for_same_ist_date(ps_module):
+    entry_time = IST.localize(datetime(2026, 8, 3, 9, 35, 0)).isoformat()
+    assert ps_module._entry_time_matches_date(entry_time, date(2026, 8, 3)) is True
+
+
+def test_entry_time_matches_date_false_for_a_different_date(ps_module):
+    entry_time = IST.localize(datetime(2026, 8, 3, 9, 35, 0)).isoformat()
+    assert ps_module._entry_time_matches_date(entry_time, date(2026, 8, 4)) is False
+
+
+def test_entry_time_matches_date_handles_naive_timestamp_as_ist(ps_module):
+    # Some rows may lack tzinfo (defensive -- every strategy script writes
+    # via datetime.now(IST).isoformat(), which is always tz-aware, but the
+    # CSV is hand-editable/legacy data isn't guaranteed to be).
+    entry_time = datetime(2026, 8, 3, 23, 55, 0).isoformat()
+    assert ps_module._entry_time_matches_date(entry_time, date(2026, 8, 3)) is True
+
+
+def test_entry_time_matches_date_false_on_empty_or_garbage(ps_module):
+    assert ps_module._entry_time_matches_date("", date(2026, 8, 3)) is False
+    assert ps_module._entry_time_matches_date("not-a-timestamp", date(2026, 8, 3)) is False
+
+
+def test_entry_time_is_today_ist_delegates_to_matches_date(ps_module):
+    p = _patch_now(date(2026, 8, 3), 12, 0)
+    try:
+        entry_time = IST.localize(datetime(2026, 8, 3, 9, 35, 0)).isoformat()
+        assert ps_module._entry_time_is_today_ist(entry_time) is True
+        entry_time_yesterday = IST.localize(datetime(2026, 8, 2, 9, 35, 0)).isoformat()
+        assert ps_module._entry_time_is_today_ist(entry_time_yesterday) is False
+    finally:
+        p.stop()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
