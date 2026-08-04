@@ -1,6 +1,6 @@
 import { AlertTriangle, ArrowLeft, RefreshCw } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router'
 import { pythonStrategyApi } from '@/api/python-strategy'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'

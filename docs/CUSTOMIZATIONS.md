@@ -74,6 +74,22 @@ git diff <pre-merge-commit> HEAD -- app.py blueprints/python_strategy.py service
 # see the per-file sections above for what to expect if it did
 ```
 
+**If the merge touched `frontend/` at all, also actually build it — don't
+rely on the merge being conflict-free as proof it's fine:**
+
+```bash
+cd frontend && npm run build
+```
+
+`py_compile` only proves the *Python* customizations still parse; nothing
+above verifies the frontend customizations still typecheck against whatever
+upstream's dependencies moved to. A fork-only frontend file (git conflicts
+with nothing, since upstream has never touched it) can still silently break
+because upstream renamed a shared dependency somewhere else entirely — see
+the `react-router-dom` incident in the Frontend section below. `git diff
+--stat` showing frontend/dist as the only frontend change is NOT the same
+thing as the frontend actually building.
+
 A file showing 0 lines of diff between `custom-strategies` and the
 merge-base is **not actually customized** here (even if it looks
 project-specific) — it was simply inherited from an earlier point in
@@ -95,6 +111,20 @@ git push origin custom-strategies
 ```
 
 **Sync log:**
+- **2026-08-04**: upstream/main fast-forwarded and merged into
+  `custom-strategies`, zero conflicts including `frontend/dist/`. Merge
+  itself was clean and fully verified against every customized *Python*
+  file (0-line diff or reviewed-benign additive change on all of them, full
+  test suite passing) — but the frontend was never actually built as part
+  of that verification, only diffed. Days later, `npm run build` failed on
+  the server: `PythonStrategyPnl.tsx`/`PythonStrategyTrades.tsx`/
+  `PythonStrategyErrors.tsx` (fork-only files, see "New files" below) still
+  imported from `react-router-dom`, which upstream had renamed to
+  `react-router` at an earlier sync. Fixed by updating the three imports;
+  root-caused and added the missing `npm run build` verification step to
+  this procedure (see "Before committing the merge" above) so a fork-only
+  frontend file rotting against a renamed dependency gets caught before
+  push, not after a server rebuild days later.
 - **2026-07-29**: 39 commits pulled from upstream (broker funds/order-API
   fixes across Angel/Dhan/Kotak/Upstox/Zerodha, Kotak order-streaming
   adapter, Strategy Builder payoff audit, frontend `frontend/dist` rebuild).
@@ -649,6 +679,24 @@ iterates on. Changes:
 - `frontend/src/pages/python-strategy/PythonStrategyTrades.tsx`
 - `frontend/src/pages/python-strategy/PythonStrategyErrors.tsx`
 - `docs/prd/python-strategies-order-error-recovery.md`
+
+**"Zero conflict risk" means git found no textual conflict — it does NOT mean
+the file is unaffected by upstream's changes elsewhere.** Incident, 2026-08-04:
+these three "new, upstream doesn't know about them" files still imported from
+`react-router-dom`. Upstream had renamed the dependency to `react-router` (v8)
+network-wide at some earlier sync, and every OTHER page picked that up because
+git's merge touched them directly — these three didn't, because upstream has
+never touched them and never will, so nothing about the merge itself would
+ever surface the mismatch. `npm run build` (`tsc -b`) failed on the server
+with `TS2307: Cannot find module 'react-router-dom'` days after a clean,
+zero-conflict merge had already been pushed. A file being "new/unowned by
+upstream" is a reason it can't merge-conflict, not a reason it's safe to skip
+verifying — it can still silently rot against a dependency the rest of the
+codebase moved on from. **Actually run `cd frontend && npm run build` after
+every merge that touches `frontend/` at all** (not just when `frontend/dist/`
+shows the expected conflict) — the pre-merge sanity checks above only
+`py_compile` the Python customizations; nothing was verifying the frontend
+customizations actually still typecheck against current dependencies.
 
 ---
 
