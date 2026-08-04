@@ -22,6 +22,7 @@ import time
 from datetime import datetime, timezone
 
 import psutil
+from sqlalchemy import text
 
 from database.health_db import (
     HealthAlert,
@@ -123,6 +124,24 @@ def check_db_connectivity():
         "latency": "database.latency_db",
     }
 
+    # This runs synchronously inside the /health/check request handler, not
+    # the background collector this module's own docstring promises "zero
+    # latency impact" for -- under gunicorn+eventlet's single worker, a
+    # blocking SQLite wait here does not yield to any other request. The
+    # production busy_timeout (5000ms, see docs/plans/2026-02-06-strategy-
+    # risk-management-prd.md) is fine for a real write contending with
+    # another real write, but is much too long for a cheap liveness probe:
+    # confirmed in production (2026-08-04) that visiting /health while
+    # openalgo.db had a concurrent writer (e.g. a strategy's own PnL/trade
+    # push landing in the same DB) froze the single worker long enough that
+    # a strategy subprocess's own loopback calls (report_pnl_to_platform,
+    # check_force_exit) timed out and its report_pnl_tick job started
+    # skipping runs. Override busy_timeout to a short bound just for this
+    # probe's own connection -- NullPool hands back a fresh connection per
+    # session.execute() call, so this never touches the production
+    # busy_timeout any other query on the same engine gets.
+    PROBE_BUSY_TIMEOUT_MS = 200
+
     for db_name, module_path in databases.items():
         try:
             parts = module_path.rsplit(".", 1)
@@ -133,23 +152,26 @@ def check_db_connectivity():
                 # Try a simple query
                 if hasattr(module, "db_session"):
                     session = getattr(module, "db_session")
-                    # Execute simple query to test connectivity
-                    session.execute("SELECT 1").fetchone()
-                    results[db_name] = "pass"
                 elif hasattr(module, "logs_session"):
                     session = getattr(module, "logs_session")
-                    session.execute("SELECT 1").fetchone()
-                    results[db_name] = "pass"
                 elif hasattr(module, "latency_session"):
                     session = getattr(module, "latency_session")
-                    session.execute("SELECT 1").fetchone()
-                    results[db_name] = "pass"
                 else:
                     results[db_name] = "pass"  # Assume pass if no session found
+                    continue
+
+                session.execute(text(f"PRAGMA busy_timeout = {PROBE_BUSY_TIMEOUT_MS}"))
+                session.execute(text("SELECT 1")).fetchone()
+                results[db_name] = "pass"
         except Exception as e:
             logger.error(f"Database connectivity check failed for {db_name}: {e}")
             results[db_name] = "fail"
             overall_status = "fail"
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
 
     return {"status": overall_status, "databases": results}
 

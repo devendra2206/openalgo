@@ -132,6 +132,7 @@ Author
 ===============================================================================
 """
 
+import copy
 import csv
 import json
 import logging
@@ -1444,8 +1445,12 @@ class WeeklySideEngine:
         if pos.error_state:
             # Frozen awaiting a Retry/Cancel/Manual decision -- still checks
             # for a pending action every cycle so a user's click is picked up
-            # promptly instead of only on the next restart.
-            pending = check_pending_action(self.engine.env, self.leg_key)
+            # promptly instead of only on the next restart. Backgrounded
+            # (see _refresh_pending_action_bg) so a slow/contended loopback
+            # call never blocks run_cycle() -- any cached result from a
+            # PRIOR cycle's background fetch is applied immediately below.
+            self.engine._refresh_pending_action_bg(self.leg_key)
+            pending = self.engine._pop_pending_action(self.leg_key)
             if pending is not None:
                 self._resolve_leg_error(pending)
             return
@@ -1618,7 +1623,7 @@ class WeeklySideEngine:
         pos.error_message = message
         pos.error_since = datetime.now(IST).isoformat()
         action = "BUY" if error_state == "entry_failed" else "SELL"
-        push_leg_error(self.engine.env, self.leg_key, pos, action=action)
+        self.engine._push_leg_error_bg(self.leg_key, pos, action=action)
         self.engine.save_state()
         Log.error(f"[WEEKLY_{self.option_type}] {error_state} ({error_kind}): {message}")
 
@@ -1656,7 +1661,7 @@ class WeeklySideEngine:
                 pos.error_kind = ""
                 pos.error_order_id = ""
                 self.engine.save_state()
-                push_leg_error(self.engine.env, self.leg_key, pos, clear=True)
+                self.engine._push_leg_error_bg(self.leg_key, pos, clear=True)
                 ack_pending_action(self.engine.env, self.leg_key)
                 return
             if kind == "terminal":
@@ -1665,7 +1670,7 @@ class WeeklySideEngine:
                 )
                 self.leg.position = LegPosition()
                 self.engine.save_state()
-                push_leg_error(self.engine.env, self.leg_key, self.leg.position, clear=True)
+                self.engine._push_leg_error_bg(self.leg_key, self.leg.position, clear=True)
                 ack_pending_action(self.engine.env, self.leg_key)
                 return
             # kind == "resting": one last honest re-price + bounded wait, then
@@ -1699,7 +1704,7 @@ class WeeklySideEngine:
             pos.error_kind = ""
             pos.error_order_id = ""
             self.engine.save_state()
-            push_leg_error(self.engine.env, self.leg_key, pos, clear=True)
+            self.engine._push_leg_error_bg(self.leg_key, pos, clear=True)
             ack_pending_action(self.engine.env, self.leg_key)
 
     def _do_retry_resolution(self, was_exit: bool, kind: str):
@@ -1734,7 +1739,7 @@ class WeeklySideEngine:
                 pos.error_kind = ""
                 pos.error_order_id = ""
                 self.engine.save_state()
-                push_leg_error(self.engine.env, self.leg_key, pos, clear=True)
+                self.engine._push_leg_error_bg(self.leg_key, pos, clear=True)
                 self.engine._pending_fills.discard(self.leg_key)
                 return
 
@@ -1771,7 +1776,7 @@ class WeeklySideEngine:
             pos.error_kind = ""
             pos.error_order_id = ""
             self.engine.save_state()
-            push_leg_error(self.engine.env, self.leg_key, pos, clear=True)
+            self.engine._push_leg_error_bg(self.leg_key, pos, clear=True)
             # _watch_entry_fill owns _pending_fills for this leg_key from here.
             # No strike/reference/current snapshot survives a restart-free
             # Retry, so the confirmation log falls back to a shorter form
@@ -1812,7 +1817,7 @@ class WeeklySideEngine:
                 self.engine.price_stream.remove_instruments([{"symbol": symbol, "exchange": OPTIONS_EXCHANGE}])
                 self.leg.position = LegPosition()
                 self.engine.save_state()
-            push_leg_error(self.engine.env, self.leg_key, self.leg.position, clear=True)
+            self.engine._push_leg_error_bg(self.leg_key, self.leg.position, clear=True)
         except Exception as exc:
             Log.exception(f"[WEEKLY_{self.option_type}] Unexpected error during Cancel's final chance: {exc}")
             self._enter_error_mode(order_id, "entry_failed", "resting", order_id, str(exc))
@@ -1963,7 +1968,7 @@ class WeeklySideEngine:
         Log.info(f"[WEEKLY_{self.option_type}] Position closed: {pos.symbol} reason={reason} "
                  f"pnl_rupees={pnl_rupees:.2f}")
         self.engine.price_stream.remove_instruments([{"symbol": pos.symbol, "exchange": OPTIONS_EXCHANGE}])
-        notify_trade_closed(self.engine.env, log_warning=Log.warning)
+        self.engine._notify_trade_closed_bg()
         leg.position = LegPosition()
         self.engine.save_state()
 
@@ -1995,7 +2000,10 @@ class MonthlySideEngine:
             return  # a background fill-watcher is already resolving this leg
         pos = self.leg.position
         if pos.error_state:
-            pending = check_pending_action(self.engine.env, self.leg_key)
+            # Backgrounded (see _refresh_pending_action_bg) so a slow/
+            # contended loopback call never blocks run_cycle().
+            self.engine._refresh_pending_action_bg(self.leg_key)
+            pending = self.engine._pop_pending_action(self.leg_key)
             if pending is not None:
                 self._resolve_leg_error(pending)
             return
@@ -2151,7 +2159,7 @@ class MonthlySideEngine:
         pos.error_message = message
         pos.error_since = datetime.now(IST).isoformat()
         action = "SELL" if error_state == "entry_failed" else "BUY"
-        push_leg_error(self.engine.env, self.leg_key, pos, action=action)
+        self.engine._push_leg_error_bg(self.leg_key, pos, action=action)
         self.engine.save_state()
         Log.error(f"[MONTHLY_{self.option_type}] {error_state} ({error_kind}): {message}")
 
@@ -2178,7 +2186,7 @@ class MonthlySideEngine:
                 pos.error_kind = ""
                 pos.error_order_id = ""
                 self.engine.save_state()
-                push_leg_error(self.engine.env, self.leg_key, pos, clear=True)
+                self.engine._push_leg_error_bg(self.leg_key, pos, clear=True)
                 ack_pending_action(self.engine.env, self.leg_key)
                 return
             if kind == "terminal":
@@ -2187,7 +2195,7 @@ class MonthlySideEngine:
                 )
                 self.leg.position = LegPosition()
                 self.engine.save_state()
-                push_leg_error(self.engine.env, self.leg_key, self.leg.position, clear=True)
+                self.engine._push_leg_error_bg(self.leg_key, self.leg.position, clear=True)
                 ack_pending_action(self.engine.env, self.leg_key)
                 return
             ack_pending_action(self.engine.env, self.leg_key)
@@ -2213,7 +2221,7 @@ class MonthlySideEngine:
             pos.error_kind = ""
             pos.error_order_id = ""
             self.engine.save_state()
-            push_leg_error(self.engine.env, self.leg_key, pos, clear=True)
+            self.engine._push_leg_error_bg(self.leg_key, pos, clear=True)
             ack_pending_action(self.engine.env, self.leg_key)
 
     def _do_retry_resolution(self, was_exit: bool, kind: str):
@@ -2241,7 +2249,7 @@ class MonthlySideEngine:
                 pos.error_kind = ""
                 pos.error_order_id = ""
                 self.engine.save_state()
-                push_leg_error(self.engine.env, self.leg_key, pos, clear=True)
+                self.engine._push_leg_error_bg(self.leg_key, pos, clear=True)
                 self.engine._pending_fills.discard(self.leg_key)
                 return
 
@@ -2276,7 +2284,7 @@ class MonthlySideEngine:
             pos.error_kind = ""
             pos.error_order_id = ""
             self.engine.save_state()
-            push_leg_error(self.engine.env, self.leg_key, pos, clear=True)
+            self.engine._push_leg_error_bg(self.leg_key, pos, clear=True)
             self.engine._fill_executor.submit(
                 self._watch_entry_fill, resume_order_id, pos.symbol, None, None, None, None
             )
@@ -2311,7 +2319,7 @@ class MonthlySideEngine:
                 self.engine.price_stream.remove_instruments([{"symbol": symbol, "exchange": OPTIONS_EXCHANGE}])
                 self.leg.position = LegPosition()
                 self.engine.save_state()
-            push_leg_error(self.engine.env, self.leg_key, self.leg.position, clear=True)
+            self.engine._push_leg_error_bg(self.leg_key, self.leg.position, clear=True)
         except Exception as exc:
             Log.exception(f"[MONTHLY_{self.option_type}] Unexpected error during Cancel's final chance: {exc}")
             self._enter_error_mode(order_id, "entry_failed", "resting", order_id, str(exc))
@@ -2422,7 +2430,7 @@ class MonthlySideEngine:
         Log.info(f"[MONTHLY_{self.option_type}] Position closed: {pos.symbol} reason={reason} "
                  f"pnl_rupees={pnl_rupees:.2f}")
         self.engine.price_stream.remove_instruments([{"symbol": pos.symbol, "exchange": OPTIONS_EXCHANGE}])
-        notify_trade_closed(self.engine.env, log_warning=Log.warning)
+        self.engine._notify_trade_closed_bg()
         leg.position = LegPosition()
         self.engine.save_state()
 
@@ -2480,6 +2488,18 @@ class StrategyEngine:
         # the cheap boolean run_cycle actually reads.
         self._force_exit_pending: bool = False
         self._force_exit_check_pending: bool = False
+        # push_leg_error/notify_trade_closed/check_pending_action are also
+        # synchronous local HTTP calls made from inside run_cycle() (via
+        # evaluate()) -- same blocking-bug class as check_force_exit above,
+        # confirmed in production (2026-08-04): visiting /health froze the
+        # single gunicorn+eventlet worker long enough that these calls hit
+        # their own 3s timeout, stalling run_cycle() and delaying every
+        # OTHER leg's evaluation in that same cycle. All three now go
+        # through _bg_executor; check_pending_action's result is consumed
+        # by the caller, so it needs a cache (like _force_exit_pending)
+        # rather than pure fire-and-forget.
+        self._pending_action_cache: dict = {}
+        self._pending_action_inflight: set = set()
 
     def save_state(self):
         """Every state_store.save() call in this engine goes through here --
@@ -2621,6 +2641,53 @@ class StrategyEngine:
                 self._force_exit_check_pending = False
 
         self._bg_executor.submit(_run)
+
+    def _push_leg_error_bg(self, leg_key: str, pos: "LegPosition", action: str = "", clear: bool = False):
+        """Fire-and-forget push_leg_error via _bg_executor -- see the
+        __init__ comment on _pending_action_cache for why this must never
+        run inline on the run_cycle() thread. `pos` is a live, mutable
+        LegPosition this same cycle may reset moments later (e.g. right
+        after a clear=True call, once the leg is confirmed resolved), so it
+        is snapshotted with a shallow copy on THIS (calling) thread before
+        handing off -- executor.submit() evaluates its arguments immediately,
+        only the function call itself is deferred."""
+        snapshot = copy.copy(pos)
+        self._bg_executor.submit(push_leg_error, self.env, leg_key, snapshot, action=action, clear=clear)
+
+    def _notify_trade_closed_bg(self):
+        """Fire-and-forget notify_trade_closed via _bg_executor -- same
+        blocking-bug class as push_leg_error above."""
+        self._bg_executor.submit(notify_trade_closed, self.env, log_warning=Log.warning)
+
+    def _refresh_pending_action_bg(self, leg_key: str):
+        """Dispatches check_pending_action to _bg_executor instead of
+        blocking run_cycle() -- mirrors _refresh_force_exit_check_bg, but
+        keyed per leg_key (multiple legs can be in error state at once) and
+        caches the result for pop_pending_action() to consume, since (unlike
+        push_leg_error/notify_trade_closed) the caller needs the return
+        value, not just fire-and-forget. Guarded per leg_key so a slow check
+        that outlives one cycle isn't resubmitted on top of itself."""
+        if leg_key in self._pending_action_inflight:
+            return
+        self._pending_action_inflight.add(leg_key)
+
+        def _run():
+            try:
+                result = check_pending_action(self.env, leg_key)
+                if result is not None:
+                    self._pending_action_cache[leg_key] = result
+            except Exception as exc:
+                Log.warning(f"check_pending_action background refresh failed for {leg_key}: {exc}")
+            finally:
+                self._pending_action_inflight.discard(leg_key)
+
+        self._bg_executor.submit(_run)
+
+    def _pop_pending_action(self, leg_key: str) -> Optional[dict]:
+        """The last background-fetched pending action for this leg, if any
+        -- consumed once (popped), so a fetched action is never applied
+        twice."""
+        return self._pending_action_cache.pop(leg_key, None)
 
     def run_cycle(self):
         try:

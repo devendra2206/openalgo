@@ -796,6 +796,74 @@ def test_new_candle_closed_never_fires_on_the_first_call_after_a_restart(
     assert engine._new_candle_closed() is True
 
 
+def test_refresh_pending_action_bg_populates_cache_asynchronously(script_module, clock, tmp_path):
+    """check_pending_action must never block run_cycle() -- confirmed in
+    production (2026-08-04) that a frozen single gunicorn+eventlet worker
+    stalled this loopback call for its full 3s timeout, delaying evaluation
+    of every OTHER leg in the same cycle. _refresh_pending_action_bg
+    dispatches the check to _bg_executor and caches the result for
+    _pop_pending_action() to consume on a LATER call, instead of blocking
+    the calling thread waiting for the real HTTP round trip."""
+    engine, _client, _store = _build_engine(
+        script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
+        WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
+    )
+    fake_action = {"action": "retry"}
+    script_module.check_pending_action = lambda _env, _leg_key: fake_action
+
+    # Nothing cached yet -- dispatching must never itself return a result.
+    assert engine._pop_pending_action("WEEKLY_CE") is None
+    engine._refresh_pending_action_bg("WEEKLY_CE")
+
+    deadline = time.monotonic() + 2.0
+    while "WEEKLY_CE" in engine._pending_action_inflight and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert "WEEKLY_CE" not in engine._pending_action_inflight, (
+        "background check_pending_action fetch never completed"
+    )
+
+    assert engine._pop_pending_action("WEEKLY_CE") == fake_action
+    # Popped once -- a fetched action is never re-applied on a second read.
+    assert engine._pop_pending_action("WEEKLY_CE") is None
+
+
+def test_push_leg_error_bg_snapshots_pos_before_backgrounding(script_module, clock, tmp_path):
+    """pos is a live, mutable LegPosition the calling cycle may reset
+    moments after dispatching this -- e.g. clear=True right before the leg
+    is confirmed resolved and leg.position is replaced with a fresh
+    LegPosition(). _push_leg_error_bg must snapshot the fields BEFORE
+    handing off to the background thread, not read them lazily once the
+    background task actually runs, or the platform could get pushed a
+    push_leg_error call describing the WRONG (already-reset) leg state."""
+    engine, _client, _store = _build_engine(
+        script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
+        WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
+    )
+    calls = []
+    script_module.push_leg_error = lambda env, leg_key, pos, action="", clear=False: calls.append(
+        (leg_key, pos.symbol, pos.error_state, action, clear)
+    )
+
+    pos = script_module.LegPosition(
+        symbol="NIFTY06AUG2624300CE", error_state="entry_failed", error_kind="terminal",
+    )
+    engine._push_leg_error_bg("WEEKLY_CE", pos, action="SELL")
+
+    # Mutate/replace the leg's position immediately after dispatching --
+    # simulates the same cycle resolving/resetting it before the background
+    # thread has necessarily run yet.
+    pos.symbol = ""
+    pos.error_state = ""
+
+    deadline = time.monotonic() + 2.0
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    assert calls == [("WEEKLY_CE", "NIFTY06AUG2624300CE", "entry_failed", "SELL", False)], (
+        "push_leg_error saw the mutated/reset pos instead of a frozen snapshot"
+    )
+
+
 def test_fetch_candle_oi_premium_discards_a_still_forming_candle(script_module, clock, tmp_path):
     """Confirmed against real production data: client.history()'s last row
     can be the broker's LIVE, still-forming current candle -- a candle read
