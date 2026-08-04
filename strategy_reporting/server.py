@@ -722,14 +722,35 @@ def _relay(_unused):
 
     if is_sse:
         def _stream():
-            with _relay_client.stream(
+            # A dedicated, one-off connection for this stream -- NOT the
+            # pooled _relay_client used for ordinary buffered requests below.
+            # A long-lived SSE stream sharing a connection pool with regular
+            # request/response traffic risks head-of-line blocking / delayed
+            # flushing on that pool; isolating it removes that as a variable.
+            # httpx.stream() (the module-level function, not Client.stream())
+            # opens its own one-off connection per call -- HTTP/1.1 by
+            # default (h2 requires the optional `h2` package AND explicit
+            # http2=True on a Client; neither applies to this call).
+            with httpx.stream(
                 request.method, target_url, headers=headers, content=request.get_data(),
                 timeout=None,
             ) as upstream:
                 for chunk in upstream.iter_raw():
                     yield chunk
 
-        return Response(stream_with_context(_stream()), mimetype="text/event-stream")
+        response = Response(stream_with_context(_stream()), mimetype="text/event-stream")
+        # Belt-and-suspenders against buffering at every layer between the
+        # main app's SSE generator and the browser: nginx's own
+        # proxy_buffering is already off for the /python location block,
+        # but X-Accel-Buffering covers it explicitly too in case that
+        # config ever drifts. Deliberately NOT setting direct_passthrough --
+        # that flag is for wrapping a real file-like object (send_file's use
+        # case), not a generator; setting it here broke werkzeug's dev
+        # server outright ("applications must write bytes"), caught by a
+        # synthetic latency test before this shipped.
+        response.headers["X-Accel-Buffering"] = "no"
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
     upstream = _relay_client.request(
         request.method, target_url, headers=headers, content=request.get_data(),

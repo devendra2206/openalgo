@@ -345,10 +345,45 @@ broadcast a live SSE update via the still-unchanged `broadcast_pnl_update`/
 functions, or (b) actually stop a strategy's OS process after a completed
 Force Exit via the still-unchanged `stop_strategy_process` — both called
 from `strategy_reporting/broadcast_bridge.py` (runs inside the main
-process, started from `app.py`, real OS thread via this fork's established
-`eventlet.patcher.original("threading")` escape hatch) rather than
-imported into the new subprocess, since only the main process holds the
-actual Popen handle / SSE subscriber list.
+process, started from `app.py`) rather than imported into the new
+subprocess, since only the main process holds the actual Popen handle /
+SSE subscriber list.
+
+**2026-08-05 follow-up — the receive loop must NOT be a genuine OS thread
+under eventlet.** Shipped first with this fork's usual
+`eventlet.patcher.original("threading")` escape hatch, matching every
+other "needs a real blocking loop" case in this codebase
+(`services/websocket_client.py`, `sandbox/websocket_execution_engine.py`).
+Wrong here specifically: unlike those cases, this loop's whole job is to
+call back INTO code (`broadcast_*`) that touches `SSE_SUBSCRIBERS`' `queue.Queue`
+objects and `SSE_LOCK` — the eventlet-monkey-patched primitives, since the
+whole gunicorn process is patched. Signaling those from a genuine,
+unpatched OS thread is the exact `greenlet.error: Cannot switch to a
+different thread` class of bug already fixed in
+`services/websocket_client.py`'s `_run_coroutine_and_wait` (production
+incident, 2026-07-29) — except here it didn't crash, it silently degraded:
+observed in production as "PnL/trade price updating, just very slowly."
+A foreign thread's `queue.put()` can leave the SSE generator's
+`q.get()` without a notification eventlet's hub actually acts on, so the
+update only surfaces once something else gives the hub a reason to poll
+(worst case, `api_strategy_events`' own 30s heartbeat cycle).
+
+Fixed: under eventlet, the receive loop runs as a genuine `eventlet.spawn()`
+green thread, not an OS thread — only the individual blocking `socket.recv()`
+call leaves the green world, via `eventlet.tpool.execute()` (eventlet's own
+documented, hub-safe bridge for "one blocking call on a background native
+thread, result handed back to the calling greenlet"). Everything
+downstream, including every `broadcast_*` call, runs on the calling
+greenlet — safe by construction, no cross-thread signaling into
+eventlet-patched primitives at all. Outside eventlet (this fork's own
+Windows/dev-machine testing has no `eventlet` installed at all) there's no
+greenlet/native-thread split to worry about, so the original real-OS-thread
+approach is kept for that path. Caught by a synthetic SSE relay latency
+test before understanding the root cause — worth remembering the test
+initially pointed at the wrong layer (the relay itself, which turned out
+to already be fast) before the actual cross-thread signaling bug was
+found by re-reading this exact class of fix already on record in
+`services/websocket_client.py`.
 
 **Strategy scripts** (`strategies/deployed/*.py`, all 7): `_post_json_local`/
 `_get_json_local` retarget from `openalgo.sock`/`FLASK_PORT` to
