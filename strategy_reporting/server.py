@@ -111,6 +111,23 @@ app.config.update(
 _relay_client = httpx.Client(timeout=10.0)
 
 
+@app.teardown_appcontext
+def _shutdown_db_session(exception=None):
+    """Missing until 2026-08-05 -- db_session is a scoped_session, which
+    SQLAlchemy keys per-thread by default (threading.get_ident()). This
+    process serves requests via werkzeug's threaded WSGI server, which
+    reuses OS threads across requests -- without removing the session
+    after each request, a reused thread's session keeps its identity map
+    from earlier requests, so a later GET on that same thread can return a
+    stale, cached row instead of another thread's more recent commit.
+    Observed in production as the PnL tile and the Trades page
+    disagreeing about the exact same open position, reading the exact
+    same query, because each happened to land on a different thread with
+    a different cache state. Mirrors app.py's own
+    shutdown_database_sessions teardown_appcontext for the main app."""
+    db_session.remove()
+
+
 ###############################################################################
 # Auth helpers
 ###############################################################################

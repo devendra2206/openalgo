@@ -105,6 +105,18 @@ def _handle_event(event: dict):
             logger.warning(f"broadcast_bridge: unknown event type {event_type!r}")
     except Exception:
         logger.exception(f"broadcast_bridge: failed to handle event {event}")
+    finally:
+        # get_pnl_snapshot() (and anything else touched above) uses a
+        # scoped_session -- this runs outside a Flask request, so
+        # app.py's own teardown_appcontext never fires for it (see
+        # utils/db_sessions.py's own docstring: background work must
+        # remove its scoped sessions itself). Without this, a stale
+        # cached row on this same thread/greenlet could be served again
+        # on the NEXT event, same staleness class fixed in
+        # strategy_reporting/server.py's teardown_appcontext.
+        from utils.db_sessions import remove_all_scoped_sessions
+
+        remove_all_scoped_sessions()
 
 
 def _open_socket():
