@@ -43,7 +43,13 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import type { MasterContractStatus, PnlSnapshot, PythonStrategy, Trade } from '@/types/python-strategy'
+import type {
+  MasterContractStatus,
+  OpenPosition,
+  PnlSnapshot,
+  PythonStrategy,
+  Trade,
+} from '@/types/python-strategy'
 import { SCHEDULE_DAYS, STATUS_COLORS, STATUS_LABELS } from '@/types/python-strategy'
 import { showToast } from '@/utils/toast'
 
@@ -162,28 +168,49 @@ export default function PythonStrategyIndex() {
           }))
 
           // This same push already carries each open leg's live current_price
-          // and pnl (~every 0.8s) -- patch the matching OPEN row in the
-          // Today's Trades panel in place so its LTP/PnL actually ticks live,
-          // instead of only refreshing when a trade closes (trade_update
-          // fires on close only, far too infrequent for a "live" row).
-          const openPositions: { leg_key: string; current_price: number; pnl: number }[] =
-            data.open_positions || []
+          // and pnl (~every 0.8s) -- patch a matching OPEN row in place so its
+          // LTP/PnL actually ticks live, AND append any leg not already in
+          // the list as a fresh OPEN row. Without the append half, a leg that
+          // enters while this page is already open (no prior fetch, no
+          // trade_update -- that only fires on EXIT) would never appear in
+          // the Today's Trades panel at all, including its collapsible
+          // toggle staying hidden even though a real open position exists.
+          const openPositions: OpenPosition[] = data.open_positions || []
           if (openPositions.length > 0) {
             setTodayTradesByStrategy((prev) => {
-              const existing = prev[data.strategy_id]
-              if (!existing) return prev
-              const byLeg = new Map(openPositions.map((p) => [p.leg_key, p]))
-              const updated = existing.map((trade) => {
+              const existing = prev[data.strategy_id] ?? []
+              const byLeg = new Map(existing.map((t) => [t.leg, t]))
+              let anyPatched = false
+              const patched = existing.map((trade) => {
                 if (trade.status !== 'OPEN') return trade
-                const live = byLeg.get(trade.leg)
+                const live = openPositions.find((p) => p.leg_key === trade.leg)
                 if (!live) return trade
+                anyPatched = true
                 return {
                   ...trade,
                   exit_px: String(live.current_price),
                   pnl_rupees: live.pnl.toFixed(2),
                 }
               })
-              return { ...prev, [data.strategy_id]: updated }
+              const newRows: Trade[] = openPositions
+                .filter((p) => !byLeg.has(p.leg_key))
+                .map((p) => ({
+                  leg: p.leg_key,
+                  symbol: p.symbol,
+                  quantity: String(p.quantity),
+                  direction: p.direction,
+                  entry_time: p.entry_time ?? '',
+                  entry_px: String(p.entry_price),
+                  exit_time: '',
+                  exit_px: String(p.current_price),
+                  pnl_points: '',
+                  pnl_rupees: p.pnl.toFixed(2),
+                  exit_reason: '',
+                  execution_id: p.execution_id != null ? String(p.execution_id) : 'legacy',
+                  status: 'OPEN' as const,
+                }))
+              if (!anyPatched && newRows.length === 0) return prev
+              return { ...prev, [data.strategy_id]: [...patched, ...newRows] }
             })
           }
           return

@@ -52,6 +52,8 @@ export interface OpenPosition {
   entry_price: number
   current_price: number
   pnl: number
+  entry_time?: string
+  execution_id?: number | string
 }
 
 export interface PnlSnapshot {

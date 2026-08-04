@@ -2816,6 +2816,7 @@ class StrategyEngine:
                 # own is_short sign flip and is unaffected by this.
                 "quantity": -pos.quantity if is_short else pos.quantity,
                 "entry_price": pos.entry_px, "current_price": ltp, "pnl": pnl,
+                "entry_time": pos.entry_time, "execution_id": pos.execution_id,
             })
         return open_positions
 
