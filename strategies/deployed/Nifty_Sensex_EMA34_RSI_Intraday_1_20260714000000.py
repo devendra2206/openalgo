@@ -184,6 +184,7 @@ Author
 ===============================================================================
 """
 
+import copy
 import csv
 import json
 import logging
@@ -1532,6 +1533,17 @@ class StrategyEngine:
         # (reprice loop) can never make the live PnL display go stale too;
         # PnL pushes are small/fast and only need to run one at a time.
         self._pnl_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pnltick")
+        # check_pending_action is a synchronous local HTTP call -- calling it
+        # directly from run_cycle's own thread (as this file did until
+        # 2026-08-04) is the same blocking-bug class documented on
+        # _refresh_force_exit_check_bg above: a slow/contended loopback call
+        # stalls run_cycle and delays every OTHER leg's evaluation that same
+        # cycle. Cached per leg_key since (unlike push_leg_error) the caller
+        # needs the return value, not just fire-and-forget. Mirrors
+        # MCX_CrudeOil_EMA9_RSI_Intraday/Nifty_OI_WeeklyBuy_MonthlySell's
+        # _refresh_pending_action_bg/_pop_pending_action.
+        self._pending_action_cache: dict = {}
+        self._pending_action_inflight: set = set()
         # Weekly expiry only rolls at week boundaries, not intraday -- resolving it
         # fresh via client.expiry() on every single entry added a full REST
         # round-trip to the entry critical path for no reason. Cached per
@@ -1874,6 +1886,53 @@ class StrategyEngine:
             except Exception as exc:
                 Log.warning(f"[{leg_key}] Failed to dispatch periodic error re-push: {exc}")
 
+    def _push_leg_error_bg(self, leg_key: str, pos: "LegPosition", action: str = "", clear: bool = False):
+        """Fire-and-forget push_leg_error via _pnl_executor -- for the
+        "clear"/on-resolution pushes from _resolve_leg_error, which run
+        synchronously on run_cycle's own thread (2026-08-04: fixed -- this
+        file was calling push_leg_error() directly there, the same
+        blocking-bug class as check_pending_action below). `pos` is
+        snapshotted with a shallow copy on THIS (calling) thread before
+        handing off -- executor.submit() evaluates its arguments
+        immediately, only the function call itself is deferred, and `pos` is
+        a live, mutable LegPosition this same cycle may reset moments
+        later."""
+        snapshot = copy.copy(pos)
+        try:
+            self._pnl_executor.submit(push_leg_error, self.env, leg_key, snapshot, action=action, clear=clear)
+        except Exception as exc:
+            Log.warning(f"[{leg_key}] Failed to dispatch push_leg_error: {exc}")
+
+    def _refresh_pending_action_bg(self, leg_key: str):
+        """Dispatches check_pending_action to _pnl_executor instead of
+        blocking run_cycle() (2026-08-04: fixed -- see _push_leg_error_bg's
+        docstring for the same bug class). Caches the result for
+        _pop_pending_action() to consume, since (unlike push_leg_error) the
+        caller needs the return value, not just fire-and-forget. Guarded per
+        leg_key so a slow check that outlives one cycle isn't resubmitted on
+        top of itself."""
+        if leg_key in self._pending_action_inflight:
+            return
+        self._pending_action_inflight.add(leg_key)
+
+        def _run():
+            try:
+                result = check_pending_action(self.env, leg_key)
+                if result is not None:
+                    self._pending_action_cache[leg_key] = result
+            except Exception as exc:
+                Log.warning(f"check_pending_action background refresh failed for {leg_key}: {exc}")
+            finally:
+                self._pending_action_inflight.discard(leg_key)
+
+        self._pnl_executor.submit(_run)
+
+    def _pop_pending_action(self, leg_key: str) -> Optional[dict]:
+        """The last background-fetched pending action for this leg, if any
+        -- consumed once (popped), so a fetched action is never applied
+        twice."""
+        return self._pending_action_cache.pop(leg_key, None)
+
     def _exit_leg(self, leg_key: str, inst: InstrumentConfig, reason: str = "unknown"):
         leg = self.store.state.legs[leg_key]
         pos = leg.position
@@ -2054,7 +2113,7 @@ class StrategyEngine:
                 pos.error_kind = ""
                 pos.error_order_id = ""
                 self._save_state()
-                push_leg_error(self.env, leg_key, pos, clear=True)
+                self._push_leg_error_bg(leg_key, pos, clear=True)
                 ack_pending_action(self.env, leg_key)
                 return
             if kind == "terminal":
@@ -2064,7 +2123,7 @@ class StrategyEngine:
                 )
                 leg.position = LegPosition()
                 self._save_state()
-                push_leg_error(self.env, leg_key, leg.position, clear=True)
+                self._push_leg_error_bg(leg_key, leg.position, clear=True)
                 ack_pending_action(self.env, leg_key)
                 return
             # kind == "resting": one last honest re-price + bounded wait, then
@@ -2102,7 +2161,7 @@ class StrategyEngine:
             pos.error_kind = ""
             pos.error_order_id = ""
             self._save_state()
-            push_leg_error(self.env, leg_key, pos, clear=True)
+            self._push_leg_error_bg(leg_key, pos, clear=True)
             ack_pending_action(self.env, leg_key)
 
     def _do_retry_resolution(self, leg_key: str, inst: InstrumentConfig, was_exit: bool, kind: str):
@@ -2354,7 +2413,8 @@ class StrategyEngine:
                     if leg.position.error_state:
                         inst_name = leg_key.split("_")[0]
                         inst = next(i for i in INSTRUMENTS if i.name == inst_name)
-                        pending = check_pending_action(self.env, leg_key)
+                        self._refresh_pending_action_bg(leg_key)
+                        pending = self._pop_pending_action(leg_key)
                         if pending is not None:
                             self._resolve_leg_error(leg_key, inst, pending)
                 if self._handle_force_exit():
@@ -2387,7 +2447,8 @@ class StrategyEngine:
                         # force-close check below on the NEXT cycle (still past
                         # universal exit time), so it still gets closed before
                         # the day ends.
-                        pending = check_pending_action(self.env, leg_key)
+                        self._refresh_pending_action_bg(leg_key)
+                        pending = self._pop_pending_action(leg_key)
                         if pending is not None:
                             self._resolve_leg_error(leg_key, inst, pending)
                         else:
@@ -2437,7 +2498,8 @@ class StrategyEngine:
                         # this is what makes the pause per-leg, not per-strategy:
                         # every OTHER leg_key/instrument in these two loops is
                         # untouched and keeps evaluating its own signal normally.
-                        pending = check_pending_action(self.env, leg_key)
+                        self._refresh_pending_action_bg(leg_key)
+                        pending = self._pop_pending_action(leg_key)
                         if pending is not None:
                             self._resolve_leg_error(leg_key, inst, pending)
                         continue
