@@ -433,166 +433,182 @@ class FyersAdapter:
                 )
                 return
 
-            # Find matching subscription using HSM token or original symbol
+            # Find matching subscription using HSM token or original symbol.
+            #
+            # Single lock acquisition for the whole hot message path (mirrors
+            # broker/shoonya/streaming/shoonya_adapter.py's
+            # _process_market_message, "SA-9 fix") -- active_subscriptions/
+            # hsm_to_symbol/symbol_to_hsm/subscription_callbacks are the same
+            # dicts subscribe_symbols()/unsubscribe_symbols() mutate under
+            # self.lock, and this method previously read AND wrote them here
+            # with no lock at all. Confirmed exploitable in production
+            # (2026-08-04): a ~20min Fyers WS reconnect storm (403 handshake
+            # rejections) left active_subscriptions transiently inconsistent,
+            # and the (now-removed, see below) single-subscription fallback
+            # blindly mislabeled unrelated ticks under an unrelated MCX
+            # symbol for the rest of the day.
             callback = None
             openalgo_data_type = "Quote"  # Default
             matched_subscription = None
 
-            # Try to match using HSM token first (most reliable)
-            hsm_token = fyers_data.get("hsm_token")
-            if hsm_token:
-                # Use bidirectional mapping for fast lookup
-                if hsm_token in self.hsm_to_symbol:
-                    full_symbol = self.hsm_to_symbol[hsm_token]
-                    if full_symbol in self.active_subscriptions:
-                        matched_subscription = self.active_subscriptions[full_symbol]
-                        self.logger.debug(f"Matched by HSM token: {hsm_token} -> {full_symbol}")
-                else:
-                    # TEMP-DEBUG (2026-07-30, VWAP staleness investigation): elevated
-                    # to warning so this surfaces without needing debug-level logging.
-                    # Remove once the staleness root cause is confirmed/fixed.
-                    self.logger.warning(
-                        f"[DEBUG-TEMP] HSM token {hsm_token} not in mappings. "
-                        f"fyers_symbol={fyers_data.get('symbol')} "
-                        f"original_symbol={fyers_data.get('original_symbol')} "
-                        f"exchange_token={fyers_data.get('exchange_token')}"
-                    )
-                    self.logger.debug(f"Current HSM->Symbol mappings: {self.hsm_to_symbol}")
-                    # Try fallback matching
-                    for full_symbol, sub_info in self.active_subscriptions.items():
-                        if (
-                            full_symbol in self.symbol_to_hsm
-                            and self.symbol_to_hsm[full_symbol] == hsm_token
-                        ):
-                            matched_subscription = sub_info
-                            # Update reverse mapping for future fast lookup
-                            self.hsm_to_symbol[hsm_token] = full_symbol
-                            self.logger.warning(
-                                f"[DEBUG-TEMP] Matched by HSM token (fallback): "
-                                f"{hsm_token} -> {full_symbol}"
-                            )
-                            break
+            with self.lock:
+                # Try to match using HSM token first (most reliable)
+                hsm_token = fyers_data.get("hsm_token")
+                if hsm_token:
+                    # Use bidirectional mapping for fast lookup
+                    if hsm_token in self.hsm_to_symbol:
+                        full_symbol = self.hsm_to_symbol[hsm_token]
+                        if full_symbol in self.active_subscriptions:
+                            matched_subscription = self.active_subscriptions[full_symbol]
+                            self.logger.debug(f"Matched by HSM token: {hsm_token} -> {full_symbol}")
+                    else:
+                        self.logger.debug(
+                            f"HSM token {hsm_token} not in mappings. "
+                            f"fyers_symbol={fyers_data.get('symbol')} "
+                            f"original_symbol={fyers_data.get('original_symbol')} "
+                            f"exchange_token={fyers_data.get('exchange_token')}"
+                        )
+                        # Try fallback matching
+                        for full_symbol, sub_info in self.active_subscriptions.items():
+                            if (
+                                full_symbol in self.symbol_to_hsm
+                                and self.symbol_to_hsm[full_symbol] == hsm_token
+                            ):
+                                matched_subscription = sub_info
+                                # Update reverse mapping for future fast lookup
+                                self.hsm_to_symbol[hsm_token] = full_symbol
+                                self.logger.debug(
+                                    f"Matched by HSM token (fallback): {hsm_token} -> {full_symbol}"
+                                )
+                                break
 
-            # If no match by HSM token, try matching by original_symbol field
-            if not matched_subscription and "original_symbol" in fyers_data:
-                original_symbol = fyers_data.get("original_symbol", "")
-                # Try exact match
-                if original_symbol in self.active_subscriptions:
-                    matched_subscription = self.active_subscriptions[original_symbol]
-                    self.logger.debug(f"Matched by original_symbol: {original_symbol}")
-                else:
-                    self.logger.warning(
-                        f"[DEBUG-TEMP] hsm_token={hsm_token} no exact original_symbol match "
-                        f"for '{original_symbol}', trying pattern fallback"
-                    )
-                    # Try to find a match in active subscriptions
-                    # Handle cases like NSE:NIFTY25SEPFUT -> NFO:NIFTY30SEP25FUT
-                    for full_symbol, sub_info in self.active_subscriptions.items():
-                        # Check for NFO futures match
-                        if (
-                            sub_info["exchange"] == "NFO"
-                            and "NIFTY" in original_symbol
-                            and "FUT" in original_symbol
-                        ):
-                            if "NIFTY" in sub_info["symbol"] and "FUT" in sub_info["symbol"]:
+                # If no match by HSM token, try matching by original_symbol field
+                if not matched_subscription and "original_symbol" in fyers_data:
+                    original_symbol = fyers_data.get("original_symbol", "")
+                    # Try exact match
+                    if original_symbol in self.active_subscriptions:
+                        matched_subscription = self.active_subscriptions[original_symbol]
+                        self.logger.debug(f"Matched by original_symbol: {original_symbol}")
+                    else:
+                        self.logger.debug(
+                            f"hsm_token={hsm_token} no exact original_symbol match "
+                            f"for '{original_symbol}', trying pattern fallback"
+                        )
+                        # Try to find a match in active subscriptions
+                        # Handle cases like NSE:NIFTY25SEPFUT -> NFO:NIFTY30SEP25FUT
+                        for full_symbol, sub_info in self.active_subscriptions.items():
+                            # Check for NFO futures match
+                            if (
+                                sub_info["exchange"] == "NFO"
+                                and "NIFTY" in original_symbol
+                                and "FUT" in original_symbol
+                            ):
+                                if "NIFTY" in sub_info["symbol"] and "FUT" in sub_info["symbol"]:
+                                    matched_subscription = sub_info
+                                    self.logger.debug(
+                                        f"Matched NFO future by pattern: {original_symbol} -> {full_symbol}"
+                                    )
+                                    # Update the mapping for future use
+                                    if hsm_token and hsm_token not in self.hsm_to_symbol:
+                                        self.hsm_to_symbol[hsm_token] = full_symbol
+                                        self.symbol_to_hsm[full_symbol] = hsm_token
+                                    break
+
+                # If no match by token, fall back to symbol matching from fyers data.
+                # Every branch here still requires an actual textual
+                # correspondence between fyers_symbol and the candidate
+                # subscription -- deliberately NOT falling further back to
+                # "only one subscription exists, so it must be this one"
+                # (removed 2026-08-04): confirmed in production that this
+                # unverified guess mislabeled a live MCX option's ticks as an
+                # unrelated NIFTY option's (and vice versa) for hours during a
+                # broker reconnect storm. Delivering nothing for an
+                # unmatched tick is safe (the caller's own staleness
+                # detection handles that); delivering it under the WRONG
+                # symbol name is not.
+                if not matched_subscription:
+                    # Try to match using the symbol from fyers_data
+                    fyers_symbol = fyers_data.get("symbol", "")
+                    if fyers_symbol:
+                        # Try exact match first
+                        for full_symbol, sub_info in self.active_subscriptions.items():
+                            # Check various matching patterns
+                            if sub_info["symbol"] in fyers_symbol or fyers_symbol.endswith(
+                                sub_info["symbol"]
+                            ):
                                 matched_subscription = sub_info
                                 self.logger.debug(
-                                    f"Matched NFO future by pattern: {original_symbol} -> {full_symbol}"
+                                    f"Matched by symbol name (fuzzy): {fyers_symbol} -> {full_symbol}"
                                 )
                                 # Update the mapping for future use
                                 if hsm_token and hsm_token not in self.hsm_to_symbol:
                                     self.hsm_to_symbol[hsm_token] = full_symbol
                                     self.symbol_to_hsm[full_symbol] = hsm_token
                                 break
-
-            # If no match by token, fall back to symbol matching from fyers data
-            if not matched_subscription:
-                # Try to match using the symbol from fyers_data
-                fyers_symbol = fyers_data.get("symbol", "")
-                if fyers_symbol:
-                    # Try exact match first
-                    for full_symbol, sub_info in self.active_subscriptions.items():
-                        # Check various matching patterns
-                        if sub_info["symbol"] in fyers_symbol or fyers_symbol.endswith(
-                            sub_info["symbol"]
-                        ):
-                            matched_subscription = sub_info
-                            self.logger.warning(
-                                f"[DEBUG-TEMP] Matched by symbol name (fuzzy): "
-                                f"{fyers_symbol} -> {full_symbol}"
-                            )
-                            # Update the mapping for future use
-                            if hsm_token and hsm_token not in self.hsm_to_symbol:
-                                self.hsm_to_symbol[hsm_token] = full_symbol
-                                self.symbol_to_hsm[full_symbol] = hsm_token
-                            break
-                        # Special case for NFO futures
-                        elif sub_info["exchange"] == "NFO" and "FUT" in sub_info["symbol"]:
-                            # Extract core symbol from both
-                            fyers_core = (
-                                fyers_symbol.replace("-EQ", "").split("FUT")[0]
-                                if "FUT" in fyers_symbol
-                                else ""
-                            )
-                            sub_core = (
-                                sub_info["symbol"].split("FUT")[0]
-                                if "FUT" in sub_info["symbol"]
-                                else ""
-                            )
-                            if fyers_core and sub_core and fyers_core in sub_core:
-                                matched_subscription = sub_info
-                                self.logger.warning(
-                                    f"[DEBUG-TEMP] Matched NFO by core symbol (fuzzy): "
-                                    f"{fyers_symbol} -> {full_symbol}"
+                            # Special case for NFO futures
+                            elif sub_info["exchange"] == "NFO" and "FUT" in sub_info["symbol"]:
+                                # Extract core symbol from both
+                                fyers_core = (
+                                    fyers_symbol.replace("-EQ", "").split("FUT")[0]
+                                    if "FUT" in fyers_symbol
+                                    else ""
                                 )
-                                # Update the mapping for future use
-                                if hsm_token and hsm_token not in self.hsm_to_symbol:
-                                    self.hsm_to_symbol[hsm_token] = full_symbol
-                                    self.symbol_to_hsm[full_symbol] = hsm_token
-                                break
+                                sub_core = (
+                                    sub_info["symbol"].split("FUT")[0]
+                                    if "FUT" in sub_info["symbol"]
+                                    else ""
+                                )
+                                if fyers_core and sub_core and fyers_core in sub_core:
+                                    matched_subscription = sub_info
+                                    self.logger.debug(
+                                        f"Matched NFO by core symbol (fuzzy): {fyers_symbol} -> {full_symbol}"
+                                    )
+                                    # Update the mapping for future use
+                                    if hsm_token and hsm_token not in self.hsm_to_symbol:
+                                        self.hsm_to_symbol[hsm_token] = full_symbol
+                                        self.symbol_to_hsm[full_symbol] = hsm_token
+                                    break
 
-                # If still no match and only one subscription, use it
-                if not matched_subscription and len(self.active_subscriptions) == 1:
-                    for full_symbol, sub_info in self.active_subscriptions.items():
-                        matched_subscription = sub_info
-                        self.logger.warning(
-                            f"[DEBUG-TEMP] Single subscription match (fuzzy): {full_symbol} "
-                            f"(hsm_token={hsm_token}, fyers_symbol={fyers_symbol})"
-                        )
-                        break
+                # Final check - if still no match, snapshot debug info and fall through to return below
+                if not matched_subscription:
+                    no_match_debug = {
+                        "hsm_token": hsm_token,
+                        "hsm_to_symbol": dict(self.hsm_to_symbol),
+                        "symbol_to_hsm": dict(self.symbol_to_hsm),
+                        "active_subscriptions": list(self.active_subscriptions.keys()),
+                    }
+                else:
+                    no_match_debug = None
 
-            # Final check - if still no match, log detailed debug info and return
+                if matched_subscription:
+                    # Build the list of callbacks to invoke for this tick.
+                    #
+                    # Stocks have two distinct HSM streams — `sf` (symbol feed → quote)
+                    # and `dp` (depth feed) — and each tick belongs to exactly one
+                    # subscriber. Indices have a SINGLE feed (`if`), so a single tick
+                    # may need to be fanned out to both Quote (mode 2) and Depth
+                    # (mode 3) subscribers when both are registered. Previously this
+                    # branch only delivered to whichever callback existed, with Depth
+                    # winning when both did — so a Quote-only subscriber that ran
+                    # alongside any prior Depth registration silently received
+                    # depth-shaped data labelled `subscription_mode: 3`. See issue
+                    # #1093.
+                    full_symbol = f"{matched_subscription['exchange']}:{matched_subscription['symbol']}"
+                    quote_cb = self.subscription_callbacks.get(f"SymbolUpdate_{full_symbol}")
+                    depth_cb = self.subscription_callbacks.get(f"DepthUpdate_{full_symbol}")
+
+            # Everything below reads only local snapshots captured under the
+            # lock above -- never the live dicts -- so it runs unlocked,
+            # including the actual callback invocation (never hold a lock
+            # across a downstream callback's own work).
             if not matched_subscription:
-                self.logger.warning(f"No HSM token match for data. HSM token: {hsm_token}")
-                self.logger.debug(f"   HSM to Symbol mappings: {self.hsm_to_symbol}")
-                self.logger.debug(f"   Symbol to HSM mappings: {self.symbol_to_hsm}")
-                self.logger.debug(
-                    f"   Active subscriptions: {list(self.active_subscriptions.keys())}"
-                )
+                self.logger.debug(f"No HSM token match for data. HSM token: {no_match_debug['hsm_token']}")
+                self.logger.debug(f"   HSM to Symbol mappings: {no_match_debug['hsm_to_symbol']}")
+                self.logger.debug(f"   Symbol to HSM mappings: {no_match_debug['symbol_to_hsm']}")
+                self.logger.debug(f"   Active subscriptions: {no_match_debug['active_subscriptions']}")
                 self.logger.debug(f"   Fyers symbol: {fyers_data.get('symbol', 'N/A')}")
                 self.logger.debug(f"   Original symbol: {fyers_data.get('original_symbol', 'N/A')}")
                 return
-
-            """
-            # Complex string matching logic removed - we rely on HSM token matching
-            # This follows the same pattern as Angel adapter which uses token-based matching
-            """
-
-            # Build the list of callbacks to invoke for this tick.
-            #
-            # Stocks have two distinct HSM streams — `sf` (symbol feed → quote)
-            # and `dp` (depth feed) — and each tick belongs to exactly one
-            # subscriber. Indices have a SINGLE feed (`if`), so a single tick
-            # may need to be fanned out to both Quote (mode 2) and Depth
-            # (mode 3) subscribers when both are registered. Previously this
-            # branch only delivered to whichever callback existed, with Depth
-            # winning when both did — so a Quote-only subscriber that ran
-            # alongside any prior Depth registration silently received
-            # depth-shaped data labelled `subscription_mode: 3`. See issue
-            # #1093.
-            full_symbol = f"{matched_subscription['exchange']}:{matched_subscription['symbol']}"
-            quote_cb = self.subscription_callbacks.get(f"SymbolUpdate_{full_symbol}")
-            depth_cb = self.subscription_callbacks.get(f"DepthUpdate_{full_symbol}")
 
             dispatches: list[tuple[Callable, str]] = []
             if fyers_type == "dp":
