@@ -3,6 +3,11 @@
 ## Overview
 A complete web-based strategy hosting and scheduling system for OpenAlgo, accessible at `/python`.
 
+**Writing a new script in `deployed/`?** Read
+[`deployed/AUTHORING_CHECKLIST.md`](deployed/AUTHORING_CHECKLIST.md) first —
+run_cycle structure, order/error-recovery management, and PnL reporting
+patterns that have each caused real production bugs before.
+
 ## Features
 - **Upload & Manage**: Upload Python strategy scripts through web interface
 - **Start/Stop**: Control strategy execution with one click
