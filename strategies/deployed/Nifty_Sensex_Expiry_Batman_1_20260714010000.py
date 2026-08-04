@@ -2416,42 +2416,65 @@ class StrategyEngine:
             self._pending_fills.discard(leg_key)
 
     def _force_close_instrument(self, inst: InstrumentConfig, inst_state: InstrumentState, reason: str):
-        # Repair (SHORT) legs close AFTER the straddle (LONG) legs in this
-        # function -- unlike _handle_force_exit's SHORT-before-LONG order,
-        # this order is intentional here (see _handle_force_exit's docstring)
-        # and is left unchanged. But if a repair leg is ALREADY stuck in an
-        # unresolved error_state from a prior cycle, closing its paired
-        # straddle leg now would strip the hedge off a naked short repair leg
-        # that this same call cannot close either -- exactly the risk the
-        # SHORT-before-LONG guard on the Force Exit button protects against.
-        # Guard this path too, at the same instrument-level granularity
-        # _handle_force_exit uses.
-        instrument_blocked = bool(inst_state.pe_repair.error_state) or bool(inst_state.ce_repair.error_state)
-        if instrument_blocked:
-            Log.warning(f"[{inst.name}] Force-close ({reason}) holding straddle legs open -- "
-                        f"a repair leg has an unresolved error and must be resolved first.")
-        else:
-            if inst_state.pe.entry_filled:
-                self._close_open_leg(inst, f"{inst.name}_PE", inst_state.pe, "LONG", reason)
-            if inst_state.ce.entry_filled:
-                self._close_open_leg(inst, f"{inst.name}_CE", inst_state.ce, "LONG", reason)
-            # This check happened BEFORE the straddle closes above -- a
-            # repair leg's own background fill-watcher (a fully independent
-            # thread) can set error_state at any wall-clock moment, including
-            # in the narrow window between the check and these close calls.
-            # A re-check here can't undo an already-placed straddle close,
-            # but it surfaces the situation immediately (loudly) instead of
-            # only being noticed whenever someone next looks, since this
-            # exact ordering is what the SHORT-before-LONG guard exists to
-            # prevent.
-            if inst_state.pe_repair.error_state or inst_state.ce_repair.error_state:
-                Log.error(f"[{inst.name}] A repair leg entered error_state during this "
-                          f"force-close pass, AFTER the straddle legs above were already "
-                          f"closed -- verify manually whether the repair leg is now naked.")
-        if inst_state.pe_repair.entry_filled:
-            self._close_open_leg(inst, f"{inst.name}_PE_repair", inst_state.pe_repair, "SHORT", reason)
-        if inst_state.ce_repair.entry_filled:
-            self._close_open_leg(inst, f"{inst.name}_CE_repair", inst_state.ce_repair, "SHORT", reason)
+        """Force-closes every open leg of this instrument, regardless of the
+        strategy's own signal/exit logic -- used by both the universal-exit-
+        time and aggregate-pnl-breach triggers in run_cycle. SHORT (repair)
+        legs are closed BEFORE LONG (straddle) legs, matching
+        _handle_force_exit's SHORT-before-LONG order (2026-08-04: unified --
+        this function previously closed LONG-then-SHORT specifically here).
+        Explicit requirement: eliminate the higher-risk side first. A repair
+        (SHORT) leg is a naked short option with undefined risk; a straddle
+        (LONG) leg's risk is bounded by the premium already paid. If
+        something goes wrong partway through this close sequence (a
+        rejection, a stuck order), the safer residual state is a stuck LONG
+        leg (bounded loss) rather than a stuck naked SHORT leg (unbounded
+        loss)."""
+        # If a repair leg is stuck in error_state, the straddle legs below
+        # must NOT be closed this pass -- otherwise the hedge is removed
+        # while the naked short stays open and unmanaged, exactly what the
+        # SHORT-before-LONG requirement exists to prevent.
+        instrument_blocked = False
+        for leg_key_suffix, leg, direction in (
+            ("PE_repair", inst_state.pe_repair, "SHORT"), ("CE_repair", inst_state.ce_repair, "SHORT"),
+        ):
+            if not leg.entry_filled or leg.closed:
+                continue
+            leg_key = f"{inst.name}_{leg_key_suffix}"
+            if leg.error_state:
+                Log.warning(f"[{leg_key}] Force-close ({reason}) waiting on an unresolved error "
+                            f"({leg.error_state}/{leg.error_kind}) -- resolve it via "
+                            f"Retry/Cancel/Manually Completed first.")
+                instrument_blocked = True
+                continue
+            self._close_open_leg(inst, leg_key, leg, direction, reason)
+            if leg.error_state:
+                # _close_open_leg's place() can fail and enter error mode
+                # DURING this same call -- the check above only reflects this
+                # leg's state BEFORE the call. Without re-checking here, a
+                # place() failure on this exact cycle would leave
+                # instrument_blocked False, and the LONG loop right below
+                # would then close the straddle in the very same pass,
+                # defeating the SHORT-before-LONG guarantee on the first
+                # rejection instead of the (already correct) next cycle.
+                instrument_blocked = True
+
+        for leg_key_suffix, leg, direction in (
+            ("PE", inst_state.pe, "LONG"), ("CE", inst_state.ce, "LONG"),
+        ):
+            if not leg.entry_filled or leg.closed:
+                continue
+            leg_key = f"{inst.name}_{leg_key_suffix}"
+            if instrument_blocked:
+                Log.warning(f"[{leg_key}] Force-close ({reason}) holding this straddle leg open -- "
+                            f"{inst.name}'s repair leg has an unresolved error and must be "
+                            f"resolved first (SHORT-before-LONG requirement).")
+                continue
+            if leg.error_state:
+                Log.warning(f"[{leg_key}] Force-close ({reason}) waiting on an unresolved error "
+                            f"({leg.error_state}/{leg.error_kind}) -- resolve it via "
+                            f"Retry/Cancel/Manually Completed first.")
+                continue
+            self._close_open_leg(inst, leg_key, leg, direction, reason)
 
         # Only mark this instrument fully exited once every entry_filled leg
         # actually closed. _close_open_leg now catches a rejected/cancelled
@@ -2601,13 +2624,14 @@ class StrategyEngine:
         the strategy's own signal/exit logic -- called from run_cycle while a
         Force Exit is pending (see check_force_exit). SHORT (repair) legs are
         closed BEFORE LONG (straddle) legs, per explicit requirement for this
-        button -- distinct from _force_close_instrument's LONG-then-SHORT
-        order (used by the universal-exit-time/aggregate-pnl-breach
-        triggers), which is left unchanged. Reuses _close_open_leg, so it's
-        idempotent/resumable across cycles and a leg already in error mode is
-        left untouched (the user must resolve it via Retry/Cancel/Manual
-        first). Returns True only once every leg is fully flat, which is
-        what lets run_cycle report completion back to the platform."""
+        button -- _force_close_instrument (used by the universal-exit-time/
+        aggregate-pnl-breach triggers) now uses this same SHORT-before-LONG
+        order (2026-08-04: unified; it previously closed LONG-then-SHORT).
+        Reuses _close_open_leg, so it's idempotent/resumable across cycles
+        and a leg already in error mode is left untouched (the user must
+        resolve it via Retry/Cancel/Manual first). Returns True only once
+        every leg is fully flat, which is what lets run_cycle report
+        completion back to the platform."""
         all_flat = True
         for inst in INSTRUMENTS:
             inst_state = self.store.state.instruments[inst.name]
