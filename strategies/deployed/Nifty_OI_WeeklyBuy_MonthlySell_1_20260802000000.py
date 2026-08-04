@@ -121,7 +121,8 @@ per tick; a background thread writes closed trades to
 trades_{STRATEGY_ID}.csv; every entry log line prints the condition values
 that fired it (Reference Time/OI/premium, current OI/premium, verdict).
 
-Product: MIS (intraday). Underlying: NIFTY only. Quantity: 65 (1 lot,
+Product: NRML (see config.product's docstring for why, and its overnight-
+carry trade-off). Underlying: NIFTY only. Quantity: 65 (1 lot,
 NIFTY's current lot size) per leg. Capital tags: Rs 50,000 (Weekly Buy) /
 Rs 2,50,000 (Monthly Sell), for reporting/return-on-capital display only --
 does not gate order sizing.
@@ -214,13 +215,29 @@ class Config:
     weekly_capital_tag: float = 50_000.0     # reporting/return-on-capital display only
     monthly_capital_tag: float = 250_000.0
 
-    product: str = "MIS"
+    # NRML, not MIS (2026-08-04: switched) -- an MIS exit placed at/after the
+    # broker's own 15:15 IST square-off cutoff is rejected outright ("MIS
+    # orders cannot be placed after square-off time"), which is exactly what
+    # weekly/monthly_universal_exit_time = 15:15 below used to race against
+    # every single day. NRML has no such cutoff, so the strategy's own exit
+    # is no longer competing with the broker's RMS for the same instant.
+    # Trade-off: NRML also means no broker-side forced square-off backstop
+    # anymore -- if the strategy's own exit fails for some OTHER reason
+    # (error_state), the position now genuinely carries overnight until a
+    # human resolves it via Retry/Cancel/Manually Completed, instead of the
+    # broker eventually closing it regardless.
+    product: str = "NRML"
     price_type: str = "MARKET"
 
     market_open: time = time(9, 15)
     market_close: time = time(15, 30)
-    weekly_universal_exit_time: time = time(15, 15)   # spec SS5.B
-    monthly_universal_exit_time: time = time(15, 15)
+    # 10 minutes of buffer before market_close (was 15:15, the same instant
+    # as the broker's MIS square-off cutoff -- see product's docstring above;
+    # kept the earlier time even after moving to NRML since poll_fill's
+    # reprice loop can itself take up to ~5 minutes, and that needs to finish
+    # well before the exchange closes at 15:30, not run right up against it).
+    weekly_universal_exit_time: time = time(15, 20)   # spec SS5.B
+    monthly_universal_exit_time: time = time(15, 20)
     # No NEW entries (Weekly or Monthly, either side) from this time onward --
     # existing open legs are still managed/exited normally by their own rules.
     entry_cutoff_time: time = time(14, 45)
@@ -1438,7 +1455,7 @@ class WeeklySideEngine:
         condition values, not just the word "weakening"."""
         return self.engine.latest_weekly_detail.get(self.option_type)
 
-    def evaluate(self):
+    def evaluate(self, new_candle: bool = True):
         if self.leg_key in self.engine._pending_fills:
             return  # a background fill-watcher is already resolving this leg
         pos = self.leg.position
@@ -1458,10 +1475,20 @@ class WeeklySideEngine:
             if not pos.entry_filled:
                 return  # entry order placed but not yet confirmed -- watcher owns it
             if pos.exit_order_id and pos.exit_filled:
+                # The exit fill can confirm on the background watcher thread
+                # within seconds -- this finalize is cheap (in-memory flags
+                # only, no candle/API fetch) so it must run every scheduler
+                # tick, not just on a new candle boundary. Previously this
+                # whole evaluate() was only reachable once per closed 5-min
+                # candle (see run_cycle's old _new_candle_closed() gate),
+                # which delayed "Position closed" / the trade log write / PnL
+                # update by up to a full candle interval after the order had
+                # actually filled (2026-08-04: fixed).
                 self._finalize_exit(pos, pos.pending_exit_reason, pos.pending_exit_reenter)
                 return
-            self._manage_open_position()
-        else:
+            if new_candle:
+                self._manage_open_position()
+        elif new_candle:
             self._evaluate_entry()
 
     def _evaluate_entry(self):
@@ -1690,16 +1717,30 @@ class WeeklySideEngine:
             if was_exit:
                 pos.exit_filled = True
                 pos.manual_exit_px = fill_price
-                # evaluate()'s normal "exit_order_id and exit_filled ->
-                # finalize" path runs next cycle and _finalize_exit prefers
-                # manual_exit_px over the (unset) exit_fill_px.
-            else:
-                pos.entry_filled = True
-                pos.entry_px = fill_price
-                self.leg.trade_count += 1
-                self.engine.price_stream.add_instruments(
-                    [{"symbol": pos.symbol, "exchange": OPTIONS_EXCHANGE}]
-                )
+                pos.error_state = ""
+                pos.error_kind = ""
+                pos.error_order_id = ""
+                self.engine.save_state()
+                self.engine._push_leg_error_bg(self.leg_key, pos, clear=True)
+                ack_pending_action(self.engine.env, self.leg_key)
+                # Finalize right now -- trade log write, PnL update, "Position
+                # closed", price-stream unsubscribe -- rather than setting
+                # exit_filled=True and waiting for evaluate()'s next pass to
+                # notice it. "Manually Completed" means the user is telling
+                # us this trade is already done; the CSV/state must reflect
+                # that immediately, not on some later cycle (2026-08-04:
+                # fixed -- previously left a visible "still open" gap between
+                # marking manual and the leg actually closing). Uses
+                # pos.pending_exit_reason/pending_exit_reenter, the same
+                # values the original (failed) exit trigger recorded.
+                self._finalize_exit(pos, pos.pending_exit_reason, pos.pending_exit_reenter)
+                return
+            pos.entry_filled = True
+            pos.entry_px = fill_price
+            self.leg.trade_count += 1
+            self.engine.price_stream.add_instruments(
+                [{"symbol": pos.symbol, "exchange": OPTIONS_EXCHANGE}]
+            )
             pos.error_state = ""
             pos.error_kind = ""
             pos.error_order_id = ""
@@ -1995,7 +2036,7 @@ class MonthlySideEngine:
     def leg(self) -> LegState:
         return self.engine.state.legs[self.leg_key]
 
-    def evaluate(self):
+    def evaluate(self, new_candle: bool = True):
         if self.leg_key in self.engine._pending_fills:
             return  # a background fill-watcher is already resolving this leg
         pos = self.leg.position
@@ -2011,10 +2052,15 @@ class MonthlySideEngine:
             if not pos.entry_filled:
                 return  # entry order placed but not yet confirmed -- watcher owns it
             if pos.exit_order_id and pos.exit_filled:
+                # See WeeklySideEngine.evaluate()'s matching comment -- this
+                # finalize must run every scheduler tick, not just on a new
+                # candle boundary, or "Position closed" lags the actual fill
+                # by up to one full candle interval (2026-08-04: fixed).
                 self._finalize_exit(pos, pos.pending_exit_reason)
                 return
-            self._manage_open_position()
-        else:
+            if new_candle:
+                self._manage_open_position()
+        elif new_candle:
             self._evaluate_entry()
 
     def _evaluate_entry(self):
@@ -2210,13 +2256,23 @@ class MonthlySideEngine:
             if was_exit:
                 pos.exit_filled = True
                 pos.manual_exit_px = fill_price
-            else:
-                pos.entry_filled = True
-                pos.entry_px = fill_price
-                self.leg.trade_count += 1
-                self.engine.price_stream.add_instruments(
-                    [{"symbol": pos.symbol, "exchange": OPTIONS_EXCHANGE}]
-                )
+                pos.error_state = ""
+                pos.error_kind = ""
+                pos.error_order_id = ""
+                self.engine.save_state()
+                self.engine._push_leg_error_bg(self.leg_key, pos, clear=True)
+                ack_pending_action(self.engine.env, self.leg_key)
+                # See WeeklySideEngine's matching comment -- finalize right
+                # now instead of waiting for evaluate()'s next pass
+                # (2026-08-04: fixed).
+                self._finalize_exit(pos, pos.pending_exit_reason)
+                return
+            pos.entry_filled = True
+            pos.entry_px = fill_price
+            self.leg.trade_count += 1
+            self.engine.price_stream.add_instruments(
+                [{"symbol": pos.symbol, "exchange": OPTIONS_EXCHANGE}]
+            )
             pos.error_state = ""
             pos.error_kind = ""
             pos.error_order_id = ""
@@ -2330,8 +2386,9 @@ class MonthlySideEngine:
         pos = self.leg.position
         # No profit target, no stop-loss -- exactly as specified (plan doc
         # SS7#2). The two exits are 2 consecutive opposite-verdict candles on
-        # this leg's own frozen strike, OR the universal exit time (MIS
-        # intraday -- must not be left open into broker auto-square-off).
+        # this leg's own frozen strike, OR the universal exit time (NRML --
+        # no broker auto-square-off backstop, so this is the ONLY thing that
+        # closes the position; see config.product's docstring).
         if datetime.now(IST).time() >= config.monthly_universal_exit_time:
             ltp = self.engine.price_stream.get_ltp(pos.symbol, OPTIONS_EXCHANGE, config.ws_stale_seconds)
             if ltp is None:
@@ -2470,10 +2527,6 @@ class StrategyEngine:
         # off _fill_executor so a Force Exit check can never queue silently
         # behind a fill watcher stuck for minutes in a reprice loop.
         self._bg_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bg")
-        # Dedicated single worker for report_pnl_to_platform's push, same
-        # non-starvation reasoning -- PnL must never go stale because a fill
-        # watcher is busy.
-        self._pnl_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pnl")
         # _state_lock serializes every state_store.save() call (main thread and
         # background watchers alike) -- StateStore.save() writes the WHOLE state
         # to one shared JSON file, so two concurrent writers could corrupt it.
@@ -2500,6 +2553,9 @@ class StrategyEngine:
         # rather than pure fire-and-forget.
         self._pending_action_cache: dict = {}
         self._pending_action_inflight: set = set()
+        # See _repush_active_errors below -- config.error_repush_interval_sec
+        # existed here unused until 2026-08-04.
+        self._last_error_push: dict[str, datetime] = {}
 
     def save_state(self):
         """Every state_store.save() call in this engine goes through here --
@@ -2642,6 +2698,36 @@ class StrategyEngine:
 
         self._bg_executor.submit(_run)
 
+    def _repush_active_errors(self):
+        """push_leg_error() only fires once, on the transition into
+        error_state -- if that one POST is lost (server busy, transient
+        network blip), the UI's error badge silently never appears even
+        though state.json correctly tracks the error the whole time. Mirrors
+        MCX_CrudeOil_EMA9_RSI_Intraday's fix (production-confirmed
+        2026-07-28: three legs sat in exit_failed for 1-4 hours with no UI
+        error shown) -- config.error_repush_interval_sec already existed
+        here but nothing ever called this until 2026-08-04. Re-pushes at
+        most once per that interval for every leg still in error_state, so a
+        single lost push self-heals within a minute instead of leaving the
+        UI blind indefinitely. Called unconditionally at the top of
+        run_cycle(), every cycle, regardless of market hours/force-exit/etc."""
+        now = datetime.now(IST)
+        for leg_key in LEG_KEYS:
+            pos = self.state.legs[leg_key].position
+            if not pos.error_state:
+                self._last_error_push.pop(leg_key, None)
+                continue
+            last = self._last_error_push.get(leg_key)
+            if last is not None and (now - last).total_seconds() < config.error_repush_interval_sec:
+                continue
+            self._last_error_push[leg_key] = now
+            is_short = leg_key.startswith("MONTHLY_")
+            if pos.error_state == "entry_failed":
+                action = "SELL" if is_short else "BUY"
+            else:
+                action = "BUY" if is_short else "SELL"
+            self._push_leg_error_bg(leg_key, pos, action=action)
+
     def _push_leg_error_bg(self, leg_key: str, pos: "LegPosition", action: str = "", clear: bool = False):
         """Fire-and-forget push_leg_error via _bg_executor -- see the
         __init__ comment on _pending_action_cache for why this must never
@@ -2691,8 +2777,32 @@ class StrategyEngine:
 
     def run_cycle(self):
         try:
+            self._repush_active_errors()
+
             self._refresh_force_exit_check_bg()
             if self._force_exit_pending:
+                # _force_exit_all() leaves any leg already in error_state
+                # untouched (Force Exit doesn't override an unresolved
+                # Retry/Cancel/Manual decision) -- but this branch returns
+                # right after, and while force_exit_pending stays True this
+                # is the ONLY branch that runs. Without checking here too, a
+                # user's Retry/Cancel/Manual click on that errored leg would
+                # never be consumed, permanently deadlocking both the leg and
+                # Force Exit (which can never reach all_flat while that leg
+                # stays errored) until a manual restart. Resolve it first,
+                # same as the per-leg loop inside evaluate(), so a
+                # just-resolved leg can be force-closed in this same cycle by
+                # _force_exit_all right after. Mirrors
+                # MCX_CrudeOil_EMA9_RSI_Intraday's run_cycle (2026-08-04:
+                # ported -- same bug class as the trade-close/manual-complete
+                # delays fixed earlier).
+                for ot in OPTION_TYPES:
+                    for side in (self.weekly[ot], self.monthly[ot]):
+                        if side.leg.position.error_state:
+                            self._refresh_pending_action_bg(side.leg_key)
+                            pending = self._pop_pending_action(side.leg_key)
+                            if pending is not None:
+                                side._resolve_leg_error(pending)
                 if self._force_exit_all():
                     Log.warning("Force Exit complete -- all positions flat.")
                     self._force_exit_pending = False
@@ -2706,19 +2816,34 @@ class StrategyEngine:
             if not self.state.reference.computed:
                 return
 
-            if not self._new_candle_closed():
-                return  # only evaluate once per closed 5-min candle
-
-            self.latest_weekly_detail = {}
+            # A leg whose exit order already filled (confirmed on the
+            # background watcher thread, often within seconds) must be
+            # finalized -- trade log write, PnL update, "Position closed",
+            # price-stream unsubscribe -- the moment that's true, not held
+            # back until the next candle closes. Previously this whole
+            # evaluate() sweep ran only once per closed 5-min candle, which
+            # could delay finalize by up to a full candle interval after the
+            # order had actually filled (2026-08-04: fixed). new_candle
+            # still gates the heavier candle-dependent paths
+            # (_manage_open_position/_evaluate_entry) inside evaluate().
+            new_candle = self._new_candle_closed()
+            if new_candle:
+                self.latest_weekly_detail = {}
             # Weekly BEFORE Monthly, same cycle -- Monthly's same-side gate
             # reads Weekly's freshly-computed verdict from this exact candle
             # (plan doc SS1.4).
             for ot in OPTION_TYPES:
-                self.weekly[ot].evaluate()
+                self.weekly[ot].evaluate(new_candle)
             for ot in OPTION_TYPES:
-                self.monthly[ot].evaluate()
+                self.monthly[ot].evaluate(new_candle)
 
-            self.save_state()
+            # Finalize-exit/error-resolution paths above already persist
+            # their own state changes (see _finalize_exit/_resolve_leg_error)
+            # -- this call only needs to cover the candle-dependent paths'
+            # mutations (e.g. consecutive_opposite), so it stays gated the
+            # same as before to avoid a 30x increase in disk writes.
+            if new_candle:
+                self.save_state()
         except Exception:
             Log.exception("run_cycle failed")
 
@@ -2888,6 +3013,12 @@ class StrategyEngine:
         return open_positions
 
     def report_pnl_tick(self):
+        # Scheduled as its own APScheduler job ("pnl_tick", see main()) with
+        # max_instances=1 -- a slow/timed-out push queues behind itself, not
+        # behind strategy_cycle, so a stalled report_pnl_to_platform() call
+        # never delays the legs' entry/exit evaluation (2026-08-04: dropped
+        # a separate _pnl_executor thread pool that duplicated this
+        # isolation without anything ever submitting work to it).
         try:
             report_pnl_to_platform(self.env, self.state.today_realized_pnl, self._open_positions_for_pnl())
         except Exception:
@@ -2902,9 +3033,29 @@ class StrategyEngine:
         later cycle's evaluate()-style finalize check picks it up here. Only
         acks completion back to the platform once every leg is genuinely
         flat. A leg already in error_state is left untouched -- Force Exit
-        doesn't override an unresolved Retry/Cancel/Manual decision."""
+        doesn't override an unresolved Retry/Cancel/Manual decision.
+
+        MONTHLY (short, naked -- undefined risk) is closed BEFORE WEEKLY
+        (long, premium-capped/bounded risk) on purpose (2026-08-04: was the
+        other way around) -- same risk-priority convention established for
+        Nifty_Sensex_Expiry_Batman's force-close paths this session: when
+        legs must be closed sequentially, close the unbounded-risk leg
+        first."""
         all_flat = True
         for ot in OPTION_TYPES:
+            monthly_pos = self.monthly[ot].leg.position
+            if monthly_pos.error_state:
+                all_flat = False
+            elif monthly_pos.symbol:
+                if monthly_pos.exit_order_id and monthly_pos.exit_filled:
+                    self.monthly[ot]._finalize_exit(monthly_pos, monthly_pos.pending_exit_reason)
+                else:
+                    all_flat = False
+                    if self.monthly[ot].leg_key not in self._pending_fills:
+                        ltp = (self.price_stream.get_ltp(monthly_pos.symbol, OPTIONS_EXCHANGE,
+                                                           config.ws_stale_seconds) or monthly_pos.entry_px)
+                        self.monthly[ot]._exit(monthly_pos, ltp, "force_exit")
+
             weekly_pos = self.weekly[ot].leg.position
             if weekly_pos.error_state:
                 all_flat = False
@@ -2919,19 +3070,6 @@ class StrategyEngine:
                         ltp = (self.price_stream.get_ltp(weekly_pos.symbol, OPTIONS_EXCHANGE,
                                                            config.ws_stale_seconds) or weekly_pos.entry_px)
                         self.weekly[ot]._exit(weekly_pos, ltp, "force_exit", reenter=False)
-
-            monthly_pos = self.monthly[ot].leg.position
-            if monthly_pos.error_state:
-                all_flat = False
-            elif monthly_pos.symbol:
-                if monthly_pos.exit_order_id and monthly_pos.exit_filled:
-                    self.monthly[ot]._finalize_exit(monthly_pos, monthly_pos.pending_exit_reason)
-                else:
-                    all_flat = False
-                    if self.monthly[ot].leg_key not in self._pending_fills:
-                        ltp = (self.price_stream.get_ltp(monthly_pos.symbol, OPTIONS_EXCHANGE,
-                                                           config.ws_stale_seconds) or monthly_pos.entry_px)
-                        self.monthly[ot]._exit(monthly_pos, ltp, "force_exit")
         self.save_state()
         if all_flat:
             ack_force_exit_complete(self.env)
@@ -3049,14 +3187,12 @@ def main():
         price_stream.stop()
         engine._fill_executor.shutdown(wait=False)
         engine._bg_executor.shutdown(wait=False)
-        engine._pnl_executor.shutdown(wait=False)
     except Exception:
         Log.exception("Scheduler stopped unexpectedly -- cleaning up before exit.")
         scheduler.shutdown(wait=False)
         price_stream.stop()
         engine._fill_executor.shutdown(wait=False)
         engine._bg_executor.shutdown(wait=False)
-        engine._pnl_executor.shutdown(wait=False)
         raise
 
 

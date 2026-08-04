@@ -512,24 +512,24 @@ def test_monthly_gate_sees_fresh_weakening_even_on_the_candle_weekly_exits_by_un
         script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
         WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
     )
-    clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY1} 15:15", "%Y-%m-%d %H:%M"))
+    clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY1} 15:20", "%Y-%m-%d %H:%M"))
     engine.state.legs["WEEKLY_CE"].position = script_module.LegPosition(
         symbol=sim.WEEKLY_CE_SYMBOL, quantity=65, entry_px=112.0, entry_filled=True,
         entry_order_id="SIM-entry", reference_oi=50_000.0, reference_premium=100.0,
     )
-    # The last CLOSED candle as of 15:15 is the one timestamped 15:10
+    # The last CLOSED candle as of 15:20 is the one timestamped 15:15
     # (fetch_candle_oi_premium() now discards a candle until its own
     # timestamp + interval <= now). Its OI/premium reading vs. the frozen
     # reference (100/50000) is a clear Weakening quadrant (premium down, OI up).
     client.candles_by_symbol[sim.WEEKLY_CE_SYMBOL] = [
-        {"timestamp": f"{sim.DAY1} 15:10:00+05:30", "open": 100.0, "high": 100.0,
+        {"timestamp": f"{sim.DAY1} 15:15:00+05:30", "open": 100.0, "high": 100.0,
          "low": 85.0, "close": 85.0, "volume": 1000, "oi": 58_000},
     ]
 
     engine.weekly["CE"]._manage_open_position()
     _settle(engine)
 
-    # Universal exit time (15:15) still force-closed the leg as expected --
+    # Universal exit time (15:20) still force-closed the leg as expected --
     # this fix doesn't change WHEN Weekly exits, only whether Monthly's gate
     # got to see the reading first.
     assert engine.state.legs["WEEKLY_CE"].position.symbol == ""
@@ -1021,16 +1021,16 @@ def test_day4_weekly_pe_force_closed_by_universal_exit_time_only(script_module, 
     """No OI-based exit condition and no profit target ever fires in this
     window (see oi_simulation_data.py's Day 4 PE note -- the reading stays
     perpetually Accumulation vs. its own fixed reference, resetting any
-    weakening streak to 0 every cycle) -- confirms 15:15 alone force-closes
+    weakening streak to 0 every cycle) -- confirms 15:20 alone force-closes
     the leg."""
     engine, client, _store = _build_engine(
         script_module, clock, _CSV_CANDLES, "13-Aug-26", "27-Aug-26",
         WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
     )
-    _run_day(script_module, engine, clock, sim.DAY4, "09:15", "15:10")
-    assert engine.state.legs["WEEKLY_PE"].position.symbol == sim.WEEKLY_PE_SYMBOL_DAY4  # still open right up to 15:10
+    _run_day(script_module, engine, clock, sim.DAY4, "09:15", "15:15")
+    assert engine.state.legs["WEEKLY_PE"].position.symbol == sim.WEEKLY_PE_SYMBOL_DAY4  # still open right up to 15:15
 
-    _run_day(script_module, engine, clock, sim.DAY4, "15:15", "15:15")
+    _run_day(script_module, engine, clock, sim.DAY4, "15:20", "15:20")
     pe_orders = [o for o in client.placed_orders if o[0] == sim.WEEKLY_PE_SYMBOL_DAY4]
     assert pe_orders == [
         (sim.WEEKLY_PE_SYMBOL_DAY4, "BUY", 65),
@@ -1045,8 +1045,8 @@ def test_monthly_leg_force_closed_by_universal_exit_time_even_without_opposite_s
     """Monthly has no profit target/stop-loss, and until now had no
     time-based exit at all -- an open Monthly leg with no consecutive
     opposite-verdict streak must still be force-closed by
-    config.monthly_universal_exit_time (MIS intraday, never left open into
-    broker auto-square-off)."""
+    config.monthly_universal_exit_time (NRML -- no broker auto-square-off
+    backstop, so this is the only thing that closes it)."""
     engine, client, _store = _build_engine(
         script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
         WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
@@ -1055,7 +1055,7 @@ def test_monthly_leg_force_closed_by_universal_exit_time_even_without_opposite_s
         symbol=sim.MONTHLY_PE_SYMBOL, quantity=65, entry_px=230.0, entry_filled=True,
         entry_order_id="SIM-entry", reference_oi=70_000.0, reference_premium=230.0,
     )
-    clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY1} 15:15", "%Y-%m-%d %H:%M"))
+    clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY1} 15:20", "%Y-%m-%d %H:%M"))
 
     engine.monthly["PE"].evaluate()
     _settle(engine)
