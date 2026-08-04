@@ -1050,6 +1050,24 @@ else:
     logger.debug("Starting WebSocket proxy")
     start_websocket_proxy(app)
 
+# strategy_reporting: a dedicated subprocess for the /python page's PnL/
+# error/pending-action/force-exit/trade-history traffic, structurally
+# isolated from the main gunicorn+eventlet worker so an unrelated slow
+# endpoint elsewhere (e.g. /traffic) can never stall a running strategy's
+# reporting calls or a user's Retry/Cancel/Manual/Force-Exit click. See
+# strategy_reporting/server.py's module docstring for the full incident this
+# fixes and docs/CUSTOMIZATIONS.md for why blueprints/python_strategy.py
+# itself is deliberately left untouched. Always spawned via subprocess.Popen
+# here (unlike start_websocket_proxy above, this has no separate is_docker
+# branch -- start.sh has no existing standalone-start step for this
+# component to collide with).
+from strategy_reporting.app_integration import start_strategy_reporting_subprocess
+from strategy_reporting.broadcast_bridge import start_broadcast_bridge
+
+logger.debug("Starting strategy_reporting subprocess")
+start_strategy_reporting_subprocess()
+start_broadcast_bridge()
+
 # Start Flask development server with SocketIO support if directly executed
 if __name__ == "__main__":
     host_ip = os.getenv("FLASK_HOST_IP", "127.0.0.1")

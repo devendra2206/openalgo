@@ -1080,6 +1080,32 @@ server {
         proxy_set_header X-Forwarded-Host \$host;
     }
 
+    # Python strategy page -- dedicated subprocess (strategy_reporting), NOT
+    # the main Gunicorn app. Structurally isolates PnL/error/pending-action/
+    # force-exit reporting and Retry/Cancel/Manual/Force-Exit UI actions from
+    # any slow endpoint elsewhere in the main app (confirmed incident:
+    # /traffic/api/stats blocking the single eventlet worker). This ONE rule
+    # covers the whole /python surface -- the subprocess handles reporting/
+    # action/trade-history routes itself and relays everything else
+    # (start/stop/schedule/upload/CRUD) straight through to the unmodified
+    # main app, so nginx only needs this single location, not one per path.
+    location /python {
+        proxy_pass http://127.0.0.1:8766;
+        proxy_http_version 1.1;
+
+        # /python/api/events is a long-lived SSE stream relayed through this
+        # same subprocess -- same buffering/timeout treatment as /ws above.
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        proxy_buffering off;
+
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
+    }
+
     # Main app (Gunicorn UDS)
     location / {
         proxy_pass http://unix:$SOCKET_FILE;

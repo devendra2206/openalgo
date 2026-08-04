@@ -44,6 +44,7 @@ SCOPED_SESSION_MODULES = [
     ("database.strategy_book_db", "db_session"),
     ("database.oauth_db", "db_session"),
     ("database.whatsapp_db", "db_session"),
+    ("database.strategy_reporting_db", "db_session"),
 ]
 
 

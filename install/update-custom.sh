@@ -40,11 +40,11 @@ LIVE_SCRIPTS_DIR="$OPENALGO_PATH/strategies/scripts"
 WEB_USER="www-data"
 WEB_GROUP="www-data"
 
-echo -e "${BLUE}=== [1/4] Running official OpenAlgo update.sh ===${NC}"
+echo -e "${BLUE}=== [1/5] Running official OpenAlgo update.sh ===${NC}"
 sudo "$OPENALGO_PATH/install/update.sh"
 
 echo ""
-echo -e "${BLUE}=== [2/4] Rebuilding frontend ===${NC}"
+echo -e "${BLUE}=== [2/5] Rebuilding frontend ===${NC}"
 if ! command -v npm >/dev/null 2>&1; then
     echo -e "${RED}  npm not found -- cannot rebuild frontend/dist.${NC}"
     echo -e "${YELLOW}  Install Node.js (see frontend/package.json 'engines'), then re-run this script.${NC}"
@@ -60,7 +60,7 @@ else
 fi
 
 echo ""
-echo -e "${BLUE}=== [3/4] Deploying tracked strategy scripts ===${NC}"
+echo -e "${BLUE}=== [3/5] Deploying tracked strategy scripts ===${NC}"
 if [ -d "$DEPLOYED_SCRIPTS_DIR" ]; then
     deployed_count=0
     for f in "$DEPLOYED_SCRIPTS_DIR"/*.py; do
@@ -80,7 +80,72 @@ else
 fi
 
 echo ""
-echo -e "${BLUE}=== [4/4] Manual step required ===${NC}"
+echo -e "${BLUE}=== [4/5] Patching nginx for the strategy_reporting subprocess ===${NC}"
+# Idempotent: adds a "location /python { proxy_pass http://127.0.0.1:8766; ... }"
+# block (see install/install.sh's own template for the canonical version) so
+# the whole /python surface routes to the dedicated strategy_reporting
+# subprocess instead of the main app -- see strategy_reporting/server.py's
+# module docstring for why. Safe to re-run: skips if the block is already
+# present, and rolls back automatically if the patched config fails
+# `nginx -t` (never leaves the live site broken).
+NGINX_MARKER="location /python {"
+NGINX_CONF=$(sudo grep -rl "proxy_pass http://unix:" /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null | head -1)
+
+if [ -z "$NGINX_CONF" ]; then
+    echo -e "${YELLOW}  Could not auto-detect the live nginx config file (looked in"
+    echo "  /etc/nginx/sites-available and /etc/nginx/conf.d for a proxy_pass to"
+    echo "  the app's Unix socket). Add this block to your nginx server {} block"
+    echo "  yourself, before the main 'location /' block, then 'nginx -t && systemctl"
+    echo "  reload nginx' -- see install/install.sh's own /python location block for"
+    echo "  the exact, up-to-date version to copy.${NC}"
+elif sudo grep -qF "$NGINX_MARKER" "$NGINX_CONF"; then
+    echo -e "${GREEN}  Already present in $NGINX_CONF -- nothing to do.${NC}"
+else
+    BACKUP="${NGINX_CONF}.bak-$(date +%Y%m%d%H%M%S)"
+    sudo cp "$NGINX_CONF" "$BACKUP"
+    echo "  Backed up $NGINX_CONF -> $BACKUP"
+
+    # Insert right before the first "location / {" (the main app's catch-all),
+    # matching install.sh's own placement -- nginx needs the more specific
+    # /python block ahead of the generic catch-all.
+    sudo python3 - "$NGINX_CONF" << 'PYEOF'
+import re, sys
+
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+block = """    location /python {
+        proxy_pass http://127.0.0.1:8766;
+        proxy_http_version 1.1;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        proxy_buffering off;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+    }
+
+"""
+new_content = re.sub(r"( *)location / \{", block + r"\1location / {", content, count=1)
+with open(path, "w") as f:
+    f.write(new_content)
+PYEOF
+
+    if sudo nginx -t 2>/dev/null; then
+        sudo systemctl reload nginx
+        echo -e "${GREEN}  Patched $NGINX_CONF and reloaded nginx.${NC}"
+    else
+        echo -e "${RED}  Patched config failed 'nginx -t' -- restoring backup, nginx untouched.${NC}"
+        sudo cp "$BACKUP" "$NGINX_CONF"
+        echo -e "${YELLOW}  Add the block manually -- see install/install.sh's /python location block.${NC}"
+    fi
+fi
+
+echo ""
+echo -e "${BLUE}=== [5/5] Manual step required ===${NC}"
 echo -e "${YELLOW}"
 echo "update.sh restarted the Flask app/service -- it does NOT restart the"
 echo "individual strategy subprocesses, which only pick up the deployed"

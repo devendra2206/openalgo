@@ -1373,33 +1373,25 @@ def append_trade_log(strategy_tag: str, leg_key: str, symbol: str, quantity: int
                           entry_time, entry_px, exit_time, exit_px, exit_reason, execution_id))
 
 
-class _UnixHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, socket_path: str, timeout: float = 3.0):
-        super().__init__("localhost", timeout=timeout)
-        self._socket_path = socket_path
-
-    def connect(self):
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(self.timeout)
-        sock.connect(self._socket_path)
-        self.sock = sock
 
 
 def _post_json_local(env: "Environment", path: str, payload: bytes, timeout: float = 3.0):
+    """POST to the dedicated strategy_reporting subprocess -- trying in
+    order: (1) plain TCP loopback on STRATEGY_REPORTING_PORT (default
+    8766); (2) env.host (HOST_SERVER/OPENALGO_HOST), routed through
+    nginx's /python location block to the same subprocess, as a last
+    resort only. 2026-08-05: moved off the main app's openalgo.sock/
+    FLASK_PORT -- these reporting calls used to share the single
+    gunicorn+eventlet worker with every other route in the app, so an
+    unrelated slow endpoint elsewhere (confirmed in production:
+    /traffic/api/stats) could block the worker long enough that these
+    timed out even though nothing about the strategy was wrong. The
+    dedicated subprocess is immune to that by construction (a separate
+    process, plain OS threads, not eventlet). Raises if every transport
+    fails; caller logs and swallows."""
     headers = {"Content-Type": "application/json"}
-
-    socket_path = Path(__file__).resolve().parents[2] / "openalgo.sock"
-    if socket_path.exists():
-        conn = _UnixHTTPConnection(str(socket_path), timeout=timeout)
-        try:
-            conn.request("POST", path, body=payload, headers=headers)
-            conn.getresponse().read()
-            return
-        finally:
-            conn.close()
-
     last_exc: Optional[Exception] = None
-    for base in (f"http://127.0.0.1:{os.getenv('FLASK_PORT', '5000')}", env.host.rstrip("/")):
+    for base in (f"http://127.0.0.1:{os.getenv('STRATEGY_REPORTING_PORT', '8766')}", env.host.rstrip("/")):
         try:
             req = urllib.request.Request(f"{base}{path}", data=payload, method="POST", headers=headers)
             urllib.request.urlopen(req, timeout=timeout).close()
@@ -1430,18 +1422,14 @@ def report_pnl_to_platform(env: "Environment", realized_pnl: float, open_positio
 
 
 def _get_json_local(env: "Environment", path: str, timeout: float = 3.0) -> dict:
-    socket_path = Path(__file__).resolve().parents[2] / "openalgo.sock"
-    if socket_path.exists():
-        conn = _UnixHTTPConnection(str(socket_path), timeout=timeout)
-        try:
-            conn.request("GET", path)
-            resp = conn.getresponse()
-            return json.loads(resp.read())
-        finally:
-            conn.close()
-
+    """GET counterpart to _post_json_local -- same STRATEGY_REPORTING_PORT
+    -> env.host fallback chain (2026-08-05: see that function's docstring
+    for why this moved off the main app's openalgo.sock/FLASK_PORT).
+    Raises if every transport fails; caller treats it as "no action
+    pending" rather than crashing the scheduler loop over a reporting
+    hiccup."""
     last_exc: Optional[Exception] = None
-    for base in (f"http://127.0.0.1:{os.getenv('FLASK_PORT', '5000')}", env.host.rstrip("/")):
+    for base in (f"http://127.0.0.1:{os.getenv('STRATEGY_REPORTING_PORT', '8766')}", env.host.rstrip("/")):
         try:
             with urllib.request.urlopen(f"{base}{path}", timeout=timeout) as resp:
                 return json.loads(resp.read())

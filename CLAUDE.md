@@ -86,6 +86,17 @@ and the cache-invalidation publisher (`database/cache_invalidation.py`).
 - **`ZMQ_PORT` is fixed by config and never drifts.** No port scan, no `5555 -> 5556` fallback, no runtime mutation of `os.environ["ZMQ_PORT"]`. `install-multi.sh` gives each instance its own `ZMQ_PORT` (`5555 + i-1`) and each stays put.
 - **Why:** under gunicorn+eventlet the proxy runs *out of process* (a subprocess via `install.sh`, or a separate `python -m websocket_proxy.server` on Docker `start.sh`) while the cache-invalidation publisher runs inside gunicorn. If a publisher binds, the two processes race for the port; the loser silently slides to the next port while the SUB stays put, so **`subscribe` succeeds but no ticks are delivered**. Works on the single-process dev server, broken only under eventlet — historically very hard to spot. Broker-agnostic.
 
+**A second, independent instance of this same shape** exists for the `/python`
+strategy page's reporting subprocess (`ZMQ_REPORTING_PORT`, default 5565,
+fork-only): the main gunicorn process binds the SUB (`strategy_reporting/broadcast_bridge.py`),
+and the `strategy_reporting` subprocess CONNECTs a PUB to it — reversed roles
+from the market-data bus (there, gunicorn's cache-invalidation code is a PUB;
+here, it's the SUB), but the same "one binder, many connecting publishers"
+rule applies: never make `strategy_reporting/server.py`'s publisher bind, and
+never let `ZMQ_REPORTING_PORT` drift. Kept on a completely separate port from
+`ZMQ_PORT` (including `install-multi.sh`'s per-instance offset ranges for
+both) precisely so the two buses can never collide.
+
 ### Multi-session login must not tear down the shared broker feed
 
 OpenAlgo is single-user, but the same user may be logged in from **multiple
@@ -147,7 +158,9 @@ Session cleanup runs in `teardown_appcontext` after the response is sent.
 `analyzer_update`, `cache_loaded`. The React frontend subscribes to these for
 live dashboards.
 
-Ports: app 5000, WebSocket proxy 8765, ZeroMQ 5555.
+Ports: app 5000, WebSocket proxy 8765, ZeroMQ 5555, strategy_reporting
+subprocess 8766, its own ZeroMQ bus 5565 (fork-only, see the ZeroMQ bus
+invariant above).
 
 Two built-in pages exercise the streaming stack end to end: **`/websocket/test`**
 (market data; `/20`, `/30`, `/50` variants request those depth levels) and

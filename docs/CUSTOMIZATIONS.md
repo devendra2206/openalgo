@@ -237,11 +237,23 @@ added/changed something in the *existing* start/stop/schedule endpoints above
 or below where these new ones were inserted — the new endpoints themselves are
 additive and shouldn't semantically conflict with anything upstream does.
 
-**Not yet done (documented, not shipped):** extracting all of the above into a
-separate file (e.g. `blueprints/python_strategy_pnl_force_exit.py`) that
-registers routes on the same `python_strategy_bp` via import side-effect,
-shrinking this file's diff down to a single import line. Discussed and agreed
-as the next step when there's time — see the corresponding conversation entry.
+**2026-08-05 — superseded by `strategy_reporting/` (see its own section
+below), a bigger change than the same-process file-split originally
+discussed here.** Root cause: `/traffic/api/stats` (57 sequential SQLite
+queries) blocked the single gunicorn+eventlet worker long enough that
+strategy subprocesses' PnL/error/pending-action/force-exit reporting calls
+timed out — confirmed live even on a strategy script with the best available
+client-side isolation, proving a same-process file split alone (which only
+reduces future merge diff size, not runtime coupling) wouldn't have fixed
+the actual incident. `strategy_reporting/` runs these routes in a genuinely
+separate OS process instead. **This file (`blueprints/python_strategy.py`)
+itself received ZERO changes as part of that work** — deliberately, per the
+"file most likely to see upstream churn" note above; `strategy_reporting/`
+relays every other `/python/*` request straight through to this file
+unchanged, and reaches its still-in-process `broadcast_*`/
+`stop_strategy_process` functions via a new ZMQ bridge rather than an
+import. So the merge-conflict profile documented above is completely
+unaffected either way.
 
 **2026-07-30 follow-up — stagger multiple strategies' auto-start so they
 don't all subscribe to shared symbols in the same instant.** Companion fix
@@ -274,6 +286,85 @@ instant (or the same 0.15s Fyers HSM batch window,
 Covered by 6 new tests in `test/test_python_strategy_edge_cases.py`
 (offset determinism/ordering, `CronTrigger.second` wiring, and the
 sleep-between-not-before-first behavior via a monkeypatched `sleep`).
+
+---
+
+## `strategy_reporting/` (new package, fork-only, 2026-08-05)
+
+**Why:** `/traffic/api/stats` runs ~57 sequential SQLite queries per call
+(`NullPool` — a fresh connection per query). Under gunicorn+eventlet, which
+only yields at monkey-patched socket I/O (not SQLite/file I/O), that
+endpoint blocks the single worker for its full multi-second duration —
+during which strategy subprocesses' own loopback reporting calls
+(`report_pnl_to_platform`, `check_pending_action`, `check_force_exit`, etc.)
+timed out, confirmed live in production even on a strategy script that
+already had the best available client-side isolation (a separate
+APScheduler job, backgrounded platform calls). A same-process fix (reducing
+that one endpoint's query count) removes the specific trigger; it doesn't
+protect against the next slow endpoint. The user chose the structural fix.
+
+**What it is:** a genuinely separate OS process
+(`strategy_reporting/server.py`, spawned from `app.py` exactly like
+`websocket_proxy/app_integration.py`'s `_spawn_websocket_subprocess()` —
+same `subprocess.Popen`/`atexit`/SIGTERM→SIGKILL shape), running a plain
+threaded WSGI server (`werkzeug.serving.run_simple(..., threaded=True)`,
+deliberately not eventlet — no Socket.IO involvement in this process, so
+eventlet's usual justification doesn't apply, and plain OS threads mean
+nothing that ever blocks the main gunicorn worker can affect this one).
+
+It implements locally (own DB tables, own dual auth — API-key for
+subprocess calls via `database.auth_db.verify_api_key`, session-cookie for
+browser calls via `utils.session.check_session_validity` configured with
+the same `APP_KEY` so it validates the identical signed cookie) exactly the
+routes that were actually timing out: PnL push/read, leg-error push/read,
+pending Retry/Cancel/Manual actions, Force Exit request/poll/complete, and
+trade/execution/PnL history reads. **Everything else under `/python/*`**
+(start/stop/schedule/upload/CRUD, logs, status, the SSE stream itself) is
+relayed unchanged to the unmodified main process — see the
+`blueprints/python_strategy.py` section above for why that file was
+deliberately left untouched rather than migrated. One nginx rule
+(`location /python { proxy_pass http://127.0.0.1:8766; }` — see
+`install/install.sh`/`install/install-multi.sh`) routes the whole `/python`
+prefix here; the subprocess does the local-vs-relay dispatch internally.
+
+**New shared state:** `database/strategy_reporting_db.py` — `StrategyPnl`,
+`StrategyLegError`, `StrategyPendingAction`, `StrategyForceExit` tables in
+the same `openalgo.db` (via `create_db_engine()`, matching
+`database/scalping_db.py`'s precedent — no separate DB file needed for this
+amount of state). Replaces what used to be in-process dicts
+(`STRATEGY_PNL`/`STRATEGY_ERRORS`/`STRATEGY_ACTIONS`/`STRATEGY_FORCE_EXIT`
+in `blueprints/python_strategy.py`) — those dicts' *code* in
+`blueprints/python_strategy.py` is untouched (unreachable dead weight from
+nginx's perspective, harmless, not worth the diff to remove) since that
+file was never edited.
+
+**New ZMQ bus** (`ZMQ_REPORTING_PORT`, default 5565, see `CLAUDE.md`'s
+ZeroMQ bus section) so the new subprocess can tell the main process to (a)
+broadcast a live SSE update via the still-unchanged `broadcast_pnl_update`/
+`broadcast_error_update`/`broadcast_trade_update`/`broadcast_status_update`
+functions, or (b) actually stop a strategy's OS process after a completed
+Force Exit via the still-unchanged `stop_strategy_process` — both called
+from `strategy_reporting/broadcast_bridge.py` (runs inside the main
+process, started from `app.py`, real OS thread via this fork's established
+`eventlet.patcher.original("threading")` escape hatch) rather than
+imported into the new subprocess, since only the main process holds the
+actual Popen handle / SSE subscriber list.
+
+**Strategy scripts** (`strategies/deployed/*.py`, all 7): `_post_json_local`/
+`_get_json_local` retarget from `openalgo.sock`/`FLASK_PORT` to
+`STRATEGY_REPORTING_PORT` (default 8766, TCP loopback only — no Unix socket
+for this component, see `server.py`'s `main()` for why) for exactly the 6
+reporting calls. The now-unused `_UnixHTTPConnection` class was removed
+from all 7 (confirmed dead — see `strategies/deployed/AUTHORING_CHECKLIST.md`).
+
+**Known gap:** Docker deployment (`install/install-docker.sh`) uses
+Docker Compose service names as nginx upstream targets and has no
+`docker-compose.yml` checked into this repo (generated by the install
+script) — adding `strategy_reporting` there needs its own container/service
+definition this work didn't attempt, since it couldn't be validated without
+a real Docker environment. Direct/systemd installs (`install.sh`,
+`install-multi.sh`) and this fork's own `update-custom.sh` are fully
+covered.
 
 ---
 

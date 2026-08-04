@@ -118,6 +118,8 @@ REPO_URL="https://github.com/marketcalls/openalgo.git"
 FLASK_PORT_BASE=5000
 WS_PORT_BASE=8765
 ZMQ_PORT_BASE=5555
+STRATEGY_REPORTING_PORT_BASE=8766
+ZMQ_REPORTING_PORT_BASE=5565
 
 # Arrays to store instance configurations
 declare -a DOMAINS
@@ -283,6 +285,8 @@ for ((i=1; i<=INSTANCES; i++)); do
     FLASK_PORT=$((FLASK_PORT_BASE + i - 1))
     WS_PORT=$((WS_PORT_BASE + i - 1))
     ZMQ_PORT=$((ZMQ_PORT_BASE + i - 1))
+    STRATEGY_REPORTING_PORT=$((STRATEGY_REPORTING_PORT_BASE + i - 1))
+    ZMQ_REPORTING_PORT=$((ZMQ_REPORTING_PORT_BASE + i - 1))
 
     # Clone or update repository
     if [ ! -d "$INSTANCE_DIR" ]; then
@@ -352,6 +356,8 @@ for ((i=1; i<=INSTANCES; i++)); do
     sudo sed -i "s|FLASK_PORT='[0-9]*'|FLASK_PORT='$FLASK_PORT'|g" "$ENV_FILE"
     sudo sed -i "s|WEBSOCKET_PORT='[0-9]*'|WEBSOCKET_PORT='$WS_PORT'|g" "$ENV_FILE"
     sudo sed -i "s|ZMQ_PORT='[0-9]*'|ZMQ_PORT='$ZMQ_PORT'|g" "$ENV_FILE"
+    sudo sed -i "s|STRATEGY_REPORTING_PORT='[0-9]*'|STRATEGY_REPORTING_PORT='$STRATEGY_REPORTING_PORT'|g" "$ENV_FILE"
+    sudo sed -i "s|ZMQ_REPORTING_PORT='[0-9]*'|ZMQ_REPORTING_PORT='$ZMQ_REPORTING_PORT'|g" "$ENV_FILE"
 
     # 4. Update WebSocket URL for production (secure WebSocket through nginx)
     sudo sed -i "s|WEBSOCKET_URL='.*'|WEBSOCKET_URL='wss://$DOMAIN/ws'|g" "$ENV_FILE"
@@ -540,6 +546,22 @@ server {
         proxy_buffering off;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    # Python strategy page -- dedicated per-instance subprocess
+    # (strategy_reporting), NOT the main Gunicorn app. See install.sh's own
+    # /python location block / strategy_reporting/server.py's module
+    # docstring for why.
+    location /python {
+        proxy_pass http://127.0.0.1:$STRATEGY_REPORTING_PORT;
+        proxy_http_version 1.1;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        proxy_buffering off;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;

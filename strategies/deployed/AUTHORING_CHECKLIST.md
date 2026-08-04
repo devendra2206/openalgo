@@ -156,6 +156,21 @@ cycle. `EMA34_RSI` and `Pivot_Supertrend` had this bug live in
 `run_cycle` per-leg loops — meaning it fired on *every single cycle* any leg
 sat in `error_state`, not just rarely.
 
+- [ ] **`_post_json_local`/`_get_json_local` target `STRATEGY_REPORTING_PORT`
+  (default 8766), not `FLASK_PORT`/`openalgo.sock`.** As of 2026-08-05, PnL
+  push, leg-error push, pending-action poll/ack, and Force Exit
+  poll/complete are served by a dedicated `strategy_reporting` subprocess
+  (see `docs/CUSTOMIZATIONS.md`'s `strategy_reporting/` section and
+  `strategy_reporting/server.py`'s module docstring), not the main
+  gunicorn app — this is what made the executor-backgrounding items below
+  a defense-in-depth measure rather than the only line of defense: even a
+  fully synchronous call to the wrong target here would no longer share a
+  worker with unrelated main-app traffic like `/traffic/api/stats`. Copy
+  the fallback chain from any already-migrated script (e.g. MCX's
+  `_post_json_local`), don't reintroduce a `openalgo.sock` check for these
+  6 calls — that socket belongs to the main app, not this subprocess (which
+  is TCP-loopback only, see `server.py`'s `main()` for why no Unix socket).
+
 - [ ] A dedicated single-worker executor exists for this purpose (any name
   is fine — `_bg_executor`, `_pnl_executor`, `_signal_executor` are all
   used across the existing scripts; reuse whichever one already exists in
