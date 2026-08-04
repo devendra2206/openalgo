@@ -105,9 +105,16 @@ else
     sudo cp "$NGINX_CONF" "$BACKUP"
     echo "  Backed up $NGINX_CONF -> $BACKUP"
 
-    # Insert right before the first "location / {" (the main app's catch-all),
-    # matching install.sh's own placement -- nginx needs the more specific
-    # /python block ahead of the generic catch-all.
+    # Insert right before the main app's own catch-all "location / {
+    # proxy_pass http://unix:...}" block -- NOT just the first "location / {"
+    # in the file. A plain-HTTP config typically has TWO server{} blocks (a
+    # port-80 one that only redirects to HTTPS, and the real port-443 one),
+    # and the port-80 block's own "location / { return 301 ...}" comes first
+    # textually -- matching on the first occurrence silently patches the
+    # unreachable redirect-only server instead of the one actually serving
+    # traffic (2026-08-05 incident: every /python/* request kept falling
+    # through to the OLD, un-migrated blueprint route with no visible nginx
+    # error, since the patched-but-wrong block still passed `nginx -t`).
     sudo python3 - "$NGINX_CONF" << 'PYEOF'
 import re, sys
 
@@ -129,12 +136,34 @@ block = """    location /python {
     }
 
 """
-new_content = re.sub(r"( *)location / \{", block + r"\1location / {", content, count=1)
+
+pattern = re.compile(r"( *)location / \{[^}]*\}", re.DOTALL)
+found = False
+
+
+def repl(m):
+    global found
+    if not found and "proxy_pass http://unix:" in m.group(0):
+        found = True
+        return block + m.group(0)
+    return m.group(0)
+
+
+new_content = pattern.sub(repl, content)
+if not found:
+    print("Could not find the unix-socket location / block -- leaving nginx config unchanged.")
+    sys.exit(1)
+
 with open(path, "w") as f:
     f.write(new_content)
 PYEOF
+    PATCH_STATUS=$?
 
-    if sudo nginx -t 2>/dev/null; then
+    if [ "$PATCH_STATUS" -ne 0 ]; then
+        echo -e "${YELLOW}  Could not locate the app's own location / block -- config left"
+        echo "  unchanged. Add the /python block manually -- see install/install.sh's"
+        echo -e "  /python location block for the exact version to copy.${NC}"
+    elif sudo nginx -t 2>/dev/null; then
         sudo systemctl reload nginx
         echo -e "${GREEN}  Patched $NGINX_CONF and reloaded nginx.${NC}"
     else
