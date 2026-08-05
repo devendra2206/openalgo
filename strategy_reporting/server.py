@@ -34,7 +34,9 @@ prefix here with one rule while the actual lifecycle logic stays untouched.
 import csv
 import json
 import os
+import random
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -42,6 +44,7 @@ import httpx
 import pytz
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request, session, stream_with_context
+from sqlalchemy.exc import OperationalError
 
 # Load .env before any module that reads env vars at import time (mirrors
 # websocket_proxy/server.py's own standalone-subprocess bootstrap).
@@ -159,6 +162,42 @@ def _shutdown_db_session(exception=None):
     a different cache state. Mirrors app.py's own
     shutdown_database_sessions teardown_appcontext for the main app."""
     db_session.remove()
+
+
+def _write_with_retry(unit_of_work, max_attempts=5):
+    """Run `unit_of_work()` -- a no-arg callable that does its own fresh
+    read(s), mutation(s), and a single db_session.commit() -- retrying from
+    scratch on a SQLite "database is locked" error.
+
+    2026-08-05 incident: with 7 deployed strategies each pushing PnL every
+    ~0.8-1s against the same openalgo.db, api_push_pnl's read-then-commit
+    (db_session.get() followed later by db_session.commit(), same
+    transaction/connection for its whole duration under NullPool) started
+    hitting sqlite3.OperationalError: database is locked in production.
+    database/__init__.py's busy_timeout=15000 pragma does NOT help here --
+    per that module's own docstring, a WAL snapshot conflict (a stale read
+    snapshot vs. a newer commit from a concurrent writer) returns
+    immediately regardless of busy_timeout; only re-running the whole
+    transaction against a FRESH snapshot fixes it, which is exactly why
+    `unit_of_work` must re-do its own read, not just retry the commit.
+
+    Every write route in this file follows this same get-then-commit shape
+    (7 commit sites) and pushes/acks fire from independent strategy
+    processes with no coordination between them, so all of them share this
+    risk as the number of concurrently-running strategies grows -- this
+    wraps all of them, not just the highest-frequency one."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            unit_of_work()
+            return
+        except OperationalError as e:
+            db_session.rollback()
+            if "database is locked" not in str(e).lower() or attempt == max_attempts:
+                raise
+            # Small jittered backoff -- long enough to let the current
+            # writer elsewhere finish its commit, short enough that even
+            # max_attempts retries stay well under any caller's own timeout.
+            time.sleep(0.05 * attempt + random.uniform(0, 0.05))
 
 
 ###############################################################################
@@ -298,14 +337,17 @@ def api_push_pnl(strategy_id):
         return jsonify({"status": "error", "message": "realized_pnl/unrealized_pnl must be numeric"}), 400
     open_positions = data.get("open_positions") or []
 
-    row = db_session.get(StrategyPnl, strategy_id)
-    if row is None:
-        row = StrategyPnl(strategy_id=strategy_id)
-        db_session.add(row)
-    row.realized_pnl = realized_pnl
-    row.unrealized_pnl = unrealized_pnl
-    row.open_positions = json.dumps(open_positions)
-    db_session.commit()
+    def _do_write():
+        row = db_session.get(StrategyPnl, strategy_id)
+        if row is None:
+            row = StrategyPnl(strategy_id=strategy_id)
+            db_session.add(row)
+        row.realized_pnl = realized_pnl
+        row.unrealized_pnl = unrealized_pnl
+        row.open_positions = json.dumps(open_positions)
+        db_session.commit()
+
+    _write_with_retry(_do_write)
 
     _publish_bridge_event({"type": "pnl_update", "strategy_id": strategy_id})
     return jsonify({"status": "success"})
@@ -338,27 +380,31 @@ def api_push_leg_error(strategy_id):
     if not leg_key:
         return jsonify({"status": "error", "message": "leg_key is required"}), 400
 
-    existing = (
-        db_session.query(StrategyLegError)
-        .filter_by(strategy_id=strategy_id, leg_key=leg_key)
-        .first()
-    )
-    if data.get("clear"):
-        if existing:
-            db_session.delete(existing)
+    def _do_write():
+        existing = (
+            db_session.query(StrategyLegError)
+            .filter_by(strategy_id=strategy_id, leg_key=leg_key)
+            .first()
+        )
+        if data.get("clear"):
+            if existing:
+                db_session.delete(existing)
+                db_session.commit()
+        else:
+            if existing is None:
+                new_row = StrategyLegError(strategy_id=strategy_id, leg_key=leg_key)
+                db_session.add(new_row)
+                existing = new_row
+            existing.error_state = data.get("error_state", "")
+            existing.error_kind = data.get("error_kind", "")
+            existing.error_message = data.get("error_message", "")
+            existing.error_since = data.get("error_since", "")
+            existing.symbol = data.get("symbol", "")
+            existing.quantity = data.get("quantity", 0)
+            existing.action = data.get("action", "")
             db_session.commit()
-    else:
-        if existing is None:
-            existing = StrategyLegError(strategy_id=strategy_id, leg_key=leg_key)
-            db_session.add(existing)
-        existing.error_state = data.get("error_state", "")
-        existing.error_kind = data.get("error_kind", "")
-        existing.error_message = data.get("error_message", "")
-        existing.error_since = data.get("error_since", "")
-        existing.symbol = data.get("symbol", "")
-        existing.quantity = data.get("quantity", 0)
-        existing.action = data.get("action", "")
-        db_session.commit()
+
+    _write_with_retry(_do_write)
 
     _publish_bridge_event({
         "type": "error_update", "strategy_id": strategy_id, "leg_key": leg_key,
@@ -441,10 +487,13 @@ def api_ack_pending_action(strategy_id):
     if not ok:
         return err_or_config
 
-    db_session.query(StrategyPendingAction).filter_by(
-        strategy_id=strategy_id, leg_key=leg_key
-    ).delete()
-    db_session.commit()
+    def _do_write():
+        db_session.query(StrategyPendingAction).filter_by(
+            strategy_id=strategy_id, leg_key=leg_key
+        ).delete()
+        db_session.commit()
+
+    _write_with_retry(_do_write)
     return jsonify({"status": "success"})
 
 
@@ -470,17 +519,20 @@ def api_post_leg_action(strategy_id):
         if fill_price <= 0:
             return jsonify({"status": "error", "message": "fill_price must be a positive number for a manual resolution"}), 400
 
-    row = (
-        db_session.query(StrategyPendingAction)
-        .filter_by(strategy_id=strategy_id, leg_key=leg_key)
-        .first()
-    )
-    if row is None:
-        row = StrategyPendingAction(strategy_id=strategy_id, leg_key=leg_key)
-        db_session.add(row)
-    row.action = action
-    row.fill_price = fill_price
-    db_session.commit()
+    def _do_write():
+        row = (
+            db_session.query(StrategyPendingAction)
+            .filter_by(strategy_id=strategy_id, leg_key=leg_key)
+            .first()
+        )
+        if row is None:
+            row = StrategyPendingAction(strategy_id=strategy_id, leg_key=leg_key)
+            db_session.add(row)
+        row.action = action
+        row.fill_price = fill_price
+        db_session.commit()
+
+    _write_with_retry(_do_write)
 
     return jsonify({"status": "success"})
 
@@ -504,12 +556,15 @@ def api_request_force_exit(strategy_id):
     # sits unconsumed. The UI itself only shows the Force Exit button for a
     # strategy it already knows is running, so this path isn't reachable in
     # normal use either way.
-    row = db_session.get(StrategyForceExit, strategy_id)
-    if row is None:
-        row = StrategyForceExit(strategy_id=strategy_id)
-        db_session.add(row)
-    row.status = "pending"
-    db_session.commit()
+    def _do_write():
+        row = db_session.get(StrategyForceExit, strategy_id)
+        if row is None:
+            row = StrategyForceExit(strategy_id=strategy_id)
+            db_session.add(row)
+        row.status = "pending"
+        db_session.commit()
+
+    _write_with_retry(_do_write)
     return jsonify({"status": "success", "message": "Force exit requested"})
 
 
@@ -534,8 +589,11 @@ def api_complete_force_exit(strategy_id):
     if not ok:
         return err_or_config
 
-    db_session.query(StrategyForceExit).filter_by(strategy_id=strategy_id).delete()
-    db_session.commit()
+    def _do_write():
+        db_session.query(StrategyForceExit).filter_by(strategy_id=strategy_id).delete()
+        db_session.commit()
+
+    _write_with_retry(_do_write)
 
     # The actual OS-process stop only the MAIN process can do (it alone
     # holds the Popen handle) -- see strategy_reporting/broadcast_bridge.py.
@@ -752,8 +810,23 @@ def api_get_trades(strategy_id):
 
 _HOP_BY_HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade", "content-length", "host",
+    "te", "trailers", "transfer-encoding", "upgrade", "content-length",
 }
+
+# "host" was in the strip set above until 2026-08-05 -- it is NOT actually a
+# hop-by-hop header (RFC 7230's list is Connection/Keep-Alive/Proxy-*/TE/
+# Trailers/Transfer-Encoding/Upgrade only). Stripping it meant the relay let
+# httpx derive its own Host header from MAIN_APP_BASE ("openalgo-app", the
+# dummy placeholder used for the UDS transport -- see MAIN_APP_BASE above)
+# instead of forwarding the browser's real Host (algodev.co.in, correctly
+# preserved by nginx's own proxy_set_header Host $host on the way in).
+# Flask-WTF's CSRF protection compares the Referer header's origin against
+# request.host -- with Host silently rewritten to "openalgo-app" but Referer
+# still "https://algodev.co.in/...", every CSRF-protected relayed POST (e.g.
+# /stop/<id>, /start/<id>) failed with "400 Bad Request: The referrer does
+# not match the host." confirmed via httpx.Client().build_request(): an
+# explicitly-set Host header IS honored over the URL's own host, so simply
+# not stripping it here is sufficient -- no other change needed.
 
 
 @app.route(
