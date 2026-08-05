@@ -212,9 +212,11 @@ export default function PythonStrategyPnl() {
                       </Badge>
                     </TableCell>
                     <TableCell>{pos.quantity}</TableCell>
-                    <TableCell>{pos.entry_price.toFixed(2)}</TableCell>
-                    <TableCell>{pos.current_price.toFixed(2)}</TableCell>
-                    <TableCell className={pnlColor(pos.pnl)}>₹{pos.pnl.toFixed(2)}</TableCell>
+                    <TableCell>{pos.entry_price?.toFixed(2) ?? '--'}</TableCell>
+                    <TableCell>{pos.current_price?.toFixed(2) ?? '--'}</TableCell>
+                    <TableCell className={pnlColor(pos.pnl ?? 0)}>
+                      {pos.pnl != null ? `₹${pos.pnl.toFixed(2)}` : '--'}
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>
