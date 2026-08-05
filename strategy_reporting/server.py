@@ -236,6 +236,19 @@ def _load_strategy_config(strategy_id: str) -> dict | None:
     return configs.get(strategy_id)
 
 
+def _load_strategy_config_mtime() -> str:
+    """DEBUG-TEMP (2026-08-05) -- see _verify_strategy_ownership's matching
+    comment. Timing context only (writes are already known-atomic via
+    os.replace(), so this isn't diagnosing a torn read -- it's checking
+    whether a config write happened suspiciously close to a real 403,
+    which would point at the restore-on-boot loop's timing rather than
+    something in this process). Remove once root cause is confirmed/fixed."""
+    try:
+        return datetime.fromtimestamp(CONFIG_FILE.stat().st_mtime, tz=IST).isoformat()
+    except OSError:
+        return "unknown"
+
+
 def _verify_strategy_ownership(strategy_id: str, user_id):
     """Mirrors blueprints/python_strategy.py's verify_strategy_ownership --
     re-implemented against the same on-disk strategy_configs.json rather
@@ -248,6 +261,23 @@ def _verify_strategy_ownership(strategy_id: str, user_id):
         return False, (jsonify({"status": "error", "message": "Strategy not found"}), 404)
     owner = config.get("user_id")
     if owner and owner != user_id:
+        # DEBUG-TEMP (2026-08-05, transient 403-right-after-restart
+        # investigation): every simpler explanation has been ruled out by
+        # direct evidence -- strategy_reporting's own subprocess was already
+        # up and listening 4s before a real occurrence's first 403 (rules
+        # out a cold-start race); strategy_configs.json writes are already
+        # atomic (os.replace(), rules out a torn read); user_id is never
+        # written anywhere after a strategy's initial creation (rules out a
+        # restart-triggered logic bug corrupting the owner field). This is
+        # the one remaining unknown: what verify_api_key() actually
+        # resolved `user_id` to, and what `owner` actually was, at the
+        # exact moment of a real failure -- logged here instead of
+        # continuing to guess. Remove once root cause is confirmed/fixed.
+        logger.warning(
+            f"[DEBUG-TEMP] ownership mismatch for strategy_id={strategy_id!r}: "
+            f"config owner={owner!r} vs resolved user_id={user_id!r} "
+            f"(config file mtime={_load_strategy_config_mtime()})"
+        )
         return False, (jsonify({"status": "error", "message": "Unauthorized access to strategy"}), 403)
     return True, None
 
