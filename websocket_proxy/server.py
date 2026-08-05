@@ -53,6 +53,33 @@ class WebSocketProxy:
     # already holds it" and forces a real broker-level resubscribe anyway.
     REDUNDANT_SUBSCRIBE_STALE_BYPASS_SEC = 30.0
 
+    # 2026-08-05: a MUCH shorter bypass window specifically for a symbol
+    # that has NEVER ticked even once since being subscribed, as opposed to
+    # one that ticked fine and then went quiet. Root-caused via a live,
+    # controlled reproduction: the very FIRST subscribe request sent
+    # immediately after a fresh Fyers HSM WebSocket connection/auth
+    # (observed ~93ms after "Connected to Fyers HSM WebSocket") does not
+    # reliably register with Fyers' server, while every SUBSEQUENT subscribe
+    # on that same connection -- seconds or minutes later, any mode --
+    # worked correctly (confirmed by manually unsubscribing/resubscribing
+    # NIFTY.NSE_INDEX on a live connection: mode 1 failed as the first
+    # request, mode 2 worked as the second, mode 1 then ALSO worked as the
+    # third). This is a probabilistic timing race, not a deterministic
+    # bug -- it does not reproduce on every fresh connection, which matches
+    # why it only ever surfaced after a burst of near-simultaneous manual
+    # strategy restarts (the staggered 9 AM auto-start naturally spaces
+    # each strategy's first subscribe far enough apart that even an
+    # occasional race quietly self-heals via the NEXT strategy's request,
+    # long before the old 30s threshold -- or a human -- would ever notice).
+    #
+    # For a symbol that has NEVER ticked, there is no ambiguity to wait
+    # out (unlike "went quiet," where a longer grace period avoids
+    # overreacting to a brief network blip) -- it is either still inside
+    # this race window or genuinely broken, and checking again in a few
+    # seconds instead of 30 costs nothing while recovering roughly 10x
+    # faster.
+    REDUNDANT_SUBSCRIBE_NEVER_TICKED_BYPASS_SEC = 3.0
+
     def __init__(self, host: str = "127.0.0.1", port: int = 8765):
         """
         Initialize the WebSocket Proxy
@@ -597,10 +624,11 @@ class WebSocketProxy:
         (and should bypass the skip, forcing a real adapter.subscribe())
         when either:
         - it has NEVER ticked despite being held for longer than the
-          bypass window (subscription_first_held_at is old, last_message_time
-          has no entry at all), or
-        - it USED to tick and has gone silent for longer than the bypass
-          window (last_message_time is older than the window).
+          (much shorter) never-ticked bypass window -- see
+          REDUNDANT_SUBSCRIBE_NEVER_TICKED_BYPASS_SEC's docstring for why
+          this case gets its own, faster threshold, or
+        - it USED to tick and has gone silent for longer than the (longer)
+          bypass window (last_message_time is older than the window).
 
         Pulled out as its own method purely so this decision is unit-
         testable without needing to drive the full async subscribe_client
@@ -611,7 +639,7 @@ class WebSocketProxy:
         return (
             last_tick is None
             and held_since is not None
-            and (now - held_since) > self.REDUNDANT_SUBSCRIBE_STALE_BYPASS_SEC
+            and (now - held_since) > self.REDUNDANT_SUBSCRIBE_NEVER_TICKED_BYPASS_SEC
         ) or (
             last_tick is not None
             and (now - last_tick) > self.REDUNDANT_SUBSCRIBE_STALE_BYPASS_SEC
