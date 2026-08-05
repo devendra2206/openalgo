@@ -86,12 +86,27 @@ FLASK_PORT = os.getenv("FLASK_PORT", "5000")
 # no such socket file and really does listen on plain TCP, so fall back to
 # that when the socket isn't present.
 _MAIN_APP_SOCKET = _REPO_ROOT / "openalgo.sock"
-if _MAIN_APP_SOCKET.exists():
-    MAIN_APP_BASE = "http://openalgo-app"  # dummy host -- the UDS transport below ignores it for connecting
-    _relay_transport = httpx.HTTPTransport(uds=str(_MAIN_APP_SOCKET))
-else:
-    MAIN_APP_BASE = f"http://127.0.0.1:{FLASK_PORT}"
-    _relay_transport = None
+_USE_UDS = _MAIN_APP_SOCKET.exists()
+MAIN_APP_BASE = "http://openalgo-app" if _USE_UDS else f"http://127.0.0.1:{FLASK_PORT}"
+
+
+def _make_relay_transport():
+    """A FRESH httpx.HTTPTransport every call -- never share one instance
+    across multiple httpx.Client()s. httpx.Client.close() unconditionally
+    closes its transport's connection pool (see httpx's own Client.close()
+    source), even for a transport that was passed in rather than created
+    internally. The SSE relay below opens a short-lived Client per stream
+    (`with httpx.Client(transport=...) as c:`); if it shared the pooled
+    _relay_client's transport, EVERY time an SSE stream ended (browser tab
+    closed, page navigated away, EventSource auto-reconnect) it would close
+    the connection pool out from under the persistent _relay_client too,
+    which then handed back a dead file descriptor on its next reused
+    connection -- httpx.ReadError: [Errno 9] Bad file descriptor
+    (2026-08-05 incident, hit /python/api/logs/... and /python/api/strategy/...
+    with real 500s within seconds of an SSE client disconnecting)."""
+    if _USE_UDS:
+        return httpx.HTTPTransport(uds=str(_MAIN_APP_SOCKET))
+    return None
 
 # Same file the main process reads -- CONFIG_FILE in blueprints/python_strategy.py.
 # Deliberately re-implemented here rather than imported from that module: this
@@ -126,7 +141,7 @@ app.config.update(
 # retry expectations) for external broker API calls, a different traffic
 # shape/purpose than this purely-internal loopback relay. Uses the same
 # transport (Unix socket or TCP) resolved above.
-_relay_client = httpx.Client(timeout=10.0, transport=_relay_transport)
+_relay_client = httpx.Client(timeout=10.0, transport=_make_relay_transport())
 
 
 @app.teardown_appcontext
@@ -765,10 +780,13 @@ def _relay(_unused):
             # Must be a real httpx.Client (not the httpx.stream() module-level
             # convenience function) because only Client's constructor accepts
             # `transport=` -- needed to reach the main app over its Unix
-            # socket in production (see _relay_transport above). HTTP/1.1 by
-            # default (h2 requires the optional `h2` package AND explicit
-            # http2=True; neither applies to this call).
-            with httpx.Client(transport=_relay_transport, timeout=None) as _stream_client:
+            # socket in production. A FRESH transport from
+            # _make_relay_transport() every call -- never the pooled
+            # _relay_client's own transport instance, see that function's
+            # docstring for why sharing one broke buffered relay requests.
+            # HTTP/1.1 by default (h2 requires the optional `h2` package AND
+            # explicit http2=True; neither applies to this call).
+            with httpx.Client(transport=_make_relay_transport(), timeout=None) as _stream_client:
                 with _stream_client.stream(
                     request.method, target_url, headers=headers, content=request.get_data(),
                 ) as upstream:
