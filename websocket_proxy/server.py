@@ -80,6 +80,39 @@ class WebSocketProxy:
     # faster.
     REDUNDANT_SUBSCRIBE_NEVER_TICKED_BYPASS_SEC = 3.0
 
+    # 2026-08-05: after the never-ticked bypass above fires this many times
+    # in a row for the same sub_key with STILL zero ticks, escalate to a
+    # mode-switch dance instead of another same-mode resubscribe. Confirmed
+    # live, in production, via a real recurrence: even with the faster 3s
+    # bypass working correctly and firing repeatedly (5 genuine
+    # adapter.subscribe() calls from 3 different clients over 35s, each one
+    # a real wire-level HSM subscribe frame -- confirmed neither the proxy
+    # nor the HSM client itself dedups these), the wire-level tracker still
+    # showed zero frames ever parsed. Ruled out: symbol-to-HSM-token mapping
+    # failures (no "get_br_symbol returned None"/"Unmapped subscription"
+    # warnings in this incident) and a second skip layer inside
+    # fyers_hsm_websocket.py's own subscribe_symbols() (it unconditionally
+    # sends a fresh binary frame every call, confirmed by reading it).
+    #
+    # What DID work, confirmed by the user manually reproducing it live
+    # against a real stuck connection: subscribing the SAME symbol with a
+    # DIFFERENT mode broke through immediately, and switching back to the
+    # originally-stuck mode afterward then ALSO worked. The leading
+    # explanation (inferred, not directly observable -- Fyers' internal
+    # state isn't visible to us) is that Fyers' server silently ignores
+    # repeated IDENTICAL resubscribe requests for a token it already
+    # believes is subscribed, even if that original subscription silently
+    # never actually started streaming; a request that looks different
+    # (different mode) isn't caught by that dedup.
+    #
+    # This constant counts consecutive bypass firings (see
+    # _stale_bypass_attempts) before subscribe_client() stops repeating the
+    # same request and instead subscribes mode 2, re-subscribes the
+    # originally-requested mode, then unsubscribes the temporary mode-2
+    # leg -- deliberately varying the request shape rather than repeating
+    # a resubscribe that's now proven, in this exact incident, not to work.
+    STALE_BYPASS_MODE_SWITCH_THRESHOLD = 10
+
     def __init__(self, host: str = "127.0.0.1", port: int = 8765):
         """
         Initialize the WebSocket Proxy
@@ -150,6 +183,15 @@ class WebSocketProxy:
         # from a completely different period. See
         # REDUNDANT_SUBSCRIBE_STALE_BYPASS_SEC's docstring above.
         self.subscription_first_held_at: dict[tuple[str, str, int], float] = {}
+
+        # 2026-08-05: consecutive count of the never-ticked bypass firing for
+        # this sub_key with STILL zero ticks -- see
+        # STALE_BYPASS_MODE_SWITCH_THRESHOLD's docstring for the production
+        # incident this escalation responds to. Reset to 0 the moment a tick
+        # actually arrives (proves recovery, whichever attempt caused it),
+        # and cleared alongside subscription_first_held_at/subscription_index
+        # whenever the sub_key goes back to fully unheld.
+        self._stale_bypass_attempts: dict[tuple[str, str, int], int] = defaultdict(int)
 
         # Order-update subscribers: user_id -> set of client_ids that sent
         # {"action": "subscribe_orders"}. Account-scoped (no symbol/mode),
@@ -831,6 +873,7 @@ class WebSocketProxy:
                         if not self.subscription_index[sub_key]:
                             del self.subscription_index[sub_key]
                             self.subscription_first_held_at.pop(sub_key, None)
+                            self._stale_bypass_attempts.pop(sub_key, None)
                             # Only unsubscribe from adapter when last client unsubscribes
                             should_unsubscribe_from_adapter = True
                             # TEMP-DEBUG (2026-07-30) -- see subscribe_client's
@@ -1502,16 +1545,64 @@ class WebSocketProxy:
                 if self._is_subscription_genuinely_stale(sub_key, now):
                     held_since = self.subscription_first_held_at.get(sub_key)
                     last_tick = self.last_message_time.get(sub_key)
-                    logger.warning(
-                        f"[DEBUG-TEMP] bypassing redundant-subscribe skip for {sub_key} -- "
-                        f"looks stuck (last_tick="
-                        f"{'never' if last_tick is None else f'{now - last_tick:.0f}s ago'}, "
-                        f"held_since="
-                        f"{'unknown' if held_since is None else f'{now - held_since:.0f}s ago'}), "
-                        f"forcing real adapter.subscribe() triggered by "
-                        f"client_id={client_id}, user_id={user_id}"
-                    )
-                    response = adapter.subscribe(symbol, exchange, mode, depth_level)
+                    self._stale_bypass_attempts[sub_key] += 1
+                    attempt_count = self._stale_bypass_attempts[sub_key]
+
+                    if attempt_count >= self.STALE_BYPASS_MODE_SWITCH_THRESHOLD:
+                        # See STALE_BYPASS_MODE_SWITCH_THRESHOLD's class
+                        # docstring for the production incident this
+                        # responds to: repeating the SAME resubscribe
+                        # request is proven, in that incident, not to work
+                        # (5 genuine attempts, still zero ticks). Deliberately
+                        # vary the request shape instead -- subscribe an
+                        # alternate mode, re-subscribe the one actually
+                        # wanted, then drop the temporary alternate-mode leg.
+                        alternate_mode = 1 if mode == 2 else 2
+                        logger.warning(
+                            f"[DEBUG-TEMP] {sub_key} still stuck after {attempt_count} "
+                            f"genuine resubscribe attempts (last_tick="
+                            f"{'never' if last_tick is None else f'{now - last_tick:.0f}s ago'}) "
+                            f"-- escalating to mode-switch dance (subscribe mode="
+                            f"{alternate_mode}, re-subscribe mode={mode}, unsubscribe "
+                            f"mode={alternate_mode}) triggered by client_id={client_id}, "
+                            f"user_id={user_id}"
+                        )
+                        try:
+                            await self._run_blocking(
+                                adapter.subscribe, symbol, exchange, alternate_mode, depth_level
+                            )
+                        except Exception:
+                            logger.exception(
+                                f"[DEBUG-TEMP] mode-switch dance: alternate-mode subscribe "
+                                f"failed for {sub_key}"
+                            )
+                        response = await self._run_blocking(
+                            adapter.subscribe, symbol, exchange, mode, depth_level
+                        )
+                        try:
+                            await self._run_blocking(
+                                adapter.unsubscribe, symbol, exchange, alternate_mode
+                            )
+                        except Exception:
+                            logger.exception(
+                                f"[DEBUG-TEMP] mode-switch dance: alternate-mode unsubscribe "
+                                f"failed for {sub_key}"
+                            )
+                        self._stale_bypass_attempts[sub_key] = 0
+                    else:
+                        logger.warning(
+                            f"[DEBUG-TEMP] bypassing redundant-subscribe skip for {sub_key} -- "
+                            f"looks stuck (last_tick="
+                            f"{'never' if last_tick is None else f'{now - last_tick:.0f}s ago'}, "
+                            f"held_since="
+                            f"{'unknown' if held_since is None else f'{now - held_since:.0f}s ago'}), "
+                            f"forcing real adapter.subscribe() triggered by "
+                            f"client_id={client_id}, user_id={user_id} "
+                            f"(attempt {attempt_count}/{self.STALE_BYPASS_MODE_SWITCH_THRESHOLD})"
+                        )
+                        response = await self._run_blocking(
+                            adapter.subscribe, symbol, exchange, mode, depth_level
+                        )
                 else:
                     response = {"status": "success"}
             else:
@@ -1673,6 +1764,7 @@ class WebSocketProxy:
                             if not self.subscription_index[sub_key]:
                                 del self.subscription_index[sub_key]
                                 self.subscription_first_held_at.pop(sub_key, None)
+                                self._stale_bypass_attempts.pop(sub_key, None)
                                 should_unsubscribe_from_adapter = True
                                 # TEMP-DEBUG (2026-07-30) -- see the specific-symbols
                                 # branch below for the full rationale. Remove once
@@ -1748,6 +1840,7 @@ class WebSocketProxy:
                     if not self.subscription_index[sub_key]:
                         del self.subscription_index[sub_key]
                         self.subscription_first_held_at.pop(sub_key, None)
+                        self._stale_bypass_attempts.pop(sub_key, None)
                         should_unsubscribe_from_adapter = True
                         # TEMP-DEBUG (2026-07-30, VWAP/Batman/Combined staleness
                         # investigation): a real broker-level unsubscribe is
@@ -2258,6 +2351,10 @@ class WebSocketProxy:
                 sub_key = (symbol, exchange, mode)
                 current_time = time.time()
                 self.last_message_time[sub_key] = current_time
+                # Recovery confirmed for this sub_key -- whichever attempt
+                # (plain resubscribe or the mode-switch escalation) caused
+                # this tick, stop counting toward the escalation threshold.
+                self._stale_bypass_attempts.pop(sub_key, None)
 
                 # Feed market data to MarketDataService for backend consumers
                 # (sandbox execution engine, position MTM, RMS, etc.)
