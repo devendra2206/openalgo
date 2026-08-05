@@ -85,6 +85,29 @@ class WebSocketProxy:
         self.user_broker_mapping = {}  # Maps user_id to broker_name
         self.running = False
 
+        # 2026-08-05: serializes authenticate_client()'s "create or reuse
+        # broker adapter for this user_id" critical section. Single-user
+        # deployment (CLAUDE.md) means every strategy subprocess's WS client
+        # authenticates with the SAME user_id -- if several reconnect within
+        # moments of each other (e.g. a burst of manual strategy restarts
+        # right after the proxy itself was just respawned, subscription_index
+        # empty, self.broker_adapters empty), their authenticate_client()
+        # calls now interleave at the await points introduced by moving
+        # adapter.initialize()/.connect() off the event loop (see
+        # _run_blocking below) -- without this lock, two concurrent callers
+        # could both see `user_id not in self.broker_adapters`, each create
+        # and connect their OWN adapter/ConnectionPool for the same
+        # broker+user, and only one wins the final self.broker_adapters[user_id]
+        # write. The loser's connection (and any subscribes already routed to
+        # it) becomes orphaned -- indistinguishable from a healthy connection
+        # since it DOES connect and DOES accept subscribes, it just never has
+        # its ticks looked at by anyone once it loses the registry race. This
+        # is the leading suspect for "subscribe succeeds, symbol never ticks,
+        # only after a burst of near-simultaneous strategy restarts" (does
+        # NOT reproduce for the staggered 9 AM auto-start, only for manual
+        # mid-session restarts -- confirmed 2026-08-05).
+        self._adapter_locks: dict[str, aio.Lock] = defaultdict(aio.Lock)
+
         # PERFORMANCE OPTIMIZATION: Subscription index for O(1) lookup
         # Maps (symbol, exchange, mode) -> set of client_ids
         # This eliminates the need for nested loops in zmq_listener
@@ -963,6 +986,27 @@ class WebSocketProxy:
             logger.exception(f"Error getting broker configuration for user {user_id}: {e}")
             return None
 
+    async def _run_blocking(self, func, *args, **kwargs):
+        """Run a synchronous, potentially slow call (adapter.connect()/
+        .initialize() -- observed taking up to Fyers's own 15s auth timeout,
+        see FyersAdapter.connect()'s polling loop) on the default executor's
+        worker thread instead of the proxy's single asyncio event loop.
+
+        2026-08-05: called directly (no await, no run_in_executor) inside
+        authenticate_client(), these blocking calls froze the ENTIRE proxy --
+        every other client's messages (subscribes, pings, even other users'
+        own auth) queue behind whichever ONE client happens to be creating/
+        connecting an adapter, for however long that connect takes. A single
+        slow/retried connect could starve the whole process for many seconds.
+        This also means authenticate_client()'s "create or reuse adapter" body
+        previously ran as one uninterruptible synchronous block (no await
+        inside it), so it was accidentally atomic; moving the blocking work
+        here introduces real yield points, which is exactly why the new
+        per-user _adapter_locks guard immediately below is now load-bearing,
+        not just defensive."""
+        loop = aio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
     async def authenticate_client(self, client_id, data):
         """
         Authenticate a client using their API key and determine their broker
@@ -1002,208 +1046,239 @@ class WebSocketProxy:
         # Store the broker mapping for this user
         self.user_broker_mapping[user_id] = broker_name
 
-        # A successful API-key auth is not enough: the cached broker adapter/pool
-        # can be disconnected or still hold a previous day's broker token. Evict
-        # it before the normal create/connect path runs so the fresh DB token is
-        # used immediately after broker re-login.
-        if user_id in self.broker_adapters:
-            cached_adapter = self.broker_adapters[user_id]
-            cached_connected = bool(getattr(cached_adapter, "connected", False))
-            broker_changed = bool(previous_broker_name and previous_broker_name != broker_name)
-
-            if broker_changed or not cached_connected:
-                reason = (
-                    f"broker changed {previous_broker_name}->{broker_name}"
-                    if broker_changed
-                    else "cached adapter disconnected"
-                )
+        # Serializes the whole "evict stale / create or reuse adapter" section
+        # below for this user_id -- see _adapter_locks' docstring in __init__
+        # for why this is load-bearing now that adapter.connect()/.initialize()
+        # run via _run_blocking (real await points a second concurrent caller
+        # could otherwise interleave through).
+        lock_wait_start = time.monotonic()
+        async with self._adapter_locks[user_id]:
+            lock_wait = time.monotonic() - lock_wait_start
+            if lock_wait > 0.05:
                 logger.info(
-                    f"Cached {broker_name} adapter for user {user_id} is stale ({reason}) - "
-                    "evicting to rebuild with fresh credentials"
-                )
-                try:
-                    cached_adapter.disconnect()
-                except Exception as adapter_error:
-                    logger.warning(
-                        f"Error disconnecting stale adapter for user {user_id}: {adapter_error}"
-                    )
-                self.broker_adapters.pop(user_id, None)
-
-                try:
-                    from .broker_factory import cleanup_pools_for_user
-
-                    cleanup_pools_for_user(user_id, broker_name=previous_broker_name or broker_name)
-                except Exception as pool_error:
-                    logger.warning(
-                        f"Error cleaning stale connection pools for user {user_id}: {pool_error}"
-                    )
-
-        # Create or reuse broker adapter
-        if user_id not in self.broker_adapters:
-            try:
-                # Create broker adapter with dynamic broker selection
-                adapter = create_broker_adapter(broker_name)
-                if not adapter:
-                    await self.send_error(
-                        client_id,
-                        "BROKER_ERROR",
-                        f"Failed to create adapter for broker: {broker_name}",
-                    )
-                    return
-
-                # Initialize adapter with broker configuration
-                # The adapter's initialize method should handle broker-specific setup
-                initialization_result = adapter.initialize(broker_name, user_id)
-                if initialization_result and initialization_result.get("status") == "error":
-                    error_msg = initialization_result.get(
-                        "message", initialization_result.get("error", "Failed to initialize broker adapter")
-                    )
-
-                    # Check if this is an auth error (403/401) - retry with fresh token
-                    # This handles the stale cache issue described in GitHub issue #765
-                    if adapter.is_auth_error(error_msg):
-                        logger.warning(f"Auth error during initialization for user {user_id}, retrying with fresh token")
-                        adapter.clear_auth_cache_for_user(user_id)
-
-                        # Retry initialization with fresh credentials
-                        initialization_result = adapter.initialize(broker_name, user_id)
-                        if initialization_result and initialization_result.get("status") == "error":
-                            error_msg = initialization_result.get("message", "Failed to initialize after retry")
-                            await self.send_error(client_id, "BROKER_INIT_ERROR", error_msg)
-                            return
-                    else:
-                        await self.send_error(client_id, "BROKER_INIT_ERROR", error_msg)
-                        return
-
-                # Connect to the broker
-                connect_result = adapter.connect()
-                # Handle both response formats:
-                # - Adapter format: {"status": "error", "code": "...", "message": "..."}
-                # - ConnectionPool format: {"success": False, "error": "..."}
-                is_error = (
-                    (connect_result and connect_result.get("status") == "error") or
-                    (connect_result and connect_result.get("success") == False)
-                )
-                if is_error:
-                    error_msg = connect_result.get("message", connect_result.get("error", "Failed to connect to broker"))
-                    error_code = connect_result.get("code", "")
-
-                    # Always retry connection failures with fresh token (issue #765)
-                    # Connection failures after re-login are almost always due to stale cached tokens
-                    # The upstox_client logs "401 Unauthorized" but returns generic "CONNECTION_FAILED"
-                    should_retry = (
-                        adapter.is_auth_error(error_msg) or
-                        error_code in ("CONNECTION_FAILED", "CONNECTION_ERROR") or
-                        "failed to connect" in error_msg.lower()
-                    )
-
-                    if should_retry:
-                        logger.warning(f"Connection failed for user {user_id}, retrying with fresh token (error: {error_msg}, code: {error_code})")
-
-                        # Clear stale cache in WebSocket process (issue #765)
-                        self._clear_auth_cache_for_user(user_id)
-                        adapter.clear_auth_cache_for_user(user_id)
-
-                        # Re-initialize with fresh credentials from database
-                        # Use force=True for pooled adapters to override existing initialization
-                        logger.info(f"Re-initializing adapter for user {user_id} with fresh token")
-                        try:
-                            # Try with force parameter (supported by _PooledAdapterWrapper)
-                            init_retry_result = adapter.initialize(broker_name, user_id, force=True)
-                        except TypeError:
-                            # Fallback for raw adapters that don't support force parameter
-                            init_retry_result = adapter.initialize(broker_name, user_id)
-                        # Handle both response formats
-                        init_is_error = (
-                            (init_retry_result and init_retry_result.get("status") == "error") or
-                            (init_retry_result and init_retry_result.get("success") == False)
-                        )
-                        if init_is_error:
-                            error_msg = init_retry_result.get("message", init_retry_result.get("error", "Failed to re-initialize"))
-                            logger.error(f"Re-initialization failed for user {user_id}: {error_msg}")
-                            await self.send_error(client_id, "BROKER_INIT_ERROR", error_msg)
-                            return
-
-                        # Retry connection
-                        logger.info(f"Retrying connection for user {user_id}")
-                        connect_result = adapter.connect()
-                        # Handle both response formats
-                        connect_is_error = (
-                            (connect_result and connect_result.get("status") == "error") or
-                            (connect_result and connect_result.get("success") == False)
-                        )
-                        if connect_is_error:
-                            error_msg = connect_result.get("message", connect_result.get("error", "Failed to connect after retry"))
-                            logger.error(f"Retry connection also failed for user {user_id}: {error_msg}")
-                            await self.send_error(client_id, "BROKER_CONNECTION_ERROR", error_msg)
-                            return
-
-                        logger.info(f"Retry successful for user {user_id}")
-                    else:
-                        await self.send_error(client_id, "BROKER_CONNECTION_ERROR", error_msg)
-                        return
-
-                # Store the adapter
-                self.broker_adapters[user_id] = adapter
-
-                logger.info(
-                    f"Successfully created and connected {broker_name} adapter for user {user_id}"
+                    f"[ADAPTER-LOCK] client_id={client_id} user_id={user_id} waited "
+                    f"{lock_wait:.3f}s for another connection's adapter setup to finish"
                 )
 
-            except Exception as e:
-                error_str = str(e)
-                logger.exception(f"Failed to create broker adapter for {broker_name}: {e}")
+            # A successful API-key auth is not enough: the cached broker adapter/pool
+            # can be disconnected or still hold a previous day's broker token. Evict
+            # it before the normal create/connect path runs so the fresh DB token is
+            # used immediately after broker re-login.
+            if user_id in self.broker_adapters:
+                cached_adapter = self.broker_adapters[user_id]
+                cached_connected = bool(getattr(cached_adapter, "connected", False))
+                broker_changed = bool(previous_broker_name and previous_broker_name != broker_name)
 
-                # Check if exception is an auth error - retry with fresh token
-                # This handles the stale cache issue described in GitHub issue #765
-                if self._is_auth_error_exception(error_str):
-                    logger.warning(f"Auth exception for user {user_id}, retrying with fresh token")
+                if broker_changed or not cached_connected:
+                    reason = (
+                        f"broker changed {previous_broker_name}->{broker_name}"
+                        if broker_changed
+                        else "cached adapter disconnected"
+                    )
+                    logger.info(
+                        f"Cached {broker_name} adapter for user {user_id} is stale ({reason}) - "
+                        "evicting to rebuild with fresh credentials"
+                    )
                     try:
-                        self._clear_auth_cache_for_user(user_id)
+                        cached_adapter.disconnect()
+                    except Exception as adapter_error:
+                        logger.warning(
+                            f"Error disconnecting stale adapter for user {user_id}: {adapter_error}"
+                        )
+                    self.broker_adapters.pop(user_id, None)
 
-                        # Retry adapter creation
-                        adapter = create_broker_adapter(broker_name)
-                        if adapter:
-                            # Clear cache on the new adapter as well
-                            if hasattr(adapter, 'clear_auth_cache_for_user'):
-                                adapter.clear_auth_cache_for_user(user_id)
+                    try:
+                        from .broker_factory import cleanup_pools_for_user
 
-                            initialization_result = adapter.initialize(broker_name, user_id)
-                            # Handle both response formats
-                            init_is_error = (
-                                (initialization_result and initialization_result.get("status") == "error") or
-                                (initialization_result and initialization_result.get("success") == False)
-                            )
-                            if not init_is_error:
-                                connect_result = adapter.connect()
-                                # Handle both response formats
-                                connect_is_error = (
-                                    (connect_result and connect_result.get("status") == "error") or
-                                    (connect_result and connect_result.get("success") == False)
-                                )
-                                if not connect_is_error:
-                                    self.broker_adapters[user_id] = adapter
-                                    logger.info(f"Successfully connected {broker_name} adapter for user {user_id} after retry")
-                                    # Fall through to success response
-                                else:
-                                    error_msg = connect_result.get("message", connect_result.get("error", "Failed to connect after retry"))
-                                    await self.send_error(client_id, "BROKER_CONNECTION_ERROR", error_msg)
-                                    return
-                            else:
-                                error_msg = initialization_result.get("message", initialization_result.get("error", "Failed to initialize after retry"))
+                        cleanup_pools_for_user(user_id, broker_name=previous_broker_name or broker_name)
+                    except Exception as pool_error:
+                        logger.warning(
+                            f"Error cleaning stale connection pools for user {user_id}: {pool_error}"
+                        )
+
+            # Create or reuse broker adapter
+            if user_id in self.broker_adapters:
+                logger.debug(
+                    f"[ADAPTER-LOCK] client_id={client_id} user_id={user_id} reusing "
+                    f"already-connected adapter id={id(self.broker_adapters[user_id])}"
+                )
+            if user_id not in self.broker_adapters:
+                attempt_start = time.monotonic()
+                try:
+                    # Create broker adapter with dynamic broker selection
+                    adapter = create_broker_adapter(broker_name)
+                    if not adapter:
+                        await self.send_error(
+                            client_id,
+                            "BROKER_ERROR",
+                            f"Failed to create adapter for broker: {broker_name}",
+                        )
+                        return
+                    logger.info(
+                        f"[ADAPTER-LOCK] client_id={client_id} user_id={user_id} creating NEW "
+                        f"adapter id={id(adapter)} for broker={broker_name}"
+                    )
+
+                    # Initialize adapter with broker configuration
+                    # The adapter's initialize method should handle broker-specific setup
+                    # -- run off the event loop, see _run_blocking's docstring.
+                    initialization_result = await self._run_blocking(adapter.initialize, broker_name, user_id)
+                    if initialization_result and initialization_result.get("status") == "error":
+                        error_msg = initialization_result.get(
+                            "message", initialization_result.get("error", "Failed to initialize broker adapter")
+                        )
+
+                        # Check if this is an auth error (403/401) - retry with fresh token
+                        # This handles the stale cache issue described in GitHub issue #765
+                        if adapter.is_auth_error(error_msg):
+                            logger.warning(f"Auth error during initialization for user {user_id}, retrying with fresh token")
+                            adapter.clear_auth_cache_for_user(user_id)
+
+                            # Retry initialization with fresh credentials
+                            initialization_result = await self._run_blocking(adapter.initialize, broker_name, user_id)
+                            if initialization_result and initialization_result.get("status") == "error":
+                                error_msg = initialization_result.get("message", "Failed to initialize after retry")
                                 await self.send_error(client_id, "BROKER_INIT_ERROR", error_msg)
                                 return
                         else:
-                            await self.send_error(client_id, "BROKER_ERROR", f"Failed to create adapter for {broker_name}")
+                            await self.send_error(client_id, "BROKER_INIT_ERROR", error_msg)
                             return
-                    except Exception as retry_error:
-                        logger.exception(f"Retry also failed for {broker_name}: {retry_error}")
-                        await self.send_error(client_id, "BROKER_ERROR", str(retry_error))
+
+                    # Connect to the broker -- run off the event loop, see
+                    # _run_blocking's docstring (FyersAdapter.connect() alone
+                    # can poll for up to 15s).
+                    connect_result = await self._run_blocking(adapter.connect)
+                    # Handle both response formats:
+                    # - Adapter format: {"status": "error", "code": "...", "message": "..."}
+                    # - ConnectionPool format: {"success": False, "error": "..."}
+                    is_error = (
+                        (connect_result and connect_result.get("status") == "error") or
+                        (connect_result and connect_result.get("success") == False)
+                    )
+                    if is_error:
+                        error_msg = connect_result.get("message", connect_result.get("error", "Failed to connect to broker"))
+                        error_code = connect_result.get("code", "")
+
+                        # Always retry connection failures with fresh token (issue #765)
+                        # Connection failures after re-login are almost always due to stale cached tokens
+                        # The upstox_client logs "401 Unauthorized" but returns generic "CONNECTION_FAILED"
+                        should_retry = (
+                            adapter.is_auth_error(error_msg) or
+                            error_code in ("CONNECTION_FAILED", "CONNECTION_ERROR") or
+                            "failed to connect" in error_msg.lower()
+                        )
+
+                        if should_retry:
+                            logger.warning(f"Connection failed for user {user_id}, retrying with fresh token (error: {error_msg}, code: {error_code})")
+
+                            # Clear stale cache in WebSocket process (issue #765)
+                            self._clear_auth_cache_for_user(user_id)
+                            adapter.clear_auth_cache_for_user(user_id)
+
+                            # Re-initialize with fresh credentials from database
+                            # Use force=True for pooled adapters to override existing initialization
+                            logger.info(f"Re-initializing adapter for user {user_id} with fresh token")
+                            try:
+                                # Try with force parameter (supported by _PooledAdapterWrapper)
+                                init_retry_result = await self._run_blocking(adapter.initialize, broker_name, user_id, force=True)
+                            except TypeError:
+                                # Fallback for raw adapters that don't support force parameter
+                                init_retry_result = await self._run_blocking(adapter.initialize, broker_name, user_id)
+                            # Handle both response formats
+                            init_is_error = (
+                                (init_retry_result and init_retry_result.get("status") == "error") or
+                                (init_retry_result and init_retry_result.get("success") == False)
+                            )
+                            if init_is_error:
+                                error_msg = init_retry_result.get("message", init_retry_result.get("error", "Failed to re-initialize"))
+                                logger.error(f"Re-initialization failed for user {user_id}: {error_msg}")
+                                await self.send_error(client_id, "BROKER_INIT_ERROR", error_msg)
+                                return
+
+                            # Retry connection
+                            logger.info(f"Retrying connection for user {user_id}")
+                            connect_result = await self._run_blocking(adapter.connect)
+                            # Handle both response formats
+                            connect_is_error = (
+                                (connect_result and connect_result.get("status") == "error") or
+                                (connect_result and connect_result.get("success") == False)
+                            )
+                            if connect_is_error:
+                                error_msg = connect_result.get("message", connect_result.get("error", "Failed to connect after retry"))
+                                logger.error(f"Retry connection also failed for user {user_id}: {error_msg}")
+                                await self.send_error(client_id, "BROKER_CONNECTION_ERROR", error_msg)
+                                return
+
+                            logger.info(f"Retry successful for user {user_id}")
+                        else:
+                            await self.send_error(client_id, "BROKER_CONNECTION_ERROR", error_msg)
+                            return
+
+                    # Store the adapter
+                    self.broker_adapters[user_id] = adapter
+
+                    logger.info(
+                        f"[ADAPTER-LOCK] Successfully created and connected {broker_name} adapter "
+                        f"id={id(adapter)} for user {user_id} in {time.monotonic() - attempt_start:.3f}s"
+                    )
+
+                except Exception as e:
+                    error_str = str(e)
+                    logger.exception(f"Failed to create broker adapter for {broker_name}: {e}")
+
+                    # Check if exception is an auth error - retry with fresh token
+                    # This handles the stale cache issue described in GitHub issue #765
+                    if self._is_auth_error_exception(error_str):
+                        logger.warning(f"Auth exception for user {user_id}, retrying with fresh token")
+                        try:
+                            self._clear_auth_cache_for_user(user_id)
+
+                            # Retry adapter creation
+                            adapter = create_broker_adapter(broker_name)
+                            if adapter:
+                                # Clear cache on the new adapter as well
+                                if hasattr(adapter, 'clear_auth_cache_for_user'):
+                                    adapter.clear_auth_cache_for_user(user_id)
+
+                                initialization_result = await self._run_blocking(adapter.initialize, broker_name, user_id)
+                                # Handle both response formats
+                                init_is_error = (
+                                    (initialization_result and initialization_result.get("status") == "error") or
+                                    (initialization_result and initialization_result.get("success") == False)
+                                )
+                                if not init_is_error:
+                                    connect_result = await self._run_blocking(adapter.connect)
+                                    # Handle both response formats
+                                    connect_is_error = (
+                                        (connect_result and connect_result.get("status") == "error") or
+                                        (connect_result and connect_result.get("success") == False)
+                                    )
+                                    if not connect_is_error:
+                                        self.broker_adapters[user_id] = adapter
+                                        logger.info(
+                                            f"[ADAPTER-LOCK] Successfully connected {broker_name} adapter "
+                                            f"id={id(adapter)} for user {user_id} after retry"
+                                        )
+                                        # Fall through to success response
+                                    else:
+                                        error_msg = connect_result.get("message", connect_result.get("error", "Failed to connect after retry"))
+                                        await self.send_error(client_id, "BROKER_CONNECTION_ERROR", error_msg)
+                                        return
+                                else:
+                                    error_msg = initialization_result.get("message", initialization_result.get("error", "Failed to initialize after retry"))
+                                    await self.send_error(client_id, "BROKER_INIT_ERROR", error_msg)
+                                    return
+                            else:
+                                await self.send_error(client_id, "BROKER_ERROR", f"Failed to create adapter for {broker_name}")
+                                return
+                        except Exception as retry_error:
+                            logger.exception(f"Retry also failed for {broker_name}: {retry_error}")
+                            await self.send_error(client_id, "BROKER_ERROR", str(retry_error))
+                            return
+                    else:
+                        logger.exception(f"Broker error for {broker_name}: {error_str}")
+                        await self.send_error(client_id, "BROKER_ERROR", error_str)
                         return
-                else:
-                    logger.exception(f"Broker error for {broker_name}: {error_str}")
-                    await self.send_error(client_id, "BROKER_ERROR", error_str)
-                    return
 
         # Send success response with broker information
         await self.send_message(
