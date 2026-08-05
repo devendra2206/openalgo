@@ -44,6 +44,8 @@ import httpx
 import pytz
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request, session, stream_with_context
+from sqlalchemy import func
+from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 from sqlalchemy.exc import OperationalError
 
 # Load .env before any module that reads env vars at import time (mirrors
@@ -336,15 +338,36 @@ def api_push_pnl(strategy_id):
     except (TypeError, ValueError):
         return jsonify({"status": "error", "message": "realized_pnl/unrealized_pnl must be numeric"}), 400
     open_positions = data.get("open_positions") or []
+    open_positions_json = json.dumps(open_positions)
 
     def _do_write():
-        row = db_session.get(StrategyPnl, strategy_id)
-        if row is None:
-            row = StrategyPnl(strategy_id=strategy_id)
-            db_session.add(row)
-        row.realized_pnl = realized_pnl
-        row.unrealized_pnl = unrealized_pnl
-        row.open_positions = json.dumps(open_positions)
+        # Single atomic UPSERT, no preceding SELECT -- avoids the
+        # SQLITE_BUSY_SNAPSHOT class of "database is locked" entirely (not
+        # just retries around it) by never holding a stale read snapshot
+        # across a later write. See docs/CUSTOMIZATIONS.md's 2026-08-05
+        # entry for the full explanation; this is the highest-frequency
+        # writer of all 7 (every running strategy, every ~0.8-1s), so it's
+        # the one most worth converting.
+        stmt = sqlite_upsert(StrategyPnl).values(
+            strategy_id=strategy_id,
+            realized_pnl=realized_pnl,
+            unrealized_pnl=unrealized_pnl,
+            open_positions=open_positions_json,
+        ).on_conflict_do_update(
+            index_elements=["strategy_id"],
+            set_={
+                "realized_pnl": realized_pnl,
+                "unrealized_pnl": unrealized_pnl,
+                "open_positions": open_positions_json,
+                # StrategyPnl.updated_at's onupdate=func.now() is an ORM-session
+                # convenience -- it does NOT fire for a Core-level upsert (verified:
+                # the compiled SQL has no updated_at in its SET clause at all
+                # without this), so it must be set explicitly here or the column
+                # would silently stop refreshing after each row's first insert.
+                "updated_at": func.now(),
+            },
+        )
+        db_session.execute(stmt)
         db_session.commit()
 
     _write_with_retry(_do_write)
@@ -381,27 +404,31 @@ def api_push_leg_error(strategy_id):
         return jsonify({"status": "error", "message": "leg_key is required"}), 400
 
     def _do_write():
-        existing = (
-            db_session.query(StrategyLegError)
-            .filter_by(strategy_id=strategy_id, leg_key=leg_key)
-            .first()
-        )
         if data.get("clear"):
-            if existing:
-                db_session.delete(existing)
-                db_session.commit()
+            # Bulk delete -- a no-op if the row doesn't exist, so no
+            # existence check needed first (see api_push_pnl's comment on
+            # why avoiding a preceding SELECT matters under SQLite WAL).
+            db_session.query(StrategyLegError).filter_by(
+                strategy_id=strategy_id, leg_key=leg_key
+            ).delete()
+            db_session.commit()
         else:
-            if existing is None:
-                new_row = StrategyLegError(strategy_id=strategy_id, leg_key=leg_key)
-                db_session.add(new_row)
-                existing = new_row
-            existing.error_state = data.get("error_state", "")
-            existing.error_kind = data.get("error_kind", "")
-            existing.error_message = data.get("error_message", "")
-            existing.error_since = data.get("error_since", "")
-            existing.symbol = data.get("symbol", "")
-            existing.quantity = data.get("quantity", 0)
-            existing.action = data.get("action", "")
+            values = {
+                "error_state": data.get("error_state", ""),
+                "error_kind": data.get("error_kind", ""),
+                "error_message": data.get("error_message", ""),
+                "error_since": data.get("error_since", ""),
+                "symbol": data.get("symbol", ""),
+                "quantity": data.get("quantity", 0),
+                "action": data.get("action", ""),
+            }
+            stmt = sqlite_upsert(StrategyLegError).values(
+                strategy_id=strategy_id, leg_key=leg_key, **values,
+            ).on_conflict_do_update(
+                index_elements=["strategy_id", "leg_key"],
+                set_=values,
+            )
+            db_session.execute(stmt)
             db_session.commit()
 
     _write_with_retry(_do_write)
@@ -520,16 +547,13 @@ def api_post_leg_action(strategy_id):
             return jsonify({"status": "error", "message": "fill_price must be a positive number for a manual resolution"}), 400
 
     def _do_write():
-        row = (
-            db_session.query(StrategyPendingAction)
-            .filter_by(strategy_id=strategy_id, leg_key=leg_key)
-            .first()
+        stmt = sqlite_upsert(StrategyPendingAction).values(
+            strategy_id=strategy_id, leg_key=leg_key, action=action, fill_price=fill_price,
+        ).on_conflict_do_update(
+            index_elements=["strategy_id", "leg_key"],
+            set_={"action": action, "fill_price": fill_price},
         )
-        if row is None:
-            row = StrategyPendingAction(strategy_id=strategy_id, leg_key=leg_key)
-            db_session.add(row)
-        row.action = action
-        row.fill_price = fill_price
+        db_session.execute(stmt)
         db_session.commit()
 
     _write_with_retry(_do_write)
@@ -557,11 +581,17 @@ def api_request_force_exit(strategy_id):
     # strategy it already knows is running, so this path isn't reachable in
     # normal use either way.
     def _do_write():
-        row = db_session.get(StrategyForceExit, strategy_id)
-        if row is None:
-            row = StrategyForceExit(strategy_id=strategy_id)
-            db_session.add(row)
-        row.status = "pending"
+        # requested_at intentionally NOT in set_ -- matches the prior ORM
+        # code's behavior of only ever touching `status` on an existing
+        # row, leaving the original request timestamp untouched by a
+        # re-request while one is already pending.
+        stmt = sqlite_upsert(StrategyForceExit).values(
+            strategy_id=strategy_id, status="pending",
+        ).on_conflict_do_update(
+            index_elements=["strategy_id"],
+            set_={"status": "pending"},
+        )
+        db_session.execute(stmt)
         db_session.commit()
 
     _write_with_retry(_do_write)
