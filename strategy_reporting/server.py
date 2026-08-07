@@ -327,6 +327,21 @@ def _require_session(f):
 _zmq_context = None
 _zmq_socket = None
 
+# PnL DB-write throttle -- broadcast_bridge no longer reads the DB back to
+# build the SSE payload (2026-08-07, uses the event's own embedded
+# snapshot instead), so the DB write and the live broadcast are decoupled:
+# nothing downstream needs every write to land immediately. This is the
+# highest-frequency route of all 7 (every running strategy, every
+# ~0.8-1s) and the main driver of "database is locked" contention under
+# concurrent strategies -- persisting at most once per
+# _PNL_DB_WRITE_INTERVAL_SEC per strategy cuts write volume ~6x while the
+# broadcast (and therefore the live UI) still updates every single tick.
+# Benign race if two requests for the same strategy_id land in the same
+# instant (both may write) -- not worth a lock for a rate-limit heuristic
+# with no correctness requirement.
+_last_pnl_db_write: dict[str, float] = {}
+_PNL_DB_WRITE_INTERVAL_SEC = 5.0
+
 
 def _publish_bridge_event(event: dict):
     """Fire-and-forget -- a lost bridge message means the browser's SSE
@@ -400,9 +415,30 @@ def api_push_pnl(strategy_id):
         db_session.execute(stmt)
         db_session.commit()
 
-    _write_with_retry(_do_write)
+    now = time.monotonic()
+    last_write = _last_pnl_db_write.get(strategy_id, 0.0)
+    if now - last_write >= _PNL_DB_WRITE_INTERVAL_SEC:
+        _write_with_retry(_do_write)
+        _last_pnl_db_write[strategy_id] = now
 
-    _publish_bridge_event({"type": "pnl_update", "strategy_id": strategy_id})
+    # Carry the payload IN the event -- api_push_pnl already has everything
+    # get_pnl_snapshot() would otherwise re-read from the DB a moment later
+    # in broadcast_bridge. This is the highest-frequency route of all 7
+    # (every running strategy, every ~0.8-1s), so the extra read was a real,
+    # avoidable multiplier on write-lock contention: 1 write + 1 read per
+    # tick collapses to 1 write only. broadcast_bridge falls back to
+    # get_pnl_snapshot() if these fields are ever absent (e.g. an older
+    # in-flight event across a deploy), so this is additive, not a hard
+    # dependency between the two processes' event shape.
+    _publish_bridge_event({
+        "type": "pnl_update",
+        "strategy_id": strategy_id,
+        "realized_pnl": realized_pnl,
+        "unrealized_pnl": unrealized_pnl,
+        "total_pnl": realized_pnl + unrealized_pnl,
+        "open_positions": open_positions,
+        "updated_at": datetime.now(IST).isoformat(),
+    })
     return jsonify({"status": "success"})
 
 

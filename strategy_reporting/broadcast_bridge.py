@@ -80,7 +80,22 @@ def _handle_event(event: dict):
 
     try:
         if event_type == "pnl_update":
-            snapshot = get_pnl_snapshot(strategy_id)
+            # api_push_pnl now carries the full snapshot in the event itself
+            # (2026-08-07) -- avoids a DB read-back on this, the highest-
+            # frequency route of all 7 (every running strategy, every
+            # ~0.8-1s). Fall back to the DB read only if an older event
+            # shape (missing these fields) is ever received, e.g. an
+            # in-flight message across a deploy.
+            if "realized_pnl" in event:
+                snapshot = {
+                    "realized_pnl": event.get("realized_pnl", 0.0),
+                    "unrealized_pnl": event.get("unrealized_pnl", 0.0),
+                    "total_pnl": event.get("total_pnl", 0.0),
+                    "open_positions": event.get("open_positions", []),
+                    "updated_at": event.get("updated_at"),
+                }
+            else:
+                snapshot = get_pnl_snapshot(strategy_id)
             broadcast_pnl_update(strategy_id, snapshot)
         elif event_type == "error_update":
             broadcast_error_update(
