@@ -624,12 +624,18 @@ Environment="OMP_NUM_THREADS=2"
 Environment="MKL_NUM_THREADS=2"
 Environment="NUMEXPR_NUM_THREADS=2"
 Environment="NUMBA_NUM_THREADS=2"
+# --no-control-socket: gunicorn 25's control-socket thread does not shut
+# down cleanly under the eventlet worker (Thread.join(timeout=2.0) inside
+# Arbiter.halt() raises eventlet.timeout.Timeout instead of returning),
+# crash-exiting every stop/restart instead of shutting down cleanly. See
+# install.sh's matching comment for the confirmed production incident.
 ExecStart=/bin/bash -c 'source $VENV_PATH/bin/activate && $VENV_PATH/bin/gunicorn \\
     --worker-class eventlet \\
     -w 1 \\
     --bind unix:$SOCKET_FILE \\
     --timeout 300 \\
     --log-level info \\
+    --no-control-socket \\
     app:app'
 Restart=always
 RestartSec=5

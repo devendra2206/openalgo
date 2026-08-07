@@ -1174,12 +1174,23 @@ Environment="MKL_NUM_THREADS=2"
 Environment="NUMEXPR_NUM_THREADS=2"
 Environment="NUMBA_NUM_THREADS=2"
 # Simplified approach to ensure Python environment is properly loaded
+# --no-control-socket: gunicorn 25's control-socket thread does not shut down
+# cleanly under the eventlet worker -- Arbiter.halt()'s
+# _stop_control_server() calls Thread.join(timeout=2.0), and eventlet's
+# monkey-patched threading raises eventlet.timeout.Timeout there instead of
+# just returning after the timeout, so every stop/restart crash-exits
+# (status=1/FAILURE) instead of shutting down cleanly. Confirmed in
+# production (2026-08-07): a strategy_reporting relay request in flight
+# during one of these crash-exits saw the connection reset out from under
+# it. Not needed anyway -- nothing in this deployment uses the control
+# socket -- so disabling it removes the buggy shutdown path entirely.
 ExecStart=/bin/bash -c 'source $VENV_PATH/bin/activate && $VENV_PATH/bin/gunicorn \
     --worker-class eventlet \
     -w 1 \
     --bind unix:$SOCKET_FILE \
     --timeout 300 \
     --log-level info \
+    --no-control-socket \
     app:app'
 # Restart settings
 Restart=always
