@@ -618,6 +618,29 @@ class BrokerData:
                 datetime.strptime(end_date_str + " 23:59:59", "%Y-%m-%d %H:%M:%S").timestamp()
             )
 
+            # `end_ts` stays the user's ORIGINAL requested end -- the "append
+            # today's data from quotes" block further below still needs the
+            # true requested range to decide whether today's bar belongs in
+            # the response at all. `tpseries_end_ts` is what actually gets
+            # sent to TPSeries, and is the one clamped for "D" below.
+            tpseries_end_ts = end_ts
+
+            if interval == "D":
+                # Never ask TPSeries for a daily bar covering TODAY -- confirmed
+                # in production (2026-08-07) that Shoonya's server hangs with
+                # emsg="Server Timeout" whenever the requested range includes
+                # today's (still-forming) day, independent of range size or the
+                # chunk-window fix above. Clamp the TPSeries request to end at
+                # yesterday; the "append today's data from quotes" block
+                # further below still runs off the real `end_ts` and supplies
+                # today's bar separately via GetQuotes, so nothing is lost --
+                # TPSeries just never has to compute an incomplete day.
+                today_start_ts = int(
+                    datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+                )
+                if tpseries_end_ts >= today_start_ts:
+                    tpseries_end_ts = today_start_ts - 1
+
             # Use TPSeries for all intervals (including daily via intrv="D").
             # Post-OAuth, Shoonya's /NorenWClientAPI/EODChartData returns 405
             # Method Not Allowed — the endpoint was removed. TPSeries with
@@ -633,8 +656,8 @@ class BrokerData:
 
             response_candles = []
             chunk_start = start_ts
-            while chunk_start <= end_ts:
-                chunk_end = min(chunk_start + chunk_seconds, end_ts)
+            while chunk_start <= tpseries_end_ts:
+                chunk_end = min(chunk_start + chunk_seconds, tpseries_end_ts)
                 payload = {
                     "exch": exchange,
                     "token": token,
