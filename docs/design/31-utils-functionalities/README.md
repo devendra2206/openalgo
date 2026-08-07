@@ -99,10 +99,10 @@ def get_real_ip():
 
 ```python
 def get_httpx_client():
-    """Get connection-pooled HTTP client"""
+    """Get the shared, process-wide connection-pooled HTTP client"""
     # Features:
-    # - HTTP/2 support
-    # - Connection pooling (20 keepalive, 50 max)
+    # - HTTP/1.1 only -- HTTP/2 is disabled unconditionally (see below)
+    # - Connection pooling (40 keepalive, 100 max)
     # - 120-second timeout
     # - Latency tracking hooks
 
@@ -115,6 +115,25 @@ def get(url, **kwargs):
 def post(url, **kwargs):
     """HTTP POST shortcut"""
 ```
+
+**HTTP/2 is deliberately disabled**, not just in standalone/Docker mode as
+earlier versions of this client had it. Production runs
+`gunicorn --worker-class eventlet -w 1`: one process, many concurrent
+eventlet green threads sharing this single client instance. HTTP/2
+multiplexes many logical requests over one TCP connection via a single
+mutable state machine (tracking stream/window state); if eventlet's
+cooperative scheduler switches between two green threads while both are
+mid-operation on that same connection, the state machine can be mutated in
+an order it doesn't expect. Confirmed in production (2026-08-07):
+`httpx.LocalProtocolError: Invalid input ConnectionInputs.RECV_WINDOW_UPDATE
+in state ConnectionState.CLOSED`, recurring across multiple *purely
+synchronous* call sites (broker quote/history fetches, no `asyncio`
+involved) — one green thread's already-closed view of the connection
+colliding with another's still-active one. Once corrupted, every
+subsequent request reusing that pooled connection failed the same way,
+regardless of which broker call it belonged to. HTTP/1.1 has no shared
+mutable multiplexed connection to corrupt — each concurrent request gets
+its own connection from the pool instead.
 
 ### 5. Logging (logging.py)
 

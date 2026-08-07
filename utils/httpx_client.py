@@ -1,6 +1,8 @@
 """
-Shared httpx client module with connection pooling support for all broker APIs
-with automatic protocol negotiation (HTTP/2 when available, HTTP/1.1 fallback)
+Shared httpx client module with connection pooling support for all broker
+APIs. HTTP/1.1 only -- HTTP/2 is disabled unconditionally, see
+_create_http_client's comment for the eventlet-concurrency corruption this
+avoids.
 """
 
 from typing import Optional
@@ -18,26 +20,23 @@ _httpx_client = None
 
 def get_httpx_client() -> httpx.Client:
     """
-    Returns an HTTP client with automatic protocol negotiation.
-    The client will use HTTP/2 when the server supports it,
-    otherwise automatically falls back to HTTP/1.1.
+    Returns the shared, process-wide HTTP/1.1 client (HTTP/2 is disabled --
+    see _create_http_client's comment for why).
 
     Returns:
-        httpx.Client: A configured HTTP client with protocol auto-negotiation
+        httpx.Client: The shared configured HTTP client
     """
     global _httpx_client
 
     if _httpx_client is None:
         _httpx_client = _create_http_client()
-        logger.debug(
-            "Created HTTP client with automatic protocol negotiation (HTTP/2 preferred, HTTP/1.1 fallback)"
-        )
+        logger.debug("Created shared HTTP/1.1 client")
     return _httpx_client
 
 
 def request(method: str, url: str, **kwargs) -> httpx.Response:
     """
-    Make an HTTP request using the shared client with automatic protocol negotiation.
+    Make an HTTP request using the shared HTTP/1.1 client.
 
     Args:
         method: HTTP method (GET, POST, etc.)
@@ -133,13 +132,13 @@ def delete(url: str, **kwargs) -> httpx.Response:
 
 def _create_http_client() -> httpx.Client:
     """
-    Create a new HTTP client with automatic protocol negotiation and latency tracking.
-    Enables both HTTP/2 and HTTP/1.1, letting httpx choose the best protocol.
+    Create a new HTTP client with latency tracking. HTTP/2 is disabled
+    unconditionally (see the comment where the client is constructed) --
+    only HTTP/1.1 is used.
 
     Returns:
-        httpx.Client: A configured HTTP client with protocol auto-negotiation and timing hooks
+        httpx.Client: A configured HTTP client with timing hooks
     """
-    import os
     import time
 
     from flask import g
@@ -173,16 +172,28 @@ def _create_http_client() -> httpx.Client:
             logger.exception(f"Error in response hook: {e}")
 
     try:
-        # Detect if running in standalone mode (Docker/production) vs integrated mode (local dev)
-        # In standalone mode, disable HTTP/2 to avoid protocol negotiation issues
-        app_mode = os.environ.get("APP_MODE", "integrated").strip().strip("'\"")
-        is_standalone = app_mode == "standalone"
-
-        # Disable HTTP/2 in standalone/Docker environments to avoid protocol negotiation issues
-        http2_enabled = not is_standalone
-
+        # HTTP/2 is disabled unconditionally, not just in standalone mode.
+        # HTTP/2 multiplexes multiple logical requests over ONE shared TCP
+        # connection via a single mutable h2 state machine -- this process
+        # runs one shared httpx.Client instance accessed concurrently by
+        # many eventlet green threads (one per request/strategy). If
+        # eventlet's cooperative scheduler switches between two green
+        # threads at the wrong moment while both touch the same h2
+        # connection object, that state machine corrupts. Confirmed in
+        # production (2026-08-07): "Invalid input
+        # ConnectionInputs.RECV_WINDOW_UPDATE in state
+        # ConnectionState.CLOSED" recurring across multiple, PURELY
+        # SYNCHRONOUS call sites (get_quotes, TPSeries chunk fetch -- no
+        # asyncio involved at all), i.e. this is an eventlet-concurrency
+        # risk inherent to HTTP/2 multiplexing itself, not a symptom of any
+        # one broker call's own code. The standalone-mode comment already
+        # anticipated this exact class of "protocol negotiation issue" and
+        # worked around it there; this makes that the default everywhere,
+        # since integrated mode hit the same risk. HTTP/1.1 doesn't share
+        # it -- each request gets its own pooled connection instead of a
+        # shared mutable multiplexed one.
         client = httpx.Client(
-            http2=http2_enabled,  # Disable HTTP/2 in standalone mode, enable in integrated mode
+            http2=False,
             http1=True,  # Always enable HTTP/1.1 for compatibility
             timeout=120.0,  # Increased timeout for large historical data requests
             limits=httpx.Limits(
@@ -196,10 +207,7 @@ def _create_http_client() -> httpx.Client:
             event_hooks={"request": [log_request], "response": [log_response]},
         )
 
-        if is_standalone:
-            logger.debug("Running in standalone mode - HTTP/2 disabled for compatibility")
-        else:
-            logger.debug("Running in integrated mode - HTTP/2 enabled for optimal performance")
+        logger.debug("HTTP/2 disabled unconditionally -- see this function's own comment for why")
 
         return client
 

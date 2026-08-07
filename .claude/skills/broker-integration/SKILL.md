@@ -229,7 +229,7 @@ counts across the 35 existing plugins:
 | Module | Uses | What you must take from it |
 | --- | --- | --- |
 | `utils.logging` | ~339 | `logger = get_logger(__name__)` in every module. Its `SensitiveDataFilter` is what stops broker tokens reaching the logs — a bare `print()` or `logging.getLogger()` bypasses that redaction. Errors use `logger.exception()`. |
-| `utils.httpx_client` | ~197 | `get_httpx_client()` — the shared pooled HTTP/2 client. Never construct a per-call client. Always pass an explicit `timeout=`. |
+| `utils.httpx_client` | ~197 | `get_httpx_client()` — the shared pooled HTTP/1.1 client (HTTP/2 is disabled unconditionally as of 2026-08-07 — eventlet's green threads sharing one HTTP/2 connection's mutable multiplexing state caused production connection corruption; see the module's own docstring). Never construct a per-call client. Always pass an explicit `timeout=`. |
 | `utils.mpp_slab` | ~16 | Market Price Protection slabs for emulating MARKET/SL-M. See `references/order-type-emulation.md`. |
 | `utils.config` | ~5 | `get_broker_api_key()`, `get_broker_api_secret()`, `get_host_server()`, rate-limit getters. Prefer these over raw `os.getenv` so composite `:::` keys and defaults resolve consistently. |
 | `utils.constants` | 1 | `EXCHANGE_NSE`, `EXCHANGE_NFO`, ... — canonical exchange codes. Use them instead of string literals. |
@@ -254,7 +254,8 @@ See the capability list in `references/cross-broker-reference.md`.
 ## Step 5 — HTTP pooling and FD hygiene (mandatory, applies throughout)
 
 - **All REST via `utils/httpx_client.get_httpx_client()`** — a shared pooled
-  HTTP/2 client. NEVER `httpx.Client()` / `requests` / `urllib` / `aiohttp` per call.
+  HTTP/1.1 client (HTTP/2 deliberately disabled — see the module docstring).
+  NEVER `httpx.Client()` / `requests` / `urllib` / `aiohttp` per call.
 - The shared client has a default **120s timeout**; add an explicit `timeout=`
   for large/slow calls (e.g. the instrument-master download).
 - DB engines via `database.engine_factory.create_db_engine()` (NullPool).
