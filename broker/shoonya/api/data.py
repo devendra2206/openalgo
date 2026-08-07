@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 
 import httpx
 import pandas as pd
+import pytz
 
 from database.token_db import get_br_symbol, get_oa_symbol, get_token
 from utils.httpx_client import get_httpx_client
@@ -540,13 +541,9 @@ class BrokerData:
         """
         # 1m bars: ~375 per trading day -> cap at ~5 days
         # 5m bars: ~75 per day -> ~30 days
-        # daily bars: candle-count theory says a big window should be safe
-        # (1 bar/day), but confirmed in production (2026-08-07) that D
-        # requests 504 well under the old 2-year window even though 5m
-        # requests at their own (much shorter) window succeed -- Shoonya's
-        # TPSeries appears to compute daily bars server-side from finer
-        # data rather than serving pre-aggregated ones, making D requests
-        # expensive per unit of time span, not cheap. Shrunk to 90 days.
+        # "D" is not in this table -- it never reaches TPSeries at all
+        # anymore (see get_history's redirect to _get_daily_from_intraday;
+        # Shoonya's own intrv="D" proved unreliable regardless of range).
         minute_windows = {
             "1m": 5 * 24 * 3600,
             "3m": 10 * 24 * 3600,
@@ -557,7 +554,6 @@ class BrokerData:
             "1h": 180 * 24 * 3600,
             "2h": 180 * 24 * 3600,
             "4h": 365 * 24 * 3600,
-            "D": 90 * 24 * 3600,
         }
         return minute_windows.get(interval, 30 * 24 * 3600)
 
@@ -585,6 +581,19 @@ class BrokerData:
                 raise Exception(
                     f"Unsupported interval '{interval}'. Supported intervals are: {', '.join(supported)}"
                 )
+
+            # Shoonya's TPSeries intrv="D" is unreliable in production
+            # (2026-08-07: emsg="Server Timeout" even after excluding today
+            # and shrinking the chunk window -- confirmed it fails on
+            # historical-only ranges too, not just today's incomplete day).
+            # 5m TPSeries requests against the same symbol/range are proven
+            # reliable, so daily bars are computed by aggregating 5m candles
+            # instead of ever asking the broker for pre-aggregated daily
+            # data. This also naturally handles today's still-forming bar
+            # correctly (real intraday data, not the old GetQuotes
+            # single-snapshot fallback with high/low left at 0).
+            if interval == "D":
+                return self._get_daily_from_intraday(symbol, exchange, start_date, end_date)
 
             # Convert symbol to broker format and get token
             br_symbol = get_br_symbol(symbol, exchange)
@@ -618,33 +627,11 @@ class BrokerData:
                 datetime.strptime(end_date_str + " 23:59:59", "%Y-%m-%d %H:%M:%S").timestamp()
             )
 
-            # `end_ts` stays the user's ORIGINAL requested end -- the "append
-            # today's data from quotes" block further below still needs the
-            # true requested range to decide whether today's bar belongs in
-            # the response at all. `tpseries_end_ts` is what actually gets
-            # sent to TPSeries, and is the one clamped for "D" below.
-            tpseries_end_ts = end_ts
-
-            if interval == "D":
-                # Never ask TPSeries for a daily bar covering TODAY -- confirmed
-                # in production (2026-08-07) that Shoonya's server hangs with
-                # emsg="Server Timeout" whenever the requested range includes
-                # today's (still-forming) day, independent of range size or the
-                # chunk-window fix above. Clamp the TPSeries request to end at
-                # yesterday; the "append today's data from quotes" block
-                # further below still runs off the real `end_ts` and supplies
-                # today's bar separately via GetQuotes, so nothing is lost --
-                # TPSeries just never has to compute an incomplete day.
-                today_start_ts = int(
-                    datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-                )
-                if tpseries_end_ts >= today_start_ts:
-                    tpseries_end_ts = today_start_ts - 1
-
-            # Use TPSeries for all intervals (including daily via intrv="D").
-            # Post-OAuth, Shoonya's /NorenWClientAPI/EODChartData returns 405
-            # Method Not Allowed — the endpoint was removed. TPSeries with
-            # intrv="D" covers daily bars, so we route everything through it.
+            # Use TPSeries for all intraday intervals. "D" never reaches here
+            # -- handled by _get_daily_from_intraday above, since Shoonya's
+            # dedicated /NorenWClientAPI/EODChartData endpoint returns 405
+            # Method Not Allowed post-OAuth (removed) and TPSeries with
+            # intrv="D" is itself unreliable (see the comment above).
             # Chart endpoints require jKey in the form-urlencoded body (Bearer
             # header alone returns an empty body).
             #
@@ -656,8 +643,8 @@ class BrokerData:
 
             response_candles = []
             chunk_start = start_ts
-            while chunk_start <= tpseries_end_ts:
-                chunk_end = min(chunk_start + chunk_seconds, tpseries_end_ts)
+            while chunk_start <= end_ts:
+                chunk_end = min(chunk_start + chunk_seconds, end_ts)
                 payload = {
                     "exch": exchange,
                     "token": token,
@@ -754,51 +741,6 @@ class BrokerData:
                     columns=["timestamp", "open", "high", "low", "close", "volume", "oi"]
                 )
 
-            # For daily data, append today's data from quotes if it's missing
-            if interval == "D":
-                today_ts = int(
-                    datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-                )
-
-                # Only get today's data if it's within the requested range
-                if today_ts >= start_ts and today_ts <= end_ts:
-                    if df.empty or df["timestamp"].max() < today_ts:
-                        try:
-                            # Get today's data from quotes
-                            payload = {"exch": exchange, "token": token}
-                            quotes_response = get_api_response(
-                                "/NorenWClientAPI/GetQuotes", self.auth_token, payload=payload
-                            )
-                            logger.debug(f"Quotes Response: {quotes_response}")  # Debug print
-
-                            if quotes_response and quotes_response.get("stat") == "Ok":
-                                today_data = {
-                                    "timestamp": today_ts,
-                                    "open": float(quotes_response.get("o", 0)),
-                                    "high": float(quotes_response.get("h", 0)),
-                                    "low": float(quotes_response.get("l", 0)),
-                                    "close": float(
-                                        quotes_response.get("lp", 0)
-                                    ),  # Use LTP as close
-                                    "volume": float(quotes_response.get("v", 0)),
-                                    "oi": float(quotes_response.get("oi", 0)),
-                                }
-                                logger.debug(f"Today's quote data: {today_data}")
-                                # Append today's data -- concat with an empty df triggers
-                                # pandas' FutureWarning about dtype inference changing,
-                                # since df can genuinely be empty here (df.empty check above)
-                                if df.empty:
-                                    df = pd.DataFrame([today_data])
-                                else:
-                                    df = pd.concat([df, pd.DataFrame([today_data])], ignore_index=True)
-                                logger.debug("Added today's data from quotes")
-                        except Exception as e:
-                            logger.info(f"Error fetching today's data from quotes: {e}")
-                else:
-                    logger.info(
-                        f"Today ({today_ts}) is outside requested range ({start_ts} to {end_ts})"
-                    )
-
             # Sort by timestamp
             df = df.sort_values("timestamp")
             return df
@@ -806,3 +748,41 @@ class BrokerData:
         except Exception as e:
             logger.error(f"Error in get_history: {e}")  # Add debug logging
             raise Exception(f"Error fetching historical data: {str(e)}")
+
+    def _get_daily_from_intraday(
+        self, symbol: str, exchange: str, start_date: str, end_date: str
+    ) -> pd.DataFrame:
+        """Daily OHLCV derived by aggregating 5m candles (proven reliable
+        against Shoonya's TPSeries -- see the comment at get_history's "D"
+        redirect for why intrv="D" itself is not used). open/high/low/close/
+        volume aggregate exactly from 5m bars with no precision loss; a
+        still-forming today is naturally included as a real partial day
+        (whatever 5m bars exist so far), not a single GetQuotes snapshot."""
+        intraday = self.get_history(symbol, exchange, "5m", start_date, end_date)
+        cols = ["timestamp", "open", "high", "low", "close", "volume", "oi"]
+        if intraday is None or intraday.empty:
+            return pd.DataFrame(columns=cols)
+
+        ist = pytz.timezone("Asia/Kolkata")
+        intraday = intraday.copy()
+        intraday["ist_date"] = intraday["timestamp"].apply(
+            lambda ts: datetime.fromtimestamp(int(ts), ist).date()
+        )
+
+        daily_rows = []
+        for day, group in intraday.groupby("ist_date"):
+            group = group.sort_values("timestamp")
+            day_start_ts = int(
+                ist.localize(datetime.combine(day, datetime.min.time())).timestamp()
+            )
+            daily_rows.append({
+                "timestamp": day_start_ts,
+                "open": float(group["open"].iloc[0]),
+                "high": float(group["high"].max()),
+                "low": float(group["low"].min()),
+                "close": float(group["close"].iloc[-1]),
+                "volume": float(group["volume"].sum()),
+                "oi": float(group["oi"].iloc[-1]) if "oi" in group.columns else 0.0,
+            })
+
+        return pd.DataFrame(daily_rows, columns=cols).sort_values("timestamp").reset_index(drop=True)
