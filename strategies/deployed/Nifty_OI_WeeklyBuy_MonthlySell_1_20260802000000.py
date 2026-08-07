@@ -85,8 +85,8 @@ docs -- see the plan doc SS2 for the verification trail)
     UNCACHED REST call, so only invoked when selecting a NEW monthly strike
     (leg flat), never on every candle.
   - Weekly/Monthly expiry dates: client.expiry(instrumenttype="options"),
-    picked by date-distance logic (nearest = weekly; >20 days to expiry ->
-    current month, else next month, per spec SS8).
+    picked by date-distance logic (nearest = weekly; calendar day-of-month
+    <= 20 -> current month's expiry, > 20 -> next month's, per spec SS8).
   - Weekly OTM1 strike: client.optionchain() around current spot, picking
     the nearest REAL LISTED strike beyond ATM in the OTM direction (not an
     assumed fixed increment -- the spec only states a fixed 100-pt rounding
@@ -205,7 +205,7 @@ class Config:
     monthly_delta_low: float = 0.20
     monthly_delta_high: float = 0.25
     monthly_strike_round: int = 100           # spec SS9: round Monthly strike to nearest 100
-    monthly_expiry_roll_days: int = 20        # spec SS8: >20 days to expiry -> current month
+    monthly_expiry_roll_day_of_month: int = 20  # spec SS8: calendar day > 20 -> roll to next month's expiry
 
     # Consecutive OPPOSITE-verdict candles (relative to the leg's own entry
     # trigger verdict) required to exit -- both engines, per spec.
@@ -853,11 +853,12 @@ def resolve_weekly_expiry(client) -> tuple[str, str]:
 
 
 def resolve_monthly_expiry(client) -> tuple[str, str]:
-    """Spec SS8: current month's expiry if >20 days remain, else the next
-    month's. `dates_raw` from client.expiry() is every live expiry
-    (weekly + monthly mixed) sorted ascending -- the month-end dates are
-    identifiable as the last expiry date falling within each calendar
-    month."""
+    """Spec SS8: calendar day-of-month > 20 -> roll to next month's expiry,
+    regardless of how many days remain to the current month's own expiry;
+    on/before the 20th, use the current month's own expiry. `dates_raw` from
+    client.expiry() is every live expiry (weekly + monthly mixed) sorted
+    ascending -- the month-end dates are identifiable as the last expiry
+    date falling within each calendar month."""
     resp = client.expiry(symbol=UNDERLYING_SYMBOL, exchange=OPTIONS_EXCHANGE, instrumenttype="options")
     if resp.get("status") != "success" or not resp.get("data"):
         raise RuntimeError(f"Could not resolve monthly options expiry: {resp}")
@@ -876,10 +877,11 @@ def resolve_monthly_expiry(client) -> tuple[str, str]:
     current_month_key = (today.year, today.month)
     current_month_end = month_ends.get(current_month_key)
 
-    if current_month_end is not None and (current_month_end - today).days > config.monthly_expiry_roll_days:
+    if today.day <= config.monthly_expiry_roll_day_of_month and current_month_end is not None:
         chosen = current_month_end
     else:
-        # Next month's month-end.
+        # Past the roll day-of-month (or the current month's own expiry has
+        # already passed) -- next month's month-end.
         future_keys = sorted(k for k in month_ends if k > current_month_key)
         if not future_keys:
             raise RuntimeError("No next-month expiry available to roll to.")

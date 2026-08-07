@@ -71,19 +71,43 @@ def copy_from_dataframe(df):
         row for row in data_dict if (row["token"], row["exchange"]) not in existing_token_exchange
     ]
 
+    # Drop any record that would violate symbol/brsymbol's NOT NULL
+    # constraint (NaN or blank) -- defense in depth, independent of
+    # whichever per-exchange process_* function produced this dataframe.
+    # A single such record previously sank db_session.bulk_insert_mappings()
+    # for the WHOLE exchange (all-or-nothing), silently rolling back every
+    # valid row alongside it while master_contract_download() still
+    # reported overall "success" -- confirmed 2026-08-07 on Shoonya NFO,
+    # where 18 dummy rows out of thousands emptied the entire NFO table.
+    clean_data_dict = []
+    skipped = 0
+    for row in filtered_data_dict:
+        symbol, brsymbol = row.get("symbol"), row.get("brsymbol")
+        if symbol is None or brsymbol is None or pd.isna(symbol) or pd.isna(brsymbol) or \
+           str(symbol).strip() == "" or str(brsymbol).strip() == "":
+            skipped += 1
+            continue
+        clean_data_dict.append(row)
+    if skipped:
+        logger.warning(
+            f"Skipped {skipped} record(s) with missing symbol/brsymbol before bulk insert "
+            f"(would have violated a NOT NULL constraint and rolled back the entire batch)."
+        )
+
     # Insert in bulk the filtered records
     try:
-        if filtered_data_dict:  # Proceed only if there's anything to insert
-            db_session.bulk_insert_mappings(SymToken, filtered_data_dict)
+        if clean_data_dict:  # Proceed only if there's anything to insert
+            db_session.bulk_insert_mappings(SymToken, clean_data_dict)
             db_session.commit()
             logger.info(
-                f"Bulk insert completed successfully with {len(filtered_data_dict)} new records."
+                f"Bulk insert completed successfully with {len(clean_data_dict)} new records."
             )
         else:
             logger.info("No new records to insert.")
     except Exception as e:
         logger.error(f"Error during bulk insert: {e}")
         db_session.rollback()
+        raise
 
 
 # Define the shoonya URLs for downloading the symbol files
@@ -280,6 +304,22 @@ def process_shoonya_nfo_data(output_path):
         "strike",
         "tick_size",
     ]
+
+    # Drop dummy/combo placeholder rows -- Shoonya's raw NFO_symbols.txt
+    # occasionally has rows with blank Symbol/TradingSymbol/Instrument
+    # (2026-08-07: 18 such rows observed, tokens 36687-48577). Left
+    # unfiltered, NaN in these columns stringifies literally as "nan" in
+    # the symbol built below (e.g. "nan0nan"), and NaN bound as a SQLite
+    # parameter is treated as NULL -- violating symtoken.brsymbol's NOT
+    # NULL constraint and rolling back the ENTIRE NFO bulk insert (see
+    # copy_from_dataframe), not just these rows. Same defensive pattern as
+    # process_shoonya_cds_data's token>100 filter for the analogous CDS
+    # dummy-entry case.
+    before = len(df)
+    df = df.dropna(subset=["name", "brsymbol", "instrumenttype"])
+    df = df[(df["name"].str.strip() != "") & (df["brsymbol"].str.strip() != "")]
+    if len(df) < before:
+        logger.warning(f"Dropped {before - len(df)} NFO row(s) with missing symbol/name/instrument data")
 
     # Add missing columns to ensure DataFrame matches the database structure
     df["expiry"] = df["expiry"].fillna("")  # Fill expiry with empty strings if missing
