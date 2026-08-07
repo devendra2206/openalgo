@@ -1440,29 +1440,37 @@ def append_trade_log(strategy_tag: str, leg_key: str, symbol: str, quantity: int
 
 
 def _post_json_local(env: "Environment", path: str, payload: bytes, timeout: float = 3.0):
-    """POST to the dedicated strategy_reporting subprocess -- trying in
-    order: (1) plain TCP loopback on STRATEGY_REPORTING_PORT (default
-    8766); (2) env.host (HOST_SERVER/OPENALGO_HOST), routed through
-    nginx's /python location block to the same subprocess, as a last
-    resort only. 2026-08-05: moved off the main app's openalgo.sock/
+    """POST to the dedicated strategy_reporting subprocess over plain TCP
+    loopback on STRATEGY_REPORTING_PORT (default 8766). Retries once at
+    3x the timeout before giving up -- covers the post-restart burst
+    where every running strategy reconnects at once and the dev-grade
+    werkzeug server can't accept new connections fast enough within the
+    first, short timeout. 2026-08-07: dropped the env.host (public
+    domain) fallback that used to run here -- confirmed in production
+    that env.host is proxied through Cloudflare, which silently 403s
+    this urllib-originated traffic (bot/WAF protection) before it ever
+    reaches nginx or this app, masking the real error (a loopback
+    timeout) behind a misleading "Forbidden" that looked like an
+    ownership bug. 2026-08-05: moved off the main app's openalgo.sock/
     FLASK_PORT -- these reporting calls used to share the single
     gunicorn+eventlet worker with every other route in the app, so an
     unrelated slow endpoint elsewhere (confirmed in production:
     /traffic/api/stats) could block the worker long enough that these
     timed out even though nothing about the strategy was wrong. The
     dedicated subprocess is immune to that by construction (a separate
-    process, plain OS threads, not eventlet). Raises if every transport
-    fails; caller logs and swallows."""
+    process, plain OS threads, not eventlet). Raises if both attempts
+    fail; caller logs and swallows."""
     headers = {"Content-Type": "application/json"}
+    base = f"http://127.0.0.1:{os.getenv('STRATEGY_REPORTING_PORT', '8766')}"
     last_exc: Optional[Exception] = None
-    for base in (f"http://127.0.0.1:{os.getenv('STRATEGY_REPORTING_PORT', '8766')}", env.host.rstrip("/")):
+    for attempt_timeout in (timeout, timeout * 3):
         try:
             req = urllib.request.Request(f"{base}{path}", data=payload, method="POST", headers=headers)
-            urllib.request.urlopen(req, timeout=timeout).close()
+            urllib.request.urlopen(req, timeout=attempt_timeout).close()
             return
         except Exception as exc:
             last_exc = exc
-            Log.warning(f"_post_json_local: attempt via {base} failed: {exc}")
+            Log.warning(f"_post_json_local: attempt (timeout={attempt_timeout}s) failed: {exc}")
     raise last_exc
 
 
@@ -1492,20 +1500,20 @@ def report_pnl_to_platform(env: "Environment", realized_pnl: float, open_positio
 
 
 def _get_json_local(env: "Environment", path: str, timeout: float = 3.0) -> dict:
-    """GET counterpart to _post_json_local -- same STRATEGY_REPORTING_PORT
-    -> env.host fallback chain (2026-08-05: see that function's docstring
-    for why this moved off the main app's openalgo.sock/FLASK_PORT).
-    Raises if every transport fails; caller treats it as "no action
-    pending" rather than crashing the scheduler loop over a reporting
-    hiccup."""
+    """GET counterpart to _post_json_local -- same loopback-with-retry
+    behavior (2026-08-07: see that function's docstring for why the
+    env.host/Cloudflare fallback was dropped). Raises if both attempts
+    fail; caller treats it as "no action pending" rather than crashing
+    the scheduler loop over a reporting hiccup."""
+    base = f"http://127.0.0.1:{os.getenv('STRATEGY_REPORTING_PORT', '8766')}"
     last_exc: Optional[Exception] = None
-    for base in (f"http://127.0.0.1:{os.getenv('STRATEGY_REPORTING_PORT', '8766')}", env.host.rstrip("/")):
+    for attempt_timeout in (timeout, timeout * 3):
         try:
-            with urllib.request.urlopen(f"{base}{path}", timeout=timeout) as resp:
+            with urllib.request.urlopen(f"{base}{path}", timeout=attempt_timeout) as resp:
                 return json.loads(resp.read())
         except Exception as exc:
             last_exc = exc
-            Log.warning(f"_get_json_local: attempt via {base} failed: {exc}")
+            Log.warning(f"_get_json_local: attempt (timeout={attempt_timeout}s) failed: {exc}")
     raise last_exc
 
 
