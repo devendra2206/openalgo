@@ -540,7 +540,13 @@ class BrokerData:
         """
         # 1m bars: ~375 per trading day -> cap at ~5 days
         # 5m bars: ~75 per day -> ~30 days
-        # daily bars: 1 per day -> ~2 years
+        # daily bars: candle-count theory says a big window should be safe
+        # (1 bar/day), but confirmed in production (2026-08-07) that D
+        # requests 504 well under the old 2-year window even though 5m
+        # requests at their own (much shorter) window succeed -- Shoonya's
+        # TPSeries appears to compute daily bars server-side from finer
+        # data rather than serving pre-aggregated ones, making D requests
+        # expensive per unit of time span, not cheap. Shrunk to 90 days.
         minute_windows = {
             "1m": 5 * 24 * 3600,
             "3m": 10 * 24 * 3600,
@@ -551,7 +557,7 @@ class BrokerData:
             "1h": 180 * 24 * 3600,
             "2h": 180 * 24 * 3600,
             "4h": 365 * 24 * 3600,
-            "D": 2 * 365 * 24 * 3600,
+            "D": 90 * 24 * 3600,
         }
         return minute_windows.get(interval, 30 * 24 * 3600)
 
@@ -755,14 +761,19 @@ class BrokerData:
                                     "oi": float(quotes_response.get("oi", 0)),
                                 }
                                 logger.debug(f"Today's quote data: {today_data}")
-                                # Append today's data
-                                df = pd.concat([df, pd.DataFrame([today_data])], ignore_index=True)
+                                # Append today's data -- concat with an empty df triggers
+                                # pandas' FutureWarning about dtype inference changing,
+                                # since df can genuinely be empty here (df.empty check above)
+                                if df.empty:
+                                    df = pd.DataFrame([today_data])
+                                else:
+                                    df = pd.concat([df, pd.DataFrame([today_data])], ignore_index=True)
                                 logger.debug("Added today's data from quotes")
                         except Exception as e:
                             logger.info(f"Error fetching today's data from quotes: {e}")
                 else:
                     logger.info(
-                        f"Today ({{today_ts}}) is outside requested range ({{start_ts}} to {end_ts})"
+                        f"Today ({today_ts}) is outside requested range ({start_ts} to {end_ts})"
                     )
 
             # Sort by timestamp
