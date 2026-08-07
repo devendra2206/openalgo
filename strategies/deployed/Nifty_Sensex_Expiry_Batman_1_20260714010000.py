@@ -1290,6 +1290,7 @@ def _post_json_local(env: "Environment", path: str, payload: bytes, timeout: flo
             return
         except Exception as exc:
             last_exc = exc
+            Log.warning(f"_post_json_local: attempt via {base} failed: {exc}")
     raise last_exc
 
 
@@ -1333,6 +1334,7 @@ def _get_json_local(env: "Environment", path: str, timeout: float = 3.0) -> dict
                 return json.loads(resp.read())
         except Exception as exc:
             last_exc = exc
+            Log.warning(f"_get_json_local: attempt via {base} failed: {exc}")
     raise last_exc
 
 
