@@ -15,15 +15,23 @@ from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
 
 # Auto-detect eventlet environment (Docker/standalone uses gunicorn+eventlet)
-# asyncio.run() cannot be called under eventlet's monkey-patched event loop
+# asyncio.run() cannot be called under eventlet's monkey-patched event loop.
+# Checked fresh at CALL TIME (never cached at import time) -- caching this in
+# a module-level constant is a real, confirmed production bug: if this module
+# happens to import before gunicorn's eventlet worker class finishes
+# monkey-patching, the cached value is wrong for the rest of that worker's
+# life, letting asyncio.run() fire under eventlet and corrupt the shared
+# httpx connection pool's HTTP/2 state (confirmed 2026-08-07: h2 "Invalid
+# input ConnectionInputs.RECV_WINDOW_UPDATE in state ConnectionState.CLOSED"
+# on a completely unrelated sync TPSeries call, plus asyncio's own
+# "Future.set_result() ... InvalidStateError" -- both symptoms of the same
+# root cause).
 def _is_eventlet_patched():
     try:
         import eventlet.patcher
         return eventlet.patcher.is_monkey_patched("socket")
     except (ImportError, AttributeError):
         return False
-
-USE_ASYNC = not _is_eventlet_patched()
 
 logger = get_logger(__name__)
 
@@ -416,9 +424,11 @@ class BrokerData:
         # Step 2: Make concurrent API calls
         start_time = time.time()
 
-        # Runtime check: even if USE_ASYNC is True, asyncio.run() will crash
-        # if called from within an already-running event loop
-        use_async = USE_ASYNC
+        # Checked fresh here, not cached -- see _is_eventlet_patched's own
+        # docstring for why a module-level constant was a real bug. Also
+        # still guards against an already-running event loop (asyncio.run()
+        # crashes if called from inside one), independent of eventlet.
+        use_async = not _is_eventlet_patched()
         if use_async:
             try:
                 asyncio.get_running_loop()
