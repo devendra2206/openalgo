@@ -416,7 +416,21 @@ def api_push_pnl(strategy_id):
         db_session.commit()
 
     now = time.monotonic()
-    last_write = _last_pnl_db_write.get(strategy_id, 0.0)
+    if strategy_id not in _last_pnl_db_write:
+        # Stagger the very first write per strategy after this subprocess
+        # (re)starts: without this, a never-seen strategy_id defaults to
+        # "last write 0.0", so every running strategy's first tick writes
+        # unthrottled -- and since every strategy reconnects within the same
+        # few seconds of a restart, that's an all-at-once burst of writes,
+        # exactly the SQLite "database is locked" contention the throttle
+        # above exists to prevent (confirmed in production, 2026-08-07:
+        # report_pnl_to_platform timing out for 12+s straight right after a
+        # restart, concurrent with a real "database is locked" error from
+        # the main app's own state-restoration burst). Seeding a random
+        # virtual last-write-time spreads first writes across the full
+        # _PNL_DB_WRITE_INTERVAL_SEC window instead of letting them collide.
+        _last_pnl_db_write[strategy_id] = now - random.uniform(0, _PNL_DB_WRITE_INTERVAL_SEC)
+    last_write = _last_pnl_db_write[strategy_id]
     if now - last_write >= _PNL_DB_WRITE_INTERVAL_SEC:
         _write_with_retry(_do_write)
         _last_pnl_db_write[strategy_id] = now
