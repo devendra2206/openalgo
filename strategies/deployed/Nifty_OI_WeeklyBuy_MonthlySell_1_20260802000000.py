@@ -155,6 +155,7 @@ from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from openalgo import api
+from opengreeks import black76
 
 # See MCX_CrudeOil_EMA9_RSI_Intraday's identical comment -- several
 # always-on threads (fill-watchers, trade-log writer, PriceStream's own
@@ -941,34 +942,81 @@ def select_weekly_otm1_strike(client, spot: float, expiry_compact: str, option_t
     return max(candidates)
 
 
+def _years_to_expiry(expiry_raw: str) -> float:
+    """Time to expiry in years, for the Black-76 model -- replicates
+    services/option_greeks_service.py's calculate_time_to_expiry() exactly
+    (same NFO 15:30 expiry time, same IST 'now', same 0.0001-year floor),
+    so select_monthly_delta_strike's local math matches what optiongreeks()
+    would have computed server-side."""
+    expiry_date = datetime.strptime(expiry_raw, "%d-%b-%y")
+    expiry_dt = IST.localize(
+        expiry_date.replace(hour=15, minute=30, second=0, microsecond=0)
+    )
+    now = datetime.now(IST)
+    years = (expiry_dt - now).total_seconds() / (60 * 60 * 24) / 365.0
+    return max(years, 0.0001)
+
+
 def select_monthly_delta_strike(client, spot: float, expiry_raw: str, option_type: str) -> tuple[float, float]:
     """Nearest 100-pt strike where |Delta| is within [monthly_delta_low,
-    monthly_delta_high] (spec SS9), via optiongreeks() -- a live, uncached
-    REST call, so only invoked at new-strike-selection time (leg flat),
-    never on every candle (see module docstring). Scans outward from ATM in
-    100-pt steps on the OTM side for `option_type`, since delta moves
-    monotonically away from 0.50 as strikes go further OTM. Returns
-    (strike, delta_at_selection)."""
+    monthly_delta_high] (spec SS9). Scans outward from ATM in 100-pt steps
+    on the OTM side for `option_type`, since delta moves monotonically away
+    from 0.50 as strikes go further OTM. Returns (strike, delta_at_selection).
+
+    2026-08-10: replaced up to 20 sequential optiongreeks() calls (each 2
+    broker round-trips -- underlying LTP + that one option's LTP -- worst
+    case ~40 round-trips run synchronously inline on run_cycle's own
+    thread) with ONE optionchain(with_quotes=True) call covering the full
+    scan range, then local Black-76 math (opengreeks) per candidate, no
+    further network calls. Confirmed live: run_cycle's "maximum number of
+    running instances reached" pileup on nearly every 10s cycle correlated
+    directly with this function's worst-case (no-strike-found) scans.
+    Candidate strikes/order/target range are unchanged from the original
+    logic -- this is a performance fix only, not a strike-selection change
+    (verified: NIFTY's real listed strikes are 50pts apart, so
+    strike_count=40 on the batched fetch covers the same +/-2000pt range
+    as the original 20-step-by-100pt scan)."""
     atm_100 = round(spot / config.monthly_strike_round) * config.monthly_strike_round
     direction = 1 if option_type == "CE" else -1
+    side_key = "ce" if option_type == "CE" else "pe"
+
+    resp = client.optionchain(
+        # optionchain()'s expiry_date needs the COMPACT form ("25AUG26"), not
+        # expiry_raw's dash form ("25-Aug-26") -- see fetch_option_chain_strikes's
+        # docstring above for the 2026-08-03 production bug this exact mismatch
+        # caused elsewhere in this file.
+        underlying=UNDERLYING_SYMBOL, exchange=UNDERLYING_SPOT_EXCHANGE,
+        expiry_date=_compact_expiry(expiry_raw), strike_count=40, with_quotes=True,
+    )
+    if resp.get("status") != "success" or not resp.get("chain"):
+        raise RuntimeError(f"optionchain() failed for expiry {expiry_raw}: {resp}")
+
+    forward = float(resp.get("underlying_ltp") or spot)
+    premium_by_strike: dict[float, float] = {}
+    for row in resp["chain"]:
+        leg = row.get(side_key)
+        if leg and leg.get("ltp"):
+            premium_by_strike[float(row["strike"])] = float(leg["ltp"])
+
+    years_to_expiry = _years_to_expiry(expiry_raw)
+    flag = "c" if option_type == "CE" else "p"
+
     # Bounded scan -- 20 steps of 100pts covers +/-2000 points from ATM,
     # comfortably beyond where a 0.20-0.25 delta strike would ever sit for
-    # NIFTY's typical monthly IV/DTE combinations.
+    # NIFTY's typical monthly IV/DTE combinations. Unchanged from the
+    # original loop.
     for step in range(1, 21):
         strike = atm_100 + direction * step * config.monthly_strike_round
-        symbol = f"{UNDERLYING_SYMBOL}{_compact_expiry(expiry_raw)}{int(strike)}{option_type}"
+        premium = premium_by_strike.get(strike)
+        if premium is None:
+            continue
         try:
-            resp = client.optiongreeks(symbol=symbol, exchange=OPTIONS_EXCHANGE)
+            iv = black76.implied_volatility(premium, forward, strike, 0.0, years_to_expiry, flag)
+            delta = black76.delta(flag, forward, strike, years_to_expiry, 0.0, iv)
         except Exception as exc:
-            Log.warning(f"optiongreeks() failed for {symbol}: {exc}")
+            Log.warning(f"Local Greeks computation failed for strike {strike}: {exc}")
             continue
-        if resp.get("status") != "success":
-            Log.warning(f"optiongreeks() error for {symbol}: {resp}")
-            continue
-        delta = resp.get("greeks", {}).get("delta")
-        if delta is None:
-            continue
-        if config.monthly_delta_low <= abs(float(delta)) <= config.monthly_delta_high:
+        if config.monthly_delta_low <= abs(delta) <= config.monthly_delta_high:
             return strike, float(delta)
     raise RuntimeError(
         f"No {option_type} strike found within delta "
