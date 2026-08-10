@@ -766,6 +766,96 @@ interface changes.
 
 ---
 
+## `broker/shoonya/api/data.py`
+
+Three fixes (across five commits), all from live-hardening this broker after
+the 2026-08-07 switch to Shoonya as the live broker:
+
+1. **D-interval history shrink then replace with 5m aggregation.**
+   `55356bb63` first shrank the daily-interval TPSeries chunk window from 2
+   years to 90 days (Shoonya's TPSeries times out with a 504 on ranges that
+   wide). `3f0982d6a` then excluded today's still-forming daily bar from the
+   TPSeries request entirely (asking for it caused server-side timeouts on
+   Shoonya's end). `5ca7dc89d` finally replaced the whole `D`-interval path:
+   `get_history()` now redirects `interval == "D"` to
+   `_get_daily_from_intraday()`, which fetches 5-minute candles and
+   aggregates them into daily OHLCV locally, per explicit instruction ("let
+   commute D using 5mins candle") after the TPSeries-based approach kept
+   failing under different live conditions each time it was patched.
+
+2. **`c96491627` — stop caching the eventlet-patched check at import time.**
+   `_is_eventlet_patched()` is checked fresh on every `_process_quotes_batch()`
+   call now, not cached in a module-level `USE_ASYNC` constant at import
+   time. If this module happens to import before gunicorn's eventlet worker
+   finishes monkey-patching, a cached `False` would let `asyncio.run()` fire
+   under eventlet for the rest of that worker's life, corrupting the shared
+   httpx connection pool's HTTP/2 state (confirmed in production,
+   2026-08-07: `h2` `RECV_WINDOW_UPDATE in state CLOSED`, alongside
+   `asyncio.exceptions.InvalidStateError` from `Future.set_result()` —
+   symptoms of the same root cause).
+
+3. **`1582dde6d` — `eventlet.GreenPool` instead of `ThreadPoolExecutor` for
+   concurrent quote fan-out (2026-08-10).** `_process_quotes_batch()`'s
+   non-async path used `concurrent.futures.ThreadPoolExecutor` +
+   `as_completed()`, introduced 2026-02-18 (`6fded3701`) specifically to
+   avoid `asyncio.run()` crashing under eventlet. That was the right fix for
+   the crash, but `ThreadPoolExecutor`'s blocking-wait doesn't reliably
+   yield to eventlet's hub — this exact deployment's own startup log proves
+   monkey-patching is incomplete ("1 RLock(s) were not greened"). Confirmed
+   in production: every option-chain quote-batch call correlated with the
+   single eventlet worker going unresponsive to every other concurrent
+   request for 10-80+ seconds, including `strategy_reporting`'s own relay
+   calls timing out or getting reset (see `strategy_reporting/` section
+   above for the relay side of this same incident). `eventlet.GreenPool`
+   spawns eventlet's own native greenlets directly — no dependency on
+   stdlib threading patching correctness, so it cannot have this failure
+   mode regardless of how completely a given process got monkey-patched.
+   Same per-symbol error isolation as before.
+
+Low-to-moderate conflict risk — this file has drifted meaningfully from
+upstream across all five fixes; a future sync should specifically diff this
+file rather than trust a clean merge.
+
+---
+
+## `restx_api/option_chain.py` + `restx_api/data_schemas.py` (`with_quotes`)
+
+**2026-08-10.** `services/option_chain_service.py:get_option_chain()` already
+had a `with_quotes: bool = True` parameter — when `False`, it skips the
+entire broker-quote-fetch section and returns strike/symbol/lotsize/tick_size
+only, built purely from the local symbol master, no broker call. It was
+already used internally by `blueprints/scalping.py`, but never reachable from
+the public `/api/v1/optionchain` REST endpoint, which every strategy calls
+through the `openalgo` SDK's `client.optionchain(...)`.
+
+Root cause this was chasing: an audit of all 9 deployed strategies'
+`optionchain()` calls found 7 of 9 only ever read the `strike` field and
+discard every price/quote field in the response — yet every one of those
+calls still paid for the full per-strike broker quote fan-out (see the
+`broker/shoonya/api/data.py` section above for why that fan-out was also,
+separately, an eventlet-blocking risk). `OptionChainSchema` gained one field
+(`with_quotes = fields.Bool(required=False, load_default=True)`); the route
+handler extracts it and passes it through to the already-working service
+function. No changes needed in `option_chain_service.py` itself.
+
+Verified live: a direct parity check (same request, `with_quotes=True` vs
+`False`) confirmed byte-identical `strike`/`symbol`/`label`/`lotsize`/
+`tick_size` across every leg, with price fields correctly present in one
+mode and zeroed in the other, and `atm_strike` resolution identical between
+both.
+
+Sequencing note for anyone reusing this pattern: `OptionChainSchema` has no
+`Meta.unknown` override, so marshmallow's default (`RAISE` on unrecognized
+fields) applies — a caller sending `with_quotes` before this schema change
+deploys would get a 400, not a silently-ignored field. Server-side change
+must ship and be confirmed live before any caller starts sending the new
+field.
+
+Low conflict risk — `OptionChainSchema` and the `option_chain.py` route
+handler are small, isolated additions.
+
+---
+
 ## `broker/shoonya/mapping/transform_data.py` (MPP two-sided-quote guard)
 
 **2026-08-10**, found via a live production incident on `Nifty_Sensex_VWAP_NoHA_Intraday_1`
@@ -881,15 +971,54 @@ customizations actually still typecheck against current dependencies.
 
 `strategies/scripts/{MCX_CrudeOil_EMA9_RSI_Intraday, Nifty_Sensex_EMA34_RSI_Intraday,
 Nifty_Sensex_Pivot_Supertrend_Intraday, Nifty_Sensex_VWAP_NoHA_Intraday,
-Nifty_Sensex_Expiry_Batman, Nifty_Sensex_Pivot_EMA_Combined_Intraday}_*.py` —
-the `strategies/scripts/` copies never show up in `git status`, so a
-`git pull`/merge never touches them and they never conflict. `strategies/deployed/`
-holds a byte-identical committed copy of each (kept in sync manually after any
-edit) purely so this project's own history/reviews/PRs have something to diff
-against — the live-served copy the Python Strategy Host actually runs is
-always the `strategies/scripts/` one. Listed here purely so this doc is a
-complete picture of "what's different from a stock OpenAlgo install," not
-because git needs to track the `scripts/` copies.
+Nifty_Sensex_Expiry_Batman, Nifty_Sensex_Pivot_EMA_Combined_Intraday,
+Nifty_OI_WeeklyBuy_MonthlySell, CRUDEOIL_VWAP_EMA20_Positional,
+Nifty_Weekly_Intraday_GapSeller}_*.py` — the `strategies/scripts/` copies
+never show up in `git status`, so a `git pull`/merge never touches them and
+they never conflict. `strategies/deployed/` holds a byte-identical committed
+copy of each (kept in sync manually after any edit) purely so this project's
+own history/reviews/PRs have something to diff against — the live-served
+copy the Python Strategy Host actually runs is always the
+`strategies/scripts/` one. Listed here purely so this doc is a complete
+picture of "what's different from a stock OpenAlgo install," not because git
+needs to track the `scripts/` copies.
+
+As of 2026-08-10, three strategies are live-deployed with real capital on
+Shoonya: `Nifty_OI_WeeklyBuy_MonthlySell_1`, `Nifty_Sensex_VWAP_NoHA_Intraday_1`,
+`Nifty_Weekly_Intraday_GapSeller_1`. Changes to these three need the same
+rigor as any other live-money change — see the entries below for the process
+followed (mock-tested offline before deploy, parity-verified live after).
+
+**2026-08-10 additions:**
+- **`with_quotes=False` added to `optionchain()` calls** in the two
+  strikes-only-consumer strategies live at the time (`Nifty_Sensex_VWAP_NoHA_Intraday_1`,
+  `Nifty_OI_WeeklyBuy_MonthlySell_1`) — see `restx_api/option_chain.py` above
+  for the server-side half of this fix. Confirmed live: OI's per-cycle
+  strike-discovery call went from fetching live quotes for 82 option symbols
+  (then discarding all of them, only ever reading `strike`) to a pure local
+  DB lookup, every 5-minute candle. `Nifty_Weekly_Intraday_GapSeller_1` and
+  `Nifty_Sensex_Expiry_Batman_1`'s repair-leg path were deliberately left at
+  the default (`with_quotes=True`) — both genuinely read premium data from
+  the response for strike selection.
+- **`Nifty_OI_WeeklyBuy_MonthlySell_1`: `select_monthly_delta_strike()`
+  rewritten** to replace up to 20 sequential `client.optiongreeks()` calls
+  (each 2 broker round-trips; worst case ~40 round-trips run synchronously
+  inline on `run_cycle`'s own thread) with one `optionchain(with_quotes=True,
+  strike_count=40)` call plus local Black-76 delta computation via the
+  `opengreeks` library (already a top-level dependency). Candidate strikes,
+  scan order, and target delta range [0.20, 0.25] are unchanged — pure
+  performance fix, not a strike-selection change (explicit decision during
+  planning). Root cause this was chasing: `run_cycle` (a 10s
+  `max_instances=1` scheduled job) was getting skipped on nearly every
+  cycle all morning, correlated directly with this function's worst-case
+  (no-strike-found) scans, confirmed 3x in one session's logs. Verified
+  offline via a mock test (`FakeClient`, no live API) before deploy — CE/PE
+  selection landing in the target delta range, clean `RuntimeError` on
+  no-match, sparse-chain handling, `_years_to_expiry` sanity. One bug caught
+  by that same mock test during development: `optionchain()`'s `expiry_date`
+  needs the compact form (`"25AUG26"`), not the dash form the caller had
+  (`"25-Aug-26"`) — same class of bug already documented elsewhere in this
+  file from 2026-08-03.
 
 **2026-07-26 additions:**
 - New `Nifty_Sensex_Pivot_EMA_Combined_Intraday_1` — merges the Pivot+Supertrend
