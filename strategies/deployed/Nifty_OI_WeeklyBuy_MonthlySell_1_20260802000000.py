@@ -1003,8 +1003,17 @@ def select_monthly_delta_strike(client, spot: float, expiry_raw: str, option_typ
     premium_by_strike: dict[float, float] = {}
     for row in resp["chain"]:
         leg = row.get(side_key)
-        if leg and leg.get("ltp"):
-            premium_by_strike[float(row["strike"])] = float(leg["ltp"])
+        if not leg or not leg.get("ltp"):
+            continue
+        if not leg.get("bid") or not leg.get("ask"):
+            # No genuine two-sided market -- seen live: an illiquid strike
+            # (bid=0, ask=0) can still carry a nonzero ltp that's actually a
+            # stale/fallback value close to the underlying's own price, not a
+            # real premium (e.g. a deep-OTM PE showing ltp far above its own
+            # strike, its theoretical max). Treat as no usable price rather
+            # than trust it and rely on the Black-76 solver to reject it.
+            continue
+        premium_by_strike[float(row["strike"])] = float(leg["ltp"])
 
     years_to_expiry = _years_to_expiry(expiry_raw)
     flag = "c" if option_type == "CE" else "p"
