@@ -3,7 +3,6 @@ import json
 import os
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import httpx
@@ -235,7 +234,8 @@ class BrokerData:
         self, symbol: str, exchange: str, api_exchange: str, token: str, api_key: str
     ) -> dict:
         """
-        Fetch quote for a single symbol synchronously (for ThreadPoolExecutor)
+        Fetch quote for a single symbol synchronously (spawned concurrently
+        via eventlet.GreenPool in _process_quotes_batch's non-async path)
         """
         try:
             data = {"uid": api_key, "exch": api_exchange, "token": token}
@@ -440,34 +440,56 @@ class BrokerData:
             # Async approach with httpx.AsyncClient
             results = asyncio.run(self._process_quotes_batch_async(prepared_symbols, api_key))
         else:
-            # ThreadPoolExecutor approach
+            # eventlet.GreenPool approach -- concurrent.futures.ThreadPoolExecutor
+            # was used here previously (2026-02-18, 6fded3701) specifically to
+            # dodge asyncio.run() crashing under eventlet's monkey-patched event
+            # loop. That was the right fix for the crash, but it was never
+            # verified to also NOT block the worker: as_completed()/
+            # future.result() are plain stdlib blocking calls whose safety
+            # under eventlet depends on threading being fully monkey-patched --
+            # which this exact deployment's own startup log proves is not
+            # guaranteed ("1 RLock(s) were not greened, to fix this error make
+            # sure you run eventlet.monkey_patch() before importing any other
+            # modules"). Confirmed in production (2026-08-07): every
+            # option-chain quote-batch call correlated with the single
+            # eventlet worker going completely unresponsive to every other
+            # concurrent request for 10-80+ seconds, including
+            # strategy_reporting's own relay calls timing out or getting
+            # reset. GreenPool spawns eventlet's own native greenlets
+            # directly, with no dependency on stdlib threading patching
+            # correctness at all, so it cannot have this failure mode
+            # regardless of how completely this process happened to get
+            # monkey-patched.
+            import eventlet
+
             results = []
-            with ThreadPoolExecutor(max_workers=20) as executor:
-                future_to_symbol = {
-                    executor.submit(
+            pool = eventlet.GreenPool(size=20)
+            item_and_greenthread = [
+                (
+                    item,
+                    pool.spawn(
                         self._fetch_single_quote_sync,
                         item["symbol"],
                         item["exchange"],
                         item["api_exchange"],
                         item["token"],
                         api_key,
-                    ): item
-                    for item in prepared_symbols
-                }
+                    ),
+                )
+                for item in prepared_symbols
+            ]
 
-                for future in as_completed(future_to_symbol):
-                    try:
-                        result = future.result()
-                        results.append(result)
-                    except Exception as e:
-                        item = future_to_symbol[future]
-                        results.append(
-                            {
-                                "symbol": item["symbol"],
-                                "exchange": item["exchange"],
-                                "error": str(e),
-                            }
-                        )
+            for item, greenthread in item_and_greenthread:
+                try:
+                    results.append(greenthread.wait())
+                except Exception as e:
+                    results.append(
+                        {
+                            "symbol": item["symbol"],
+                            "exchange": item["exchange"],
+                            "error": str(e),
+                        }
+                    )
 
         elapsed = time.time() - start_time
         logger.debug(
