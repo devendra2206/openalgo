@@ -63,10 +63,27 @@ def transform_data(data, token, auth_token=None):
                     f"MPP Symbol Info: InstrumentType={instrument_type}, TickSize={tick_size}"
                 )
 
-                # Get LTP for price calculation
+                # Get LTP/bid/ask for price calculation
                 ltp = float(quote_data.get("ltp", 0))
+                bid = float(quote_data.get("bid", 0))
+                ask = float(quote_data.get("ask", 0))
 
-                if ltp > 0:
+                # A real, live two-sided quote always has bid>0 AND ask>0
+                # during market hours -- requiring both, not just ltp>0, is a
+                # defensive guard against a bad/placeholder quote silently
+                # feeding a nonsensical protected price into a real order.
+                # Confirmed in production (2026-08-10): Shoonya's GetQuotes
+                # for a specific BFO SENSEX option token returned
+                # ltp=78525.19 (the underlying INDEX level, not the option's
+                # own ~450 premium) with bid=0.0/ask=0.0 -- the old ltp>0-only
+                # check happily computed a "protected" price from that
+                # (77739.95), which the broker rejected outright, but left
+                # the leg unentered for 46 minutes until manually retried.
+                # Falling back to the regular (unconverted) order type here
+                # is the SAME safe fallback this function already takes when
+                # ltp<=0 -- not a new risk, just the existing safety net
+                # reused for a second failure mode.
+                if ltp > 0 and bid > 0 and ask > 0:
                     # Calculate protected price using centralized MPP slab with tick size rounding
                     protected_price = calculate_protected_price(
                         price=ltp,
@@ -90,8 +107,10 @@ def transform_data(data, token, auth_token=None):
                     )
                 else:
                     logger.warning(
-                        f"MPP Warning: LTP is 0 or invalid for Symbol={data['symbol']}, "
-                        f"Exchange={data['exchange']}. Proceeding with regular {original_type} order"
+                        f"MPP Warning: quote looks invalid for Symbol={data['symbol']}, "
+                        f"Exchange={data['exchange']} (ltp={ltp}, bid={bid}, ask={ask}) -- "
+                        f"missing a genuine two-sided market (or ltp<=0). "
+                        f"Proceeding with regular {original_type} order."
                     )
             else:
                 logger.warning(

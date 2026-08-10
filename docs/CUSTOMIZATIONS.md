@@ -766,6 +766,56 @@ interface changes.
 
 ---
 
+## `broker/shoonya/mapping/transform_data.py` (MPP two-sided-quote guard)
+
+**2026-08-10**, found via a live production incident on `Nifty_Sensex_VWAP_NoHA_Intraday_1`
+(real capital): Shoonya blocks native `MKT`/`SL-MKT` order types for API
+orders, so `transform_data()` converts MARKET/SL-M orders into a protected
+`LIMIT`/`SL-LMT` order itself — Market Price Protection (MPP) — by fetching
+a fresh quote and computing a limit price a small % away from its `ltp`. The
+only sanity check before trusting that quote was `ltp > 0`.
+
+At 10:20:06 IST a MARKET SELL for `SENSEX13AUG2678600PE` (BFO) triggered
+this path. The quote fetch (`BrokerData.get_quotes`) returned
+`ltp=78525.19, bid=0.0, ask=0.0` — `78525.19` is the SENSEX **index** level
+(the ATM strike locked that morning was 78600), not the option's own
+premium (~450-480 that morning), and a real, live option quote always has a
+genuine two-sided market (nonzero bid AND ask) — zero/zero is a clear signal
+the quote itself was bad, not that the option was simply illiquid. Because
+the old check was `ltp > 0` only, it happily computed a "protected" price of
+77739.95 from that bad data and sent it as a LIMIT order, which the broker
+rejected outright (safe outcome by luck, not by design) — but the leg then
+sat in `error_state` unentered for 46 minutes until manually retried.
+
+**Root cause of the bad quote itself is unconfirmed** — checked and ruled
+out: the `symtoken` DB row for `SENSEX13AUG2678600PE`/`BFO` is correct
+(token `847419`, distinct from SENSEX index's token `1`), the in-memory
+cache's `get_token()` does an exact `(symbol, exchange)` tuple lookup (no
+truncation/collision risk), and there was no master-contract reload/cache
+invalidation logged in that window (ruled out via `journalctl`). Most
+likely a transient Shoonya-side `GetQuotes` glitch for that specific token,
+but not proven — the fix below is deliberately root-cause-agnostic: it
+protects against ANY cause that produces an implausible quote, not just
+this one.
+
+Fix: `transform_data()` now requires `ltp > 0 AND bid > 0 AND ask > 0`
+before applying MPP conversion. If that fails, it falls through to the
+SAME pre-existing fallback the function already used for `ltp <= 0` (send
+the order without MPP conversion) — not a new risk, just the existing
+safety net now also covering a second failure mode. Warning log now
+includes `ltp`/`bid`/`ask` together so a recurrence is immediately
+diagnosable without repeating this investigation.
+
+Deliberately NOT applied to `broker/tradesmart/mapping/transform_data.py`'s
+`_apply_mpp` (referenced elsewhere in this same file as sharing the MPP
+pattern) — flagged as a likely-identical gap if Tradesmart is ever used for
+live capital, but out of scope for this fix per explicit instruction.
+
+Low conflict risk — isolated to the MPP branch inside `transform_data()`,
+no signature/interface changes.
+
+---
+
 ## Frontend
 
 ### `frontend/src/App.tsx` (+6 lines)
