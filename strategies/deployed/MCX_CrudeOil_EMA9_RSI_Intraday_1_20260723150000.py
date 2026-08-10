@@ -2002,6 +2002,23 @@ class StrategyEngine:
                 leg.trade_count += 1
                 self._save_state()
                 Log.info(f"[{leg_key}] Entry filled: {symbol}")
+                # WhatsApp self-alert on every confirmed entry fill. entry_px
+                # here is the pre-trade chain LTP snapshot from _enter_leg
+                # (this script doesn't capture the broker's real average_price
+                # on the normal fill-confirmation path -- estimate only, worded
+                # as such below). Dispatched via _pnl_executor (non-blocking,
+                # same pool this file already uses for push_leg_error) and
+                # notify_whatsapp_error() itself never raises -- a WhatsApp/
+                # network hiccup can never break this watcher.
+                try:
+                    self._pnl_executor.submit(
+                        notify_whatsapp_error, self.env,
+                        f"[{config.strategy_name}] {leg_key} ENTRY filled: {symbol} "
+                        f"qty={quantity} @ ~{pos.entry_px} (est.)",
+                        log_warning=Log.warning,
+                    )
+                except Exception as exc:
+                    Log.warning(f"Failed to dispatch WhatsApp entry notification: {exc}")
         except OrderNeedsAttention as exc:
             self._enter_error_mode(leg_key, "entry_failed", "resting", exc.order_id, str(exc))
         except (RuntimeError, TimeoutError) as exc:
