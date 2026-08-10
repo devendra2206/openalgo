@@ -908,6 +908,7 @@ def fetch_option_chain_strikes(client, expiry_compact: str, strike_count: int = 
     resp = client.optionchain(
         underlying=UNDERLYING_SYMBOL, exchange=UNDERLYING_SPOT_EXCHANGE,
         expiry_date=expiry_compact, strike_count=strike_count,
+        with_quotes=False,  # only `strike` is read below; skip the broker quote fan-out entirely
     )
     # The chain rows live under the "chain" key, NOT "data" -- confirmed
     # against Nifty_Sensex_Expiry_Batman's working _legs_with_strike(), which

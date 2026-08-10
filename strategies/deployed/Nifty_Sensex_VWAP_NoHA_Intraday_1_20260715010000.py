@@ -1108,13 +1108,12 @@ def fetch_chain(client, inst: InstrumentConfig, expiry: str):
     resp = client.optionchain(
         # strike_count=1 (ATM +/- 1) is enough -- pick_atm_leg only ever uses the
         # ATM strike itself (for both the PE and CE side, from the same chain
-        # response). A wider chain just means more option quotes for the backend
-        # to fan out to the broker (Shoonya's multiquotes isn't a true batch call
-        # -- broker/shoonya/api/data.py fans out one GetQuotes per symbol via a
-        # ThreadPoolExecutor), which was adding real seconds of latency for
-        # strikes that are never used.
+        # response), and only ever reads `strike`, never any price field.
+        # with_quotes=False (2026-08-09) skips the broker quote fetch entirely
+        # rather than just minimizing it -- no broker call for prices this
+        # function never uses, on top of the already-small strike_count=1.
         underlying=inst.name, exchange=inst.underlying_exchange,
-        expiry_date=expiry, strike_count=1,
+        expiry_date=expiry, strike_count=1, with_quotes=False,
     )
     if resp.get("status") != "success":
         raise RuntimeError(f"optionchain failed for {inst.name}: {resp}")
