@@ -360,7 +360,7 @@ def catch_up_gtts():
             logger.debug("No active GTT legs to catch up")
             return
 
-        from sandbox.execution_engine import ExecutionEngine
+        from sandbox.execution_engine import ExecutionEngine, quote_lacks_two_sided_market
 
         engine = ExecutionEngine()
         symbols = list({(gtt.symbol, gtt.exchange) for _leg, gtt in rows})
@@ -370,6 +370,14 @@ def catch_up_gtts():
         for leg, gtt in rows:
             quote = quotes.get((gtt.symbol, gtt.exchange))
             if not quote:
+                continue
+            if quote_lacks_two_sided_market(quote):
+                logger.warning(
+                    f"Catch-up deferring GTT leg {leg.id} ({gtt.symbol}): quote has "
+                    f"ltp={quote.get('ltp')} but no two-sided market "
+                    f"(bid={quote.get('bid')}, ask={quote.get('ask')}) -- "
+                    f"possible wrong-instrument quote, see docs/CUSTOMIZATIONS.md"
+                )
                 continue
             ltp = quote.get("ltp")
             if not gtt_manager.leg_is_triggered_by(leg.action, leg.trigger_price, ltp):

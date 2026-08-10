@@ -34,6 +34,30 @@ def _is_eventlet_patched():
 
 logger = get_logger(__name__)
 
+# Exchanges with no order book (indices) -- bid=0/ask=0 is normal/expected
+# for these, never a sign of a bad quote. Kept in sync with the NSE_INDEX/
+# BSE_INDEX rewrite already done in get_quotes()/get_multiquotes() below.
+_INDEX_EXCHANGES = ("NSE_INDEX", "BSE_INDEX")
+
+
+def _quote_is_suspect(exchange: str, ltp: float, bid: float, ask: float) -> bool:
+    """True when a quote looks like it belongs to a DIFFERENT instrument
+    than requested -- confirmed in production 2026-08-10 (twice): GetQuotes
+    for a specific NIFTY/SENSEX weekly OPTION returned an ltp matching the
+    underlying INDEX's spot level, with bid=0.0/ask=0.0. A real, live
+    tradable instrument always has a genuine two-sided market during
+    market hours; an index quote legitimately never does (no order book),
+    so bid=0/ask=0 there is normal, not a red flag -- hence the exchange
+    carve-out. Same condition as the shipped MPP guard in
+    broker/shoonya/mapping/transform_data.py (commit f0d242117), centralized
+    here so every consumer of get_quotes()/get_multiquotes() gets it for
+    free instead of re-implementing it. `exchange` must be the ORIGINAL
+    exchange (before any NSE_INDEX->NSE / BSE_INDEX->BSE rewrite) -- pass
+    it before that rewrite runs."""
+    if exchange in _INDEX_EXCHANGES:
+        return False
+    return not (ltp > 0 and bid > 0 and ask > 0)
+
 
 def get_api_response(endpoint, auth, method="POST", payload=None):
     """
@@ -155,6 +179,7 @@ class BrokerData:
             br_symbol = get_br_symbol(symbol, exchange)
             token = get_token(symbol, exchange)
 
+            original_exchange = exchange
             if exchange == "NSE_INDEX":
                 exchange = "NSE"
             elif exchange == "BSE_INDEX":
@@ -169,18 +194,29 @@ class BrokerData:
             if response.get("stat") != "Ok":
                 raise Exception(f"Error from Shoonya API: {response.get('emsg', 'Unknown error')}")
 
+            bid = float(response.get("bp1", 0))
+            ask = float(response.get("sp1", 0))
+            ltp = float(response.get("lp", 0))
+            quote_suspect = _quote_is_suspect(original_exchange, ltp, bid, ask)
+            if quote_suspect:
+                logger.warning(
+                    f"Quote looks suspect (may belong to a different instrument): "
+                    f"Symbol={symbol}, Exchange={original_exchange}, ltp={ltp}, bid={bid}, ask={ask}"
+                )
+
             # Return simplified quote data
             return {
-                "bid": float(response.get("bp1", 0)),
-                "ask": float(response.get("sp1", 0)),
+                "bid": bid,
+                "ask": ask,
                 "open": float(response.get("o", 0)),
                 "high": float(response.get("h", 0)),
                 "low": float(response.get("l", 0)),
-                "ltp": float(response.get("lp", 0)),
+                "ltp": ltp,
                 "prev_close": float(response.get("c", 0)) if "c" in response else 0,
                 "volume": int(response.get("v", 0)),
                 "oi": int(response.get("oi", 0)),
                 "tick_size": float(response.get("ti", 0)) if response.get("ti") else None,
+                "quote_suspect": quote_suspect,
             }
 
         except Exception as e:
@@ -258,19 +294,23 @@ class BrokerData:
                     "error": response.get("emsg", "Unknown error"),
                 }
 
+            bid = float(response.get("bp1", 0))
+            ask = float(response.get("sp1", 0))
+            ltp = float(response.get("lp", 0))
             return {
                 "symbol": symbol,
                 "exchange": exchange,
                 "data": {
-                    "bid": float(response.get("bp1", 0)),
-                    "ask": float(response.get("sp1", 0)),
+                    "bid": bid,
+                    "ask": ask,
                     "open": float(response.get("o", 0)),
                     "high": float(response.get("h", 0)),
                     "low": float(response.get("l", 0)),
-                    "ltp": float(response.get("lp", 0)),
+                    "ltp": ltp,
                     "prev_close": float(response.get("c", 0)) if "c" in response else 0,
                     "volume": int(response.get("v", 0)),
                     "oi": int(response.get("oi", 0)),
+                    "quote_suspect": _quote_is_suspect(exchange, ltp, bid, ask),
                 },
             }
 
@@ -309,19 +349,23 @@ class BrokerData:
                     "error": response.get("emsg", "Unknown error"),
                 }
 
+            bid = float(response.get("bp1", 0))
+            ask = float(response.get("sp1", 0))
+            ltp = float(response.get("lp", 0))
             return {
                 "symbol": symbol,
                 "exchange": exchange,
                 "data": {
-                    "bid": float(response.get("bp1", 0)),
-                    "ask": float(response.get("sp1", 0)),
+                    "bid": bid,
+                    "ask": ask,
                     "open": float(response.get("o", 0)),
                     "high": float(response.get("h", 0)),
                     "low": float(response.get("l", 0)),
-                    "ltp": float(response.get("lp", 0)),
+                    "ltp": ltp,
                     "prev_close": float(response.get("c", 0)) if "c" in response else 0,
                     "volume": int(response.get("v", 0)),
                     "oi": int(response.get("oi", 0)),
+                    "quote_suspect": _quote_is_suspect(exchange, ltp, bid, ask),
                 },
             }
 

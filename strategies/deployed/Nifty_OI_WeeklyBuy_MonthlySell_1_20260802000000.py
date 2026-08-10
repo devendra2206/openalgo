@@ -165,9 +165,12 @@ from opengreeks import black76
 threading.stack_size(1024 * 1024)  # 1MB, generous for these workloads
 
 try:
-    from _strategy_platform_client import notify_trade_closed, filter_known_fields
+    from _strategy_platform_client import notify_trade_closed, notify_whatsapp_error, filter_known_fields
 except ImportError:
     def notify_trade_closed(env, log_warning=None):
+        pass
+
+    def notify_whatsapp_error(env, message, log_warning=None):
         pass
 
     def filter_known_fields(cls, raw):
@@ -259,6 +262,11 @@ class Config:
     place_order_retry_delay: float = 1.5
 
     error_repush_interval_sec: float = 60.0
+
+    # Minimum gap between WhatsApp alerts fired from run_cycle's own outer
+    # except-clause -- without this, a persistently-recurring bug would fire
+    # one WhatsApp message per scheduler tick and flood the phone.
+    cycle_failure_notify_interval_sec: float = 300.0
 
     state_file: str = "strategy_state.json"
     log_level: int = logging.INFO
@@ -793,7 +801,15 @@ def _is_error_response(obj) -> bool:
     return isinstance(obj, dict)
 
 
-def fetch_symbol_ltp(client, symbol: str, exchange: str) -> Optional[float]:
+def fetch_symbol_ltp(client, symbol: str, exchange: str, require_two_sided: bool = False) -> Optional[float]:
+    """`require_two_sided=True` additionally requires bid>0 AND ask>0 before
+    trusting the quote -- defends against a quote that looks like it belongs
+    to a DIFFERENT instrument than requested (confirmed in production
+    2026-08-10 on this same broker: an option's LTP came back matching its
+    underlying's spot level, with bid=0/ask=0). Pass True only for
+    TRADABLE-instrument reads -- an INDEX symbol legitimately has no bid/ask
+    (no order book), so leave this False (default) for underlying-spot
+    lookups. See docs/CUSTOMIZATIONS.md."""
     try:
         resp = client.quotes(symbol=symbol, exchange=exchange)
     except Exception as exc:
@@ -803,8 +819,27 @@ def fetch_symbol_ltp(client, symbol: str, exchange: str) -> Optional[float]:
         Log.warning(f"quotes() error response for {symbol}: {resp}")
         return None
     data = resp.get("data", resp) if isinstance(resp, dict) else resp
-    ltp = data.get("ltp") if isinstance(data, dict) else None
-    return float(ltp) if ltp is not None else None
+    if not isinstance(data, dict):
+        return None
+    ltp = data.get("ltp")
+    if ltp is None:
+        return None
+    ltp = float(ltp)
+    if require_two_sided:
+        try:
+            bid = float(data.get("bid") or 0)
+            ask = float(data.get("ask") or 0)
+        except (TypeError, ValueError) as exc:
+            Log.warning(f"fetch_symbol_ltp: malformed bid/ask for {symbol}.{exchange} "
+                        f"(bid={data.get('bid')!r}, ask={data.get('ask')!r}): {exc} -- treating as untrustworthy")
+            return None
+        if not (ltp > 0 and bid > 0 and ask > 0):
+            Log.warning(
+                f"fetch_symbol_ltp: quote for {symbol}.{exchange} lacks a two-sided "
+                f"market (ltp={ltp}, bid={bid}, ask={ask}) -- treating as untrustworthy"
+            )
+            return None
+    return ltp
 
 
 def fetch_symbol_bid_ask(client, symbol: str, exchange: str) -> tuple[Optional[float], Optional[float]]:
@@ -1739,6 +1774,9 @@ class WeeklySideEngine:
         self.engine._push_leg_error_bg(self.leg_key, pos, action=action)
         self.engine.save_state()
         Log.error(f"[WEEKLY_{self.option_type}] {error_state} ({error_kind}): {message}")
+        self.engine._notify_whatsapp_error_bg(
+            f"WEEKLY_{self.option_type} {error_state} ({error_kind}): {message}"
+        )
 
     def _resolve_leg_error(self, action: dict):
         """Applies a Retry/Cancel/Manually-Completed decision pulled from the
@@ -1956,7 +1994,7 @@ class WeeklySideEngine:
 
         ltp = self.engine.price_stream.get_ltp(pos.symbol, OPTIONS_EXCHANGE, config.ws_stale_seconds)
         if ltp is None:
-            ltp = fetch_symbol_ltp(self.engine.client, pos.symbol, OPTIONS_EXCHANGE)
+            ltp = fetch_symbol_ltp(self.engine.client, pos.symbol, OPTIONS_EXCHANGE, require_two_sided=True)
 
         # Fetch this candle's own OI/premium reading and populate
         # latest_weekly_detail BEFORE any exit check below -- Monthly's
@@ -2294,6 +2332,9 @@ class MonthlySideEngine:
         self.engine._push_leg_error_bg(self.leg_key, pos, action=action)
         self.engine.save_state()
         Log.error(f"[MONTHLY_{self.option_type}] {error_state} ({error_kind}): {message}")
+        self.engine._notify_whatsapp_error_bg(
+            f"MONTHLY_{self.option_type} {error_state} ({error_kind}): {message}"
+        )
 
     def _resolve_leg_error(self, action: dict):
         """Applies a Retry/Cancel/Manually-Completed decision pulled from the
@@ -2478,7 +2519,7 @@ class MonthlySideEngine:
         if datetime.now(IST).time() >= config.monthly_universal_exit_time:
             ltp = self.engine.price_stream.get_ltp(pos.symbol, OPTIONS_EXCHANGE, config.ws_stale_seconds)
             if ltp is None:
-                ltp = fetch_symbol_ltp(self.engine.client, pos.symbol, OPTIONS_EXCHANGE)
+                ltp = fetch_symbol_ltp(self.engine.client, pos.symbol, OPTIONS_EXCHANGE, require_two_sided=True)
             self._exit(pos, ltp if ltp is not None else pos.entry_px, "universal_exit_time")
             return
 
@@ -2504,7 +2545,7 @@ class MonthlySideEngine:
         if pos.consecutive_opposite >= config.consecutive_opposite_exit:
             ltp = self.engine.price_stream.get_ltp(pos.symbol, OPTIONS_EXCHANGE, config.ws_stale_seconds)
             if ltp is None:
-                ltp = fetch_symbol_ltp(self.engine.client, pos.symbol, OPTIONS_EXCHANGE)
+                ltp = fetch_symbol_ltp(self.engine.client, pos.symbol, OPTIONS_EXCHANGE, require_two_sided=True)
             self._exit(pos, ltp if ltp is not None else current["premium"], "opposite_signal")
 
     def _exit(self, pos, exit_px, reason):
@@ -2627,6 +2668,10 @@ class StrategyEngine:
         # the cheap boolean run_cycle actually reads.
         self._force_exit_pending: bool = False
         self._force_exit_check_pending: bool = False
+        # Throttles the outer run_cycle except-clause's WhatsApp alert --
+        # separate from each side-engine's own per-leg error-push throttling.
+        # In-memory/per-instance, not persisted.
+        self._last_cycle_failure_notify: Optional[datetime] = None
         # push_leg_error/notify_trade_closed/check_pending_action are also
         # synchronous local HTTP calls made from inside run_cycle() (via
         # evaluate()) -- same blocking-bug class as check_force_exit above,
@@ -2831,6 +2876,20 @@ class StrategyEngine:
         blocking-bug class as push_leg_error above."""
         self._bg_executor.submit(notify_trade_closed, self.env, log_warning=Log.warning)
 
+    def _notify_whatsapp_error_bg(self, message: str):
+        """Fire-and-forget WhatsApp self-alert via _bg_executor -- same
+        blocking-bug class as push_leg_error/notify_trade_closed above.
+        notify_whatsapp_error() itself never raises, so a WhatsApp/network
+        hiccup can never break the calling WeeklySideEngine/MonthlySideEngine
+        method or run_cycle()."""
+        try:
+            self._bg_executor.submit(
+                notify_whatsapp_error, self.env, f"[{config.strategy_name}] {message}",
+                log_warning=Log.warning,
+            )
+        except Exception as exc:
+            Log.warning(f"Failed to dispatch WhatsApp error notification: {exc}")
+
     def _refresh_pending_action_bg(self, leg_key: str):
         """Dispatches check_pending_action to _bg_executor instead of
         blocking run_cycle() -- mirrors _refresh_force_exit_check_bg, but
@@ -2930,8 +2989,19 @@ class StrategyEngine:
             # same as before to avoid a 30x increase in disk writes.
             if new_candle:
                 self.save_state()
-        except Exception:
-            Log.exception("run_cycle failed")
+        except Exception as exc:
+            Log.exception(f"run_cycle failed: {exc}")
+            # WhatsApp self-alert for a genuinely unexpected crash not
+            # already routed through either side-engine's own
+            # _enter_error_mode alert. Throttled since an outer catch-all
+            # could otherwise fire every scheduler tick if the same bug
+            # keeps recurring.
+            now = datetime.now(IST)
+            if (self._last_cycle_failure_notify is None
+                    or (now - self._last_cycle_failure_notify).total_seconds()
+                    >= config.cycle_failure_notify_interval_sec):
+                self._last_cycle_failure_notify = now
+                self._notify_whatsapp_error_bg(f"Cycle failed: {exc}")
 
     def reconcile_pending_orders(self):
         """Startup-only crash recovery: finds any leg whose entry/exit order

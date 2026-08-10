@@ -67,6 +67,37 @@ def quote_looks_stale(quote) -> bool:
     return not (low <= ltp <= high)
 
 
+def quote_lacks_two_sided_market(quote) -> bool:
+    """Return True when a quote has no genuine two-sided market (bid/ask
+    both missing or zero) despite carrying a nonzero ltp.
+
+    Guards against acting on a quote that looks like it belongs to a
+    DIFFERENT instrument than requested -- confirmed in production
+    2026-08-10 (twice, on the live Shoonya integration): GetQuotes for a
+    specific NIFTY/SENSEX weekly OPTION returned an ltp matching the
+    underlying INDEX's spot level, with bid=0.0/ask=0.0. A real, live
+    tradable order/GTT-leg symbol always has a genuine two-sided market
+    during hours; every quote reaching this function is for a pending
+    order's or GTT leg's own symbol, which is always tradable (never an
+    index), so unlike broker/shoonya/api/data.py's own equivalent guard,
+    no exchange-type carve-out is needed here.
+
+    Same conservative shape as quote_looks_stale: only flags a REAL
+    contradiction (nonzero ltp with a missing/zero two-sided market), never
+    a benign "not fetched yet" quote -- callers already handle a missing/
+    None quote separately.
+    """
+    try:
+        ltp = Decimal(str(quote.get("ltp", 0)))
+        bid = Decimal(str(quote.get("bid", 0)))
+        ask = Decimal(str(quote.get("ask", 0)))
+    except Exception:
+        return False
+    if ltp <= 0:
+        return False
+    return not (bid > 0 and ask > 0)
+
+
 class ExecutionEngine:
     """Executes pending orders based on market data"""
 
@@ -170,6 +201,14 @@ class ExecutionEngine:
         for leg, gtt in rows:
             quote = quote_cache.get((gtt.symbol, gtt.exchange))
             if not quote:
+                continue
+            if quote_lacks_two_sided_market(quote):
+                logger.warning(
+                    f"Deferring GTT leg {leg.id} ({gtt.symbol}): quote has "
+                    f"ltp={quote.get('ltp')} but no two-sided market "
+                    f"(bid={quote.get('bid')}, ask={quote.get('ask')}) -- "
+                    f"possible wrong-instrument quote, see docs/CUSTOMIZATIONS.md"
+                )
                 continue
             ltp = quote.get("ltp")
             if not gtt_manager.leg_is_triggered_by(leg.action, leg.trigger_price, ltp):
@@ -411,6 +450,13 @@ class ExecutionEngine:
             # the full open-order price-type logic below, which assumes an
             # order that is already live in the regular book.
             if order.order_status == "trigger pending":
+                if quote_lacks_two_sided_market(quote):
+                    logger.warning(
+                        f"Deferring trigger-pending order {order.orderid} ({order.symbol}): "
+                        f"quote has ltp={ltp} but no two-sided market (bid={bid}, ask={ask}) -- "
+                        f"possible wrong-instrument quote, see docs/CUSTOMIZATIONS.md"
+                    )
+                    return
                 self._process_trigger_pending_order(order, ltp)
                 return
 
@@ -445,6 +491,13 @@ class ExecutionEngine:
                 # Stop Loss Limit order
                 # SL BUY: When LTP >= trigger price, order activates. Execute at LTP if LTP <= limit price
                 # SL SELL: When LTP <= trigger price, order activates. Execute at LTP if LTP >= limit price
+                if quote_lacks_two_sided_market(quote):
+                    logger.warning(
+                        f"Deferring SL trigger check for order {order.orderid} ({order.symbol}): "
+                        f"quote has ltp={ltp} but no two-sided market (bid={bid}, ask={ask}) -- "
+                        f"possible wrong-instrument quote, see docs/CUSTOMIZATIONS.md"
+                    )
+                    return
                 if order.action == "BUY" and ltp >= order.trigger_price:
                     if ltp <= order.price:
                         should_execute = True
@@ -458,7 +511,13 @@ class ExecutionEngine:
                 # Stop Loss Market order
                 # BUY: Execute at market when LTP >= trigger price
                 # SELL: Execute at market when LTP <= trigger price
-                if order.action == "BUY" and ltp >= order.trigger_price:
+                if quote_lacks_two_sided_market(quote):
+                    logger.warning(
+                        f"Deferring SL-M trigger check for order {order.orderid} ({order.symbol}): "
+                        f"quote has ltp={ltp} but no two-sided market (bid={bid}, ask={ask}) -- "
+                        f"possible wrong-instrument quote, see docs/CUSTOMIZATIONS.md"
+                    )
+                elif order.action == "BUY" and ltp >= order.trigger_price:
                     should_execute = True
                     execution_price = ltp
                 elif order.action == "SELL" and ltp <= order.trigger_price:

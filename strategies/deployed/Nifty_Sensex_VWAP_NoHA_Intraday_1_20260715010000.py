@@ -217,13 +217,17 @@ from openalgo import api, ta
 threading.stack_size(1024 * 1024)  # 1MB, generous for these workloads
 
 try:
-    from _strategy_platform_client import notify_trade_closed, filter_known_fields
+    from _strategy_platform_client import notify_trade_closed, notify_whatsapp_error, filter_known_fields
 except ImportError:
     # Shared helper (strategies/scripts/_strategy_platform_client.py) not
     # present alongside this script -- e.g. it was copied out standalone.
-    # Degrade gracefully: the live "trade just closed" SSE push simply won't
-    # fire, but nothing else about the strategy is affected.
+    # Degrade gracefully: the live "trade just closed" SSE push and WhatsApp
+    # failure alerts simply won't fire, but nothing else about the strategy
+    # is affected.
     def notify_trade_closed(env, log_warning=None):
+        pass
+
+    def notify_whatsapp_error(env, message, log_warning=None):
         pass
 
     # Same behavior as the shared module's version (see its own docstring) --
@@ -346,6 +350,11 @@ class Config:
     # Re-pushing at this interval for every leg still in error_state means a
     # single lost push self-heals within a minute instead of indefinitely.
     error_repush_interval_sec: float = 60.0
+
+    # Minimum gap between WhatsApp alerts fired from run_cycle's own outer
+    # except-clause -- without this, a persistently-recurring bug would fire
+    # one WhatsApp message per scheduler tick and flood the phone.
+    cycle_failure_notify_interval_sec: float = 300.0
 
     state_file: str = "strategy_state.json"
     log_level: int = logging.INFO
@@ -1045,7 +1054,18 @@ def _is_error_response(obj) -> bool:
     return isinstance(obj, dict)
 
 
-def fetch_symbol_ltp(client, symbol: str, exchange: str) -> Optional[float]:
+def fetch_symbol_ltp(client, symbol: str, exchange: str, require_two_sided: bool = False) -> Optional[float]:
+    """`require_two_sided=True` additionally requires bid>0 AND ask>0 before
+    trusting the quote -- defends against a quote that looks like it belongs
+    to a DIFFERENT instrument than requested. Confirmed in production
+    2026-08-10 on this same broker (this strategy's own SENSEX PE leg,
+    SENSEX13AUG2678600PE): a MARKET order's MPP-protected LIMIT price came
+    back computed off ltp=78525.19 (the underlying SENSEX INDEX's own spot
+    level, not the option's ~450 premium) with bid=0/ask=0, rejected by the
+    broker but leaving the leg unentered for 46 minutes. Pass True only for
+    TRADABLE-instrument reads -- an INDEX symbol legitimately has no bid/ask
+    (no order book), so leave this False (default) for underlying-spot
+    lookups. See docs/CUSTOMIZATIONS.md."""
     try:
         resp = client.quotes(symbol=symbol, exchange=exchange)
     except Exception as exc:
@@ -1055,8 +1075,27 @@ def fetch_symbol_ltp(client, symbol: str, exchange: str) -> Optional[float]:
         Log.warning(f"quotes() error response for {symbol}: {resp}")
         return None
     data = resp.get("data", resp) if isinstance(resp, dict) else resp
-    ltp = data.get("ltp") if isinstance(data, dict) else None
-    return float(ltp) if ltp is not None else None
+    if not isinstance(data, dict):
+        return None
+    ltp = data.get("ltp")
+    if ltp is None:
+        return None
+    ltp = float(ltp)
+    if require_two_sided:
+        try:
+            bid = float(data.get("bid") or 0)
+            ask = float(data.get("ask") or 0)
+        except (TypeError, ValueError) as exc:
+            Log.warning(f"fetch_symbol_ltp: malformed bid/ask for {symbol}.{exchange} "
+                        f"(bid={data.get('bid')!r}, ask={data.get('ask')!r}): {exc} -- treating as untrustworthy")
+            return None
+        if not (ltp > 0 and bid > 0 and ask > 0):
+            Log.warning(
+                f"fetch_symbol_ltp: quote for {symbol}.{exchange} lacks a two-sided "
+                f"market (ltp={ltp}, bid={bid}, ask={ask}) -- treating as untrustworthy"
+            )
+            return None
+    return ltp
 
 
 def fetch_ltp(client, inst: InstrumentConfig) -> Optional[float]:
@@ -1586,6 +1625,10 @@ class StrategyEngine:
         self._state_lock = threading.Lock()
         self._pending_fills: set[str] = set()
         self._last_error_push: dict[str, datetime] = {}
+        # Throttles the outer run_cycle except-clause's WhatsApp alert --
+        # separate from _last_error_push above, which only governs the UI
+        # error-badge re-push. In-memory/per-instance, not persisted.
+        self._last_cycle_failure_notify: Optional[datetime] = None
         self._force_exit_pending: bool = False
         self._force_exit_check_pending: bool = False
         # check_pending_action is also a synchronous local HTTP call made
@@ -1676,7 +1719,7 @@ class StrategyEngine:
                                >= config.pnl_rest_fallback_interval_sec)
                         if due:
                             self._pnl_rest_fallback_last_attempt[leg_key] = now
-                            rest_ltp = fetch_symbol_ltp(self.ltp_client, pos.symbol, inst.options_exchange)
+                            rest_ltp = fetch_symbol_ltp(self.ltp_client, pos.symbol, inst.options_exchange, require_two_sided=True)
                             if rest_ltp is not None:
                                 self._pnl_last_known_price[leg_key] = rest_ltp
                         ltp = self._pnl_last_known_price.get(leg_key)
@@ -1899,7 +1942,7 @@ class StrategyEngine:
         if cached is None:
             return None
         if ltp is None:
-            ltp = fetch_symbol_ltp(self.ltp_client, symbol, exchange)
+            ltp = fetch_symbol_ltp(self.ltp_client, symbol, exchange, require_two_sided=True)
         if ltp is not None:
             cached.ltp = ltp
         return cached
@@ -1932,7 +1975,7 @@ class StrategyEngine:
         vwap_arr = np.asarray(ta.vwap(high, low, close, volume))
 
         if ltp is None:
-            ltp = fetch_symbol_ltp(self.ltp_client, symbol, exchange)
+            ltp = fetch_symbol_ltp(self.ltp_client, symbol, exchange, require_two_sided=True)
         if ltp is None:
             ltp = float(close[-1])
 
@@ -2060,6 +2103,22 @@ class StrategyEngine:
         action = "SELL" if error_state == "entry_failed" else "BUY"
         push_leg_error(self.env, leg_key, pos, action=action)
         self._last_error_push[leg_key] = datetime.now(IST)
+        # WhatsApp self-alert on every genuine error-state transition (order
+        # rejection, fill timeout, or any other place()/poll_fill failure
+        # that routes here) -- fires once per transition, not on the
+        # periodic _repush_active_errors re-push. Dispatched via
+        # _pnl_executor (non-blocking, same pool this file already uses for
+        # push_leg_error) and notify_whatsapp_error() itself never raises --
+        # a WhatsApp/network hiccup can never break this method or the
+        # calling run_cycle.
+        try:
+            self._pnl_executor.submit(
+                notify_whatsapp_error, self.env,
+                f"[{config.strategy_name}] {leg_key} {error_state} ({error_kind}): {message}",
+                log_warning=Log.warning,
+            )
+        except Exception as exc:
+            Log.warning(f"Failed to dispatch WhatsApp error notification: {exc}")
 
     def _repush_active_errors(self):
         """push_leg_error() only fires once, on the transition into
@@ -2225,7 +2284,7 @@ class StrategyEngine:
             exit_px = self.price_stream.get_ltp(pos.symbol, inst.options_exchange,
                                                  max_age=config.ws_stale_seconds)
         if exit_px is None:
-            exit_px = fetch_symbol_ltp(self.ltp_client, pos.symbol, inst.options_exchange)
+            exit_px = fetch_symbol_ltp(self.ltp_client, pos.symbol, inst.options_exchange, require_two_sided=True)
         if exit_px is not None:
             # Short leg: sell high (entry) -> buy back low (exit) = profit.
             # Kept in sync with today_realized_pnl (pushed to the platform
@@ -2710,7 +2769,7 @@ class StrategyEngine:
                         if not self._ws_fallback_logged.get(leg_key):
                             Log.warning(f"[{leg_key}] WS LTP stale/missing -- falling back to REST quotes().")
                             self._ws_fallback_logged[leg_key] = True
-                        opt_ltp = fetch_symbol_ltp(self.ltp_client, symbol, inst.options_exchange)
+                        opt_ltp = fetch_symbol_ltp(self.ltp_client, symbol, inst.options_exchange, require_two_sided=True)
                     else:
                         self._ws_fallback_logged[leg_key] = False
                     has_position = bool(leg.position.symbol)
@@ -2760,6 +2819,23 @@ class StrategyEngine:
 
         except Exception as exc:
             Log.exception(f"Cycle failed: {exc}")
+            # WhatsApp self-alert for a genuinely unexpected crash not
+            # already routed through _enter_error_mode's own alert.
+            # Throttled since an outer catch-all could otherwise fire every
+            # scheduler tick if the same bug keeps recurring.
+            now = datetime.now(IST)
+            if (self._last_cycle_failure_notify is None
+                    or (now - self._last_cycle_failure_notify).total_seconds()
+                    >= config.cycle_failure_notify_interval_sec):
+                self._last_cycle_failure_notify = now
+                try:
+                    self._pnl_executor.submit(
+                        notify_whatsapp_error, self.env,
+                        f"[{config.strategy_name}] Cycle failed: {exc}",
+                        log_warning=Log.warning,
+                    )
+                except Exception as dispatch_exc:
+                    Log.warning(f"Failed to dispatch WhatsApp crash notification: {dispatch_exc}")
 
 
 ###############################################################################

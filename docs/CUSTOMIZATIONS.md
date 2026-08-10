@@ -906,6 +906,216 @@ no signature/interface changes.
 
 ---
 
+## Two-sided-quote guard, extended: `broker/shoonya/api/data.py`, all 9 deployed strategies, sandbox engine (2026-08-10, same day)
+
+A second incident the same day, on the same broker integration, confirmed
+this is a recurring failure mode, not a one-off: at 11:47:33 IST, a live
+`Nifty_Weekly_Intraday_GapSeller_1` stop-loss check compared
+`ltp=24586.4` (NIFTY spot) against a trigger price computed from the
+option's own ~30 premium and falsely closed a real position — the option's
+`fetch_symbol_ltp()` REST fallback had returned NIFTY spot's price with
+`bid=0.0, ask=0.0`, same shape as the SENSEX incident above but via
+`BrokerData.get_quotes()`'s single-quote path instead of MPP's order
+conversion.
+
+Root-cause investigation (two research passes) ruled out a DB/token
+collision (confirmed via direct query — `NIFTY`/`NSE_INDEX` token `26000`
+vs. the option's token `45093`, genuinely different numbers), any caching
+layer (none exists anywhere in the quote path — checked
+`get_api_response()`, `get_httpx_client()`, and the token-resolution cache
+independently), and auth/session scoping (single-user platform). The one
+client-side bug that would have perfectly explained this — HTTP/2
+connection-pool corruption under eventlet on this exact `get_quotes` call
+site — was already fixed 3 days earlier (`f6f79ecef`, 2026-08-07,
+unconditionally disabling HTTP/2 on the shared `httpx.Client`). Leading
+hypothesis is now an **unconfirmed Shoonya-backend-side glitch** (possibly
+related to how their servers handle a reused keep-alive connection across
+many different symbols in quick succession) — not something fixable in
+this codebase directly. This is why the fix below is detection/defense
+based, matching the MPP entry above, not a root-cause patch.
+
+### Shared detection layer: `broker/shoonya/api/data.py`
+
+New module-level `_quote_is_suspect(exchange, ltp, bid, ask) -> bool`:
+`exchange not in ("NSE_INDEX", "BSE_INDEX") and not (ltp>0 and bid>0 and ask>0)`
+— same condition as the MPP guard, but exchange-aware, since an INDEX quote
+legitimately has no bid/ask (no order book) and must never be flagged.
+`exchange` must be the ORIGINAL exchange, captured before the existing
+NSE_INDEX→NSE / BSE_INDEX→BSE rewrite.
+
+Added a new `"quote_suspect": bool` key to the dicts returned by
+`get_quotes()` (computed once, right before `return`, with a
+`logger.warning` including symbol/exchange/ltp/bid/ask when True) and,
+independently, to `_fetch_single_quote_sync()` /
+`_fetch_single_quote_async()` (the two single-symbol fetchers used inside
+`get_multiquotes()`'s batch fan-out — confirmed by reading the code that
+`get_multiquotes()` is a **separate implementation** from `get_quotes()`,
+not a wrapper around it, so both needed the fix independently). No
+per-symbol logging inside the multiquotes batch path — could produce dozens
+of lines per batch; callers (sandbox) log once per action taken instead.
+Purely additive in all three spots — no existing key/type changes, so the
+15+ other consumers of these functions (option chain, IV/vol-surface,
+Greeks, OI trackers, straddle charts, the Flow builder's dynamic
+quote/alert nodes) are unaffected and were **not otherwise touched** in
+this pass, since they legitimately treat `bid=0/ask=0` as normal for index
+quotes and weren't the risk-critical class this fix targets.
+
+### All 9 `strategies/deployed/*.py` scripts
+
+Each defines its own local `fetch_symbol_ltp(client, symbol, exchange)`
+(copy-paste convention, not a shared module, per
+`strategies/deployed/AUTHORING_CHECKLIST.md`). Added a
+`require_two_sided: bool = False` parameter to each — when True, also
+extracts `bid`/`ask` from the same response and requires
+`ltp>0 and bid>0 and ask>0`, returning `None` (with a `Log.warning`) instead
+of the quote otherwise. Default `False` keeps every existing (index) call
+site's behavior unchanged. Confirmed sufficient with zero additional
+caller-side logic: every risk-critical call site already had an
+`if <ltp> is None:` skip-this-cycle pattern before this change (traced
+end-to-end for GapSeller's own SL check and `exit_px` fallback), so `None`
+already means "don't act this tick, recheck next tick" everywhere it's
+used — flipping the parameter to `True` was the only change needed at each
+site.
+
+Flipped to `True` at every option-leg SL/exit-price read across all 9
+scripts (`exit_px` fallbacks, SL trigger checks, and — for
+`Nifty_Sensex_VWAP_NoHA_Intraday_1` specifically — its own
+option-price-based signal computation, since that script signals off the
+option's own VWAP rather than the underlying). Left at default `False` for
+every underlying-spot/index lookup (never has a real two-sided market) and
+for the futures-contract reads in `CRUDEOIL_VWAP_EMA20_Positional_1` /
+`MCX_CrudeOil_EMA9_RSI_Intraday_1` — an explicit judgement call: futures are
+genuinely tradable and can have a real thin book, and these specific call
+sites are signal-computation reads, not SL/exit triggers, so a
+false-negative there is far cheaper than a false SL trigger. Verified via a
+standalone mock-test harness (loads each real strategy file by path,
+stubs `client.quotes()`) exercising the exact real-incident quote shape
+(`ltp` matching the underlying spot level, `bid=ask=0`) against both
+`Nifty_Weekly_Intraday_GapSeller_1` and `Nifty_Sensex_VWAP_NoHA_Intraday_1`
+(the currently-live-capital script) — confirmed the guard correctly
+rejects the bad quote and that the index-lookup call sites are unaffected.
+
+### Sandbox: `sandbox/execution_engine.py`, `sandbox/catch_up_processor.py`
+
+New `quote_lacks_two_sided_market(quote) -> bool` next to the existing
+`quote_looks_stale()` (issue #1638) — same conservative shape (only flags a
+real contradiction, never a benign not-yet-fetched quote). No
+exchange-type branching needed here, unlike the broker layer: every quote
+reaching sandbox's order/GTT logic is for a pending order's or GTT leg's
+own symbol, which is always tradable (an index can't be traded), confirmed
+by tracing `sandbox/execution_engine.py`'s actual quote source —
+`services/quotes_service.py`'s `get_multiquotes_with_auth()` →
+`BrokerData.get_multiquotes()`, NOT `get_quotes()`, meaning the
+`get_quotes()`-only fix above would NOT have covered sandbox on its own;
+both broker-layer functions needed the `quote_suspect` addition for this
+sandbox fix to have real data to check against.
+
+Gated: `_process_order()`'s `trigger pending`, `SL`, and `SL-M` branches
+(deferring, not erroring — matches `quote_looks_stale`'s existing pattern
+exactly); `_check_pending_gtts()` and `catch_up_processor.py`'s
+`catch_up_gtts()`, both before calling `gtt_manager.leg_is_triggered_by()`
+(`continue`, skip firing this cycle). Deliberately NOT gated: the `MARKET`
+and `LIMIT` branches in `_process_order()` — `MARKET` already has an
+intentional `bid if bid>0 else ltp` fallback for genuinely thin real
+books, and gating it could stall legitimate fills indefinitely; this is an
+explicit judgement call, not an oversight. `gtt_manager.py`'s
+`leg_is_triggered_by()` itself stays a pure ltp-comparison function,
+signature unchanged — gated at its two call sites instead, keeping it
+small/testable.
+
+**Confirmed related gap, explicitly deferred, not fixed in this pass**:
+`sandbox/order_manager.py`'s placement-time marketability checks
+(`prefetched_quote`/`cached_quote` ltp-only comparisons for immediate-fill
+decisions on LIMIT/SL/SL-M at order placement) — structurally the same
+risk class, but a different surface (one-shot placement check vs. a
+standing risk position) and outside this pass's scoped boundary. Also
+confirmed out of scope and NOT touched: `sandbox/holdings_manager.py`
+(display-only MTM/P&L, not order-triggering) and
+`sandbox/websocket_execution_engine.py` (synthesizes its own `bid`/`ask`
+from a WebSocket tick's `ltp`, never calls `get_quotes`/`get_multiquotes` —
+a different data source than the one implicated in both incidents).
+
+Low conflict risk — every change in this entry is additive (`data.py`) or
+adds an early-return/continue gate immediately before an existing action
+(strategies, sandbox), matching the shape already established by the MPP
+entry above and by `quote_looks_stale` — no existing function signature was
+changed except the 9 scripts' own local `fetch_symbol_ltp` (new optional
+parameter, default preserves old behavior).
+
+---
+
+## WhatsApp self-alert on strategy failure: `_strategy_platform_client.py` + all 9 deployed strategies (2026-08-10, same day)
+
+Added at the project owner's request: a self-notify WhatsApp message
+(`POST /api/v1/whatsapp/notify`, `self: true` — see
+`docs/api/whatsapp-services/notify.md`) whenever any of the 9 deployed
+scripts hits an order rejection, a fill timeout, or any other runtime
+failure — so a strategy stuck in error_state or crashed outright is
+noticed on the phone, not just in the dashboard.
+
+### Shared function: `strategies/deployed/_strategy_platform_client.py`
+
+New `notify_whatsapp_error(env, message, log_warning=None)`, same
+fire-and-forget contract as `notify_trade_closed` above (reuses the same
+`_post_json_local` transport): **never raises**, swallows any failure via
+`log_warning` if given (and silently if not), truncates `message` to the
+endpoint's own documented 4096-char max. Verified via a standalone mock
+test — 8 assertions covering payload shape, endpoint, and specifically that
+a simulated network failure is swallowed both with and without a
+`log_warning` callback (the project owner's explicit requirement: "any
+failure to be handled ... not break the entire flow").
+
+### Two hook points, wired into all 9 scripts
+
+1. **`_enter_error_mode`** (each script's own chokepoint for a rejected
+   `place()`, a `poll_fill()`/`OrderNeedsAttention` timeout, or any other
+   entry/exit-fill exception) — fires the alert once per genuine transition
+   into `error_state`, not on the periodic UI-badge re-push
+   (`_repush_active_errors`). Message: `[{strategy_name}] {leg_key}
+   {error_state} ({error_kind}): {message}`.
+2. **`run_cycle`'s own outer `except Exception as exc:`** — catches a
+   genuinely unexpected crash not already routed through the error-state
+   machine. **Throttled** (new `cycle_failure_notify_interval_sec` config,
+   default 300s, new per-instance `_last_cycle_failure_notify` field,
+   in-memory/not persisted — a restart is itself worth a fresh alert if the
+   same crash recurs immediately) since an unthrottled outer catch-all
+   could otherwise fire once per scheduler tick if the same bug keeps
+   recurring. Message: `[{strategy_name}] Cycle failed: {exc}`.
+
+Both dispatch via **whichever background executor each script already uses
+for `push_leg_error`** (`_bg_executor` in GapSeller/OI; `_pnl_executor` in
+the other 7 — confirmed per-file before wiring, not assumed uniform) —
+never inline on `run_cycle`'s own thread, and the `.submit()` call itself is
+wrapped in its own try/except, matching the exact pattern already
+established for `push_leg_error`/`notify_trade_closed` dispatch.
+
+`Nifty_OI_WeeklyBuy_MonthlySell_1` is architecturally different (two
+side-engine classes, `WeeklySideEngine`/`MonthlySideEngine`, each with
+their own `_enter_error_mode`, both delegating to a shared
+`StrategyEngine`) — added one `_notify_whatsapp_error_bg(message)` helper
+on `StrategyEngine` itself (mirroring its existing `_notify_trade_closed_bg`
+exactly) and called it from both side-engines' `_enter_error_mode` plus
+`run_cycle`'s own outer `except Exception:` (which didn't previously bind
+the exception — changed to `except Exception as exc:` to include the
+message, same as every sibling script).
+
+### Import fallback
+
+Every script's existing `try: from _strategy_platform_client import
+notify_trade_closed, filter_known_fields / except ImportError:` block
+gained `notify_whatsapp_error` alongside `notify_trade_closed`, with the
+same no-op fallback stub — degrades gracefully (WhatsApp alerts simply
+don't fire) if the shared helper module isn't present alongside a
+standalone-copied script, exactly like `notify_trade_closed` already does.
+
+Low conflict risk — every change is additive (new function in the shared
+client module, new optional-nothing call sites in each script) or a new
+field/config value; no existing function signature changed except
+`run_cycle`'s bare `except Exception:` in the OI script, widened to bind
+the exception (behavior-preserving for everything except this new alert).
+
+---
+
 ## Frontend
 
 ### `frontend/src/App.tsx` (+6 lines)
