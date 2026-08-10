@@ -958,10 +958,23 @@ def _years_to_expiry(expiry_raw: str) -> float:
 
 
 def select_monthly_delta_strike(client, spot: float, expiry_raw: str, option_type: str) -> tuple[float, float]:
-    """Nearest 100-pt strike where |Delta| is within [monthly_delta_low,
-    monthly_delta_high] (spec SS9). Scans outward from ATM in 100-pt steps
-    on the OTM side for `option_type`, since delta moves monotonically away
-    from 0.50 as strikes go further OTM. Returns (strike, delta_at_selection).
+    """Strike where |Delta| is within [monthly_delta_low, monthly_delta_high]
+    (spec SS9), but ALWAYS a multiple of 100 -- explicit requirement, since
+    round-100 strikes are the liquid ones actually worth trading for
+    NIFTY Monthly. Scans every REAL listed strike (50pts apart, not just
+    every 100pt one) outward from ATM on the OTM side for `option_type`,
+    since delta moves monotonically away from 0.50 as strikes go further
+    OTM -- this finds a qualifying strike far more often than only checking
+    every other (100pt) strike would, since the target delta zone can land
+    on either grid point as spot/time move. If the qualifying strike is
+    already a multiple of 100, use it directly. If it's only a multiple of
+    50, snap to the next strike further OTM that IS a multiple of 100 and
+    trade that instead -- its own delta may now sit slightly outside
+    [monthly_delta_low, monthly_delta_high] (moving further OTM only
+    lowers delta further), and that's accepted deliberately: the 50pt
+    match locates the right neighborhood, the round-100 strike next to it
+    is what actually gets traded, by explicit design decision (2026-08-10).
+    Returns (strike, delta_at_the_strike_actually_returned).
 
     2026-08-10: replaced up to 20 sequential optiongreeks() calls (each 2
     broker round-trips -- underlying LTP + that one option's LTP -- worst
@@ -970,13 +983,8 @@ def select_monthly_delta_strike(client, spot: float, expiry_raw: str, option_typ
     scan range, then local Black-76 math (opengreeks) per candidate, no
     further network calls. Confirmed live: run_cycle's "maximum number of
     running instances reached" pileup on nearly every 10s cycle correlated
-    directly with this function's worst-case (no-strike-found) scans.
-    Candidate strikes/order/target range are unchanged from the original
-    logic -- this is a performance fix only, not a strike-selection change
-    (verified: NIFTY's real listed strikes are 50pts apart, so
-    strike_count=40 on the batched fetch covers the same +/-2000pt range
-    as the original 20-step-by-100pt scan)."""
-    atm_100 = round(spot / config.monthly_strike_round) * config.monthly_strike_round
+    directly with this function's worst-case (no-strike-found) scans."""
+    atm_50 = round(spot / 50.0) * 50.0
     direction = 1 if option_type == "CE" else -1
     side_key = "ce" if option_type == "CE" else "pe"
 
@@ -1001,23 +1009,42 @@ def select_monthly_delta_strike(client, spot: float, expiry_raw: str, option_typ
     years_to_expiry = _years_to_expiry(expiry_raw)
     flag = "c" if option_type == "CE" else "p"
 
-    # Bounded scan -- 20 steps of 100pts covers +/-2000 points from ATM,
-    # comfortably beyond where a 0.20-0.25 delta strike would ever sit for
-    # NIFTY's typical monthly IV/DTE combinations. Unchanged from the
-    # original loop.
-    for step in range(1, 21):
-        strike = atm_100 + direction * step * config.monthly_strike_round
+    def _delta_at(strike: float) -> float | None:
         premium = premium_by_strike.get(strike)
         if premium is None:
-            continue
+            return None
         try:
             iv = black76.implied_volatility(premium, forward, strike, 0.0, years_to_expiry, flag)
-            delta = black76.delta(flag, forward, strike, years_to_expiry, 0.0, iv)
+            return float(black76.delta(flag, forward, strike, years_to_expiry, 0.0, iv))
         except Exception as exc:
             Log.warning(f"Local Greeks computation failed for strike {strike}: {exc}")
+            return None
+
+    # Bounded scan -- 40 steps of 50pts covers +/-2000 points from ATM,
+    # comfortably beyond where a 0.20-0.25 delta strike would ever sit for
+    # NIFTY's typical monthly IV/DTE combinations (same total range as the
+    # original 20-step-by-100pt scan, just twice as fine-grained).
+    for step in range(1, 41):
+        strike = atm_50 + direction * step * 50.0
+        delta = _delta_at(strike)
+        if delta is None:
             continue
-        if config.monthly_delta_low <= abs(delta) <= config.monthly_delta_high:
-            return strike, float(delta)
+        if not (config.monthly_delta_low <= abs(delta) <= config.monthly_delta_high):
+            continue
+        if strike % 100 == 0:
+            return strike, delta
+        # 50pt-only match -- snap to the next OTM 100-multiple and trade
+        # that instead, even if ITS delta falls outside the target range
+        # (explicit decision: the round-100 strike is what actually gets
+        # traded, the 50pt scan only locates the neighborhood).
+        snapped_strike = strike + direction * 50.0
+        snapped_delta = _delta_at(snapped_strike)
+        if snapped_delta is None:
+            # Snapped strike's premium/Greeks unavailable -- can't safely
+            # trade what we can't price. Keep scanning further OTM rather
+            # than silently skip straight past this neighborhood.
+            continue
+        return snapped_strike, snapped_delta
     raise RuntimeError(
         f"No {option_type} strike found within delta "
         f"[{config.monthly_delta_low}, {config.monthly_delta_high}] near spot {spot}, expiry {expiry_raw}"
