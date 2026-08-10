@@ -219,6 +219,9 @@ class OptionChainSchema(Schema):
     strike_count = fields.Int(
         required=False, validate=validate.Range(min=1, max=100), allow_none=True
     )  # Number of strikes above/below ATM. If not provided, returns entire chain
+    with_quotes = fields.Bool(
+        required=False, load_default=True
+    )  # False skips the per-strike broker quote fetch, returning strikes/symbols only
 
 
 class MarketHolidaysSchema(Schema):

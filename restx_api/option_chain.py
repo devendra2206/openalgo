@@ -12,7 +12,10 @@ Request Body:
     "underlying": "NIFTY",
     "exchange": "NSE_INDEX",
     "expiry_date": "30DEC25",
-    "strike_count": 10  // Optional: if not provided, returns entire chain
+    "strike_count": 10,  // Optional: if not provided, returns entire chain
+    "with_quotes": true  // Optional, default true. False skips the per-strike
+                          // broker quote fetch, returning strikes/symbols only
+                          // -- for callers that only need which strikes exist.
 }
 
 Response:
@@ -96,10 +99,12 @@ class OptionChain(Resource):
             exchange = data["exchange"]
             expiry_date = data["expiry_date"]
             strike_count = data.get("strike_count")  # None means return entire chain
+            with_quotes = data.get("with_quotes", True)
 
             logger.info(
                 f"Option chain request: underlying={underlying}, exchange={exchange}, "
-                f"expiry={expiry_date}, strike_count={'all' if strike_count is None else strike_count}"
+                f"expiry={expiry_date}, strike_count={'all' if strike_count is None else strike_count}, "
+                f"with_quotes={with_quotes}"
             )
 
             # Call service to get option chain
@@ -109,6 +114,7 @@ class OptionChain(Resource):
                 expiry_date=expiry_date,
                 strike_count=strike_count,
                 api_key=api_key,
+                with_quotes=with_quotes,
             )
 
             return response, status_code
