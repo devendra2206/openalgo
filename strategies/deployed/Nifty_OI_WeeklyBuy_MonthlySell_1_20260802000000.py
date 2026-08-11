@@ -208,6 +208,11 @@ class Config:
     weekly_profit_target_pct: float = 100.0   # Weekly Buy only
     monthly_delta_low: float = 0.20
     monthly_delta_high: float = 0.25
+    # 2026-08-11: select_monthly_delta_strike() now picks whichever scanned
+    # strike's |delta| is closest to this target, instead of the first one
+    # landing in [monthly_delta_low, monthly_delta_high] -- that band is
+    # now only a "stop widening the scan" heuristic, not a hard filter.
+    monthly_delta_target: float = 0.23
     monthly_strike_round: int = 100           # spec SS9: round Monthly strike to nearest 100
     monthly_expiry_roll_day_of_month: int = 20  # spec SS8: calendar day > 20 -> roll to next month's expiry
 
@@ -993,22 +998,21 @@ def _years_to_expiry(expiry_raw: str) -> float:
 
 
 def select_monthly_delta_strike(client, spot: float, expiry_raw: str, option_type: str) -> tuple[float, float]:
-    """Strike where |Delta| is within [monthly_delta_low, monthly_delta_high]
-    (spec SS9), but ALWAYS a multiple of 100 -- explicit requirement, since
-    round-100 strikes are the liquid ones actually worth trading for NIFTY
-    Monthly. Scans ONLY round-100 strikes directly, outward from ATM on the
-    OTM side for `option_type` (2026-08-11, second pass: dropped the
-    earlier 50pt-scan-then-snap-to-100 approach -- the strike actually
-    traded is now the exact strike whose own delta is checked, no
-    snap-and-hope step, and no "snapped strike's delta may sit outside
-    target range" caveat). Returns (strike, delta_at_that_strike).
+    """Strike whose |Delta| is CLOSEST to monthly_delta_target (spec SS9
+    origin, refined 2026-08-11 third pass -- see below), but ALWAYS a
+    multiple of 100 -- explicit requirement, since round-100 strikes are
+    the liquid ones actually worth trading for NIFTY Monthly. Scans ONLY
+    round-100 strikes directly, outward from ATM on the OTM side for
+    `option_type`. Returns (strike, delta_at_that_strike).
 
     Fetches in expanding BANDS: tries the nearest band_step_count round-100
     strikes first (fast, cheap -- fewer symbols to fetch), and only if
-    nothing qualifies there, fetches one band further out before giving up
-    entirely. Each band re-fetches from ATM (optionchain() has no
-    offset/skip param), but only strikes beyond the previous band's
-    coverage are evaluated -- already-checked strikes aren't re-scored.
+    none of them land in [monthly_delta_low, monthly_delta_high], fetches
+    one band further out before giving up on that heuristic. Each band
+    re-fetches from ATM (optionchain() has no offset/skip param), but only
+    strikes beyond the previous band's coverage are newly scored --
+    already-checked strikes aren't re-scored, though the best candidate
+    found so far carries forward across bands.
 
     2026-08-10: replaced up to 20 sequential optiongreeks() calls (each 2
     broker round-trips) with ONE optionchain(with_quotes=True) call, local
@@ -1027,7 +1031,25 @@ def select_monthly_delta_strike(client, spot: float, expiry_raw: str, option_typ
     the candidate strikes to price per point of range vs the old 50pt
     scan) AND added the expanding-band fallback above, so a day where the
     qualifying strike sits further out than usual degrades to one extra
-    (still cheap) fetch instead of failing outright."""
+    (still cheap) fetch instead of failing outright.
+
+    2026-08-11 (third pass): switched from "first strike whose delta lands
+    in [monthly_delta_low, monthly_delta_high]" to "closest strike to
+    monthly_delta_target among everything scanned" -- confirmed live the
+    first-hit rule can land anywhere in that 0.05-wide band depending on
+    where the scan happens to cross it (e.g. 0.240 instead of the intended
+    ~0.23), not necessarily near its center. [monthly_delta_low,
+    monthly_delta_high] is now ONLY a "stop widening the band" heuristic,
+    not a trade filter: once any band produces a strike inside it, the
+    closest-to-target strike found across ALL bands scanned so far is
+    returned immediately (no further fetch), even if that closest strike's
+    own delta sits marginally outside the band. If no band (up to
+    max_bands) ever produces a strike inside the band, the closest-to-
+    target strike found across everything scanned is still returned (with
+    a warning) rather than failing the cycle -- RuntimeError is now
+    reserved for genuine data failures (optionchain() itself failing, or
+    zero usable/liquid premiums found across every band scanned), never
+    for "closest found wasn't close enough"."""
     atm_100 = round(spot / 100.0) * 100.0
     direction = 1 if option_type == "CE" else -1
     side_key = "ce" if option_type == "CE" else "pe"
@@ -1036,6 +1058,10 @@ def select_monthly_delta_strike(client, spot: float, expiry_raw: str, option_typ
 
     years_to_expiry = _years_to_expiry(expiry_raw)
     flag = "c" if option_type == "CE" else "p"
+
+    best_strike: float | None = None
+    best_delta: float | None = None
+    best_diff = float("inf")
 
     for band in range(1, max_bands + 1):
         # optionchain()'s strike_count counts real LISTED strikes (50pt
@@ -1087,8 +1113,12 @@ def select_monthly_delta_strike(client, spot: float, expiry_raw: str, option_typ
             delta = _delta_at(strike)
             if delta is None:
                 continue
-            if config.monthly_delta_low <= abs(delta) <= config.monthly_delta_high:
-                return strike, delta
+            diff = abs(abs(delta) - config.monthly_delta_target)
+            if diff < best_diff:
+                best_strike, best_delta, best_diff = strike, delta, diff
+
+        if best_delta is not None and config.monthly_delta_low <= abs(best_delta) <= config.monthly_delta_high:
+            return best_strike, best_delta
 
         if band < max_bands:
             Log.info(
@@ -1097,10 +1127,18 @@ def select_monthly_delta_strike(client, spot: float, expiry_raw: str, option_typ
                 f"+/-{band_step_count * (band + 1) * 100}pts"
             )
 
+    if best_strike is not None:
+        Log.warning(
+            f"[MONTHLY_{option_type}] no strike within "
+            f"[{config.monthly_delta_low}, {config.monthly_delta_high}] after scanning "
+            f"+/-{band_step_count * max_bands * 100}pts -- using closest to target "
+            f"{config.monthly_delta_target}: strike={best_strike} delta={best_delta:.4f}"
+        )
+        return best_strike, best_delta
+
     raise RuntimeError(
-        f"No {option_type} strike found within delta "
-        f"[{config.monthly_delta_low}, {config.monthly_delta_high}] near spot {spot}, expiry {expiry_raw} "
-        f"(scanned up to +/-{band_step_count * max_bands * 100}pts)"
+        f"No usable {option_type} premium found near spot {spot}, expiry {expiry_raw} "
+        f"(scanned up to +/-{band_step_count * max_bands * 100}pts, all illiquid or unpriceable)"
     )
 
 
@@ -3252,7 +3290,7 @@ def print_banner():
     print(f"Candle interval      : {config.intraday_interval}")
     print(f"Gap threshold        : {config.gap_threshold_pct}%")
     print(f"Weekly profit target : {config.weekly_profit_target_pct}%")
-    print(f"Monthly delta range  : {config.monthly_delta_low}-{config.monthly_delta_high}")
+    print(f"Monthly delta target : {config.monthly_delta_target} (stop-widening band: {config.monthly_delta_low}-{config.monthly_delta_high})")
     print(f"Quantity per leg     : {config.quantity}")
     print(f"Product              : {config.product}")
     print(f"Entry cutoff time    : {config.entry_cutoff_time.strftime('%H:%M')} (no new entries after)")
