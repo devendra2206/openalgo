@@ -48,8 +48,10 @@ CRYPTO`).
 Signal Rules
 ------------------------------------------------------------------------
 Computed off the front-month futures contract's own 45-minute candles:
-  - EMA(High, 34) and EMA(Low, 34), RSI(14) on Close, and ADX(14) -- all
-    computed over the last-closed 45m bars (the newest fetched bar is
+  - EMA(High, 34) and EMA(Low, 34), RSI(14) on Close, ADX(14), and a
+    session-anchored VWAP (see _session_vwap -- same hand-rolled pattern
+    as CRUDEOIL_VWAP_EMA20_Positional_1, no openalgo.ta helper exists) --
+    all computed over the last-closed 45m bars (the newest fetched bar is
     unconditionally dropped as still-forming, same defensive pattern used
     everywhere else in this project).
   - Evaluated purely off the last CLOSED candle's own values -- no live-LTP
@@ -63,9 +65,23 @@ Computed off the front-month futures contract's own 45-minute candles:
              AND adx_prev1 > 25                (trend strength gate --
                                                 shared by both sides, no
                                                 directional +DI/-DI check)
+             AND close_prev1 > vwap_prev1      (price also above session
+                                                VWAP -- value/location
+                                                confirmation, independent
+                                                of ADX's trend-strength
+                                                measure; added 2026-08-11
+                                                after live entries fired on
+                                                already-extended moves)
+             AND ltp > vwap_prev1              (live price also above
+                                                session VWAP at the moment
+                                                of entry, not just as of
+                                                the last closed candle --
+                                                added 2026-08-11)
   PE entry : close_prev1 < ema_low34_prev1    (mirror, below 34-EMA of Lows)
              AND rsi_prev1 < 47
              AND adx_prev1 > 25
+             AND close_prev1 < vwap_prev1      (mirror)
+             AND ltp < vwap_prev1              (mirror)
 
   CE exit  : close_prev1 < ema_low34_prev1  OR  rsi_prev1 < 47
   PE exit  : close_prev1 > ema_high34_prev1 OR  rsi_prev1 > 53
@@ -102,9 +118,10 @@ Computed off the front-month futures contract's own 45-minute candles:
   exact same _exit_leg()/LIMIT-crossing/error-recovery path as the EMA/
   RSI exit, just with reason="stop_loss". A stop-loss exit also blocks a
   fresh entry on THAT SAME leg (CE stop-out only blocks CE, PE
-  unaffected) until the candle advances, so a stopped-out trade can't
-  immediately re-enter against the identical stale-candle reading that
-  just stopped it out -- see LegState.last_sl_exit_candle_key.
+  unaffected) until the wall-clock candle actually advances, so a
+  stopped-out trade can't immediately re-enter against the identical
+  stale-candle reading that just stopped it out -- see
+  LegState.last_sl_exit_candle_boundary.
 
 Strike selection, expiry, and product
 ------------------------------------------------------------------------
@@ -507,13 +524,24 @@ class LegPosition:
 class LegState:
     trade_count: int = 0
     position: LegPosition = field(default_factory=LegPosition)
-    # 2026-08-11: set to the InstrumentSignal.candle_key a stop-loss exit
-    # fired on -- blocks a fresh entry on THIS SAME leg (CE stop-out only
-    # blocks CE re-entry, PE is unaffected) until the candle advances, so a
-    # stopped-out trade can't immediately whipsaw back in against the same
-    # stale-candle EMA/RSI/ADX reading that just got it stopped out. Reset
-    # daily in _reset_day_if_needed alongside trade_count.
-    last_sl_exit_candle_key: str = ""
+    # 2026-08-11: set to _current_candle_boundary()'s WALL-CLOCK forming-
+    # candle boundary at the moment a stop-loss exit fired -- blocks a fresh
+    # entry on THIS SAME leg (CE stop-out only blocks CE re-entry, PE is
+    # unaffected) until the candle actually advances, so a stopped-out trade
+    # can't immediately whipsaw back in against the same stale-candle EMA/
+    # RSI/ADX reading that just got it stopped out. Deliberately NOT
+    # InstrumentSignal.candle_key (last-CLOSED candle from the cached
+    # signal) -- that cache refreshes asynchronously in the background
+    # (get_signal/_refresh_signal_and_chain_bg) and can lag the true
+    # wall-clock boundary by up to one refresh cycle. Confirmed live
+    # 2026-08-11: an SL fired one cycle before the cache had caught up to a
+    # boundary that had already passed, stamping the OLD candle_key; the very
+    # next cycle's cache refresh landed on the NEW candle_key, made the
+    # comparison mismatch, and let a re-entry through 60s after the SL, same
+    # physical 45m window. _current_candle_boundary() is pure wall-clock
+    # (datetime.now() only, no cache/network dependency) so it can't lag.
+    # Reset daily in _reset_day_if_needed alongside trade_count.
+    last_sl_exit_candle_boundary: str = ""
 
 
 @dataclass
@@ -1020,7 +1048,7 @@ class StateStore:
             leg_raw = legs_data.get(key, {})
             leg = LegState()
             leg.trade_count = leg_raw.get("trade_count", 0)
-            leg.last_sl_exit_candle_key = leg_raw.get("last_sl_exit_candle_key", "")
+            leg.last_sl_exit_candle_boundary = leg_raw.get("last_sl_exit_candle_boundary", "")
             pos_raw = leg_raw.get("position", {})
             leg.position = LegPosition(**{**asdict(LegPosition()), **filter_known_fields(LegPosition, pos_raw)})
             self.state.legs[key] = leg
@@ -1038,7 +1066,7 @@ class StateStore:
             "legs": {
                 key: {
                     "trade_count": leg.trade_count,
-                    "last_sl_exit_candle_key": leg.last_sl_exit_candle_key,
+                    "last_sl_exit_candle_boundary": leg.last_sl_exit_candle_boundary,
                     "position": asdict(leg.position),
                 }
                 for key, leg in self.state.legs.items()
@@ -1199,6 +1227,7 @@ class InstrumentSignal:
     ema_low_prev1: float
     rsi_prev1: float
     adx_prev1: float
+    vwap_prev1: float
     ltp: float
     candle_key: str
 
@@ -1207,6 +1236,41 @@ class InstrumentSignal:
 # on every indicator_refresh_interval refetch (same fix applied to the other
 # 3 strategies in this project).
 _last_logged_candle: dict[str, str] = {}
+
+
+def _session_vwap(bars) -> np.ndarray:
+    """Session-anchored VWAP over `bars` (a DataFrame with a tz-aware
+    DatetimeIndex and open/high/low/close/volume columns), resetting at each
+    calendar day's first bar. No existing session-VWAP helper was found in
+    `openalgo.ta` (same finding as CRUDEOIL_VWAP_EMA20_Positional_1, which
+    this is copied from), so computed directly:
+    cumsum(typical_price * volume) / cumsum(volume), with both cumulative
+    sums reset to zero at the first bar of every new IST calendar day."""
+    typical = (bars["high"].to_numpy(dtype=float) + bars["low"].to_numpy(dtype=float)
+               + bars["close"].to_numpy(dtype=float)) / 3.0
+    volume = bars["volume"].to_numpy(dtype=float) if "volume" in bars.columns else np.ones(len(bars))
+    # Zero/missing volume bars would make VWAP undefined (0/0) -- fall back
+    # to the typical price itself for that bar's weight, same as treating a
+    # single share/contract as having traded, rather than propagating NaN
+    # through the whole session's cumulative sums.
+    volume = np.where(volume <= 0, 1.0, volume)
+
+    session_dates = np.array([ts.tz_convert(IST).date() if ts.tzinfo else ts.date()
+                               for ts in bars.index])
+
+    vwap = np.zeros(len(bars))
+    cum_pv = 0.0
+    cum_v = 0.0
+    current_session = None
+    for i in range(len(bars)):
+        if session_dates[i] != current_session:
+            current_session = session_dates[i]
+            cum_pv = 0.0
+            cum_v = 0.0
+        cum_pv += typical[i] * volume[i]
+        cum_v += volume[i]
+        vwap[i] = cum_pv / cum_v if cum_v > 0 else typical[i]
+    return vwap
 
 
 def _resample_to_candle_interval(bars, interval_minutes: int):
@@ -1281,6 +1345,7 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
     rsi = np.asarray(ta.rsi(close, config.rsi_period))
     _plus_di, _minus_di, adx = ta.adx(high, low, close, config.adx_period)
     adx = np.asarray(adx)
+    vwap = _session_vwap(bars)
 
     candle_key = str(bars.index[-1])
 
@@ -1292,7 +1357,7 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
     signal = InstrumentSignal(
         close_prev1=float(close[-1]),
         ema_high_prev1=float(ema_high[-1]), ema_low_prev1=float(ema_low[-1]),
-        rsi_prev1=float(rsi[-1]), adx_prev1=float(adx[-1]),
+        rsi_prev1=float(rsi[-1]), adx_prev1=float(adx[-1]), vwap_prev1=float(vwap[-1]),
         ltp=ltp, candle_key=candle_key,
     )
 
@@ -1301,7 +1366,7 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
         Log.info(
             f"[{inst.name}] futures={futures_symbol} candle={candle_key} close={signal.close_prev1:.2f} "
             f"ema_high{config.ema_period}={signal.ema_high_prev1:.2f} ema_low{config.ema_period}={signal.ema_low_prev1:.2f} "
-            f"rsi={signal.rsi_prev1:.2f} adx={signal.adx_prev1:.2f} ltp={ltp:.2f}"
+            f"rsi={signal.rsi_prev1:.2f} adx={signal.adx_prev1:.2f} vwap={signal.vwap_prev1:.2f} ltp={ltp:.2f}"
         )
     return signal
 
@@ -2072,7 +2137,7 @@ class StrategyEngine:
                 self._chain_cache.clear()
                 for leg in self.store.state.legs.values():
                     leg.trade_count = 0
-                    leg.last_sl_exit_candle_key = ""
+                    leg.last_sl_exit_candle_boundary = ""
                 self._save_state()
                 self.price_stream.add_instruments(
                     [{"symbol": futures_symbol, "exchange": INSTRUMENTS[0].options_exchange}]
@@ -3099,6 +3164,8 @@ class StrategyEngine:
                             signal.close_prev1 > signal.ema_high_prev1
                             and signal.rsi_prev1 > config.ce_rsi_entry_threshold
                             and signal.adx_prev1 > config.adx_threshold
+                            and signal.close_prev1 > signal.vwap_prev1
+                            and signal.ltp > signal.vwap_prev1
                         )
                         exit_condition = (
                             signal.close_prev1 < signal.ema_low_prev1
@@ -3109,6 +3176,8 @@ class StrategyEngine:
                             signal.close_prev1 < signal.ema_low_prev1
                             and signal.rsi_prev1 < config.pe_rsi_entry_threshold
                             and signal.adx_prev1 > config.adx_threshold
+                            and signal.close_prev1 < signal.vwap_prev1
+                            and signal.ltp < signal.vwap_prev1
                         )
                         exit_condition = (
                             signal.close_prev1 > signal.ema_high_prev1
@@ -3139,11 +3208,16 @@ class StrategyEngine:
                             reason = "stop_loss" if (sl_hit and not exit_condition) else "ema_rsi_adx_reversal"
                             if sl_hit and reason == "stop_loss":
                                 # Blocks a fresh entry on THIS SAME leg until the
-                                # candle advances -- see LegState.last_sl_exit_
-                                # candle_key's own comment for why (avoid
-                                # whipsawing back in against the identical
-                                # stale-candle reading that just stopped this out).
-                                leg.last_sl_exit_candle_key = signal.candle_key
+                                # WALL-CLOCK candle advances -- see LegState.
+                                # last_sl_exit_candle_boundary's own comment for
+                                # why this is _current_candle_boundary(), not
+                                # signal.candle_key (the latter is a background-
+                                # refreshed cache that can lag the true boundary
+                                # and let a re-entry slip through, confirmed live
+                                # 2026-08-11).
+                                leg.last_sl_exit_candle_boundary = str(
+                                    _current_candle_boundary(config.candle_interval_minutes)
+                                )
                             self._exit_leg(leg_key, inst, reason=reason)
                         continue
 
@@ -3151,7 +3225,9 @@ class StrategyEngine:
                         continue
                     if leg.trade_count >= config.max_trades_per_leg_per_day:
                         continue
-                    if leg.last_sl_exit_candle_key and leg.last_sl_exit_candle_key == signal.candle_key:
+                    if leg.last_sl_exit_candle_boundary and leg.last_sl_exit_candle_boundary == str(
+                        _current_candle_boundary(config.candle_interval_minutes)
+                    ):
                         continue
                     if not entry_condition:
                         continue
@@ -3160,13 +3236,17 @@ class StrategyEngine:
                         condition_desc = (
                             f"close_prev1={signal.close_prev1:.2f} > ema_high_prev1={signal.ema_high_prev1:.2f}, "
                             f"rsi_prev1={signal.rsi_prev1:.2f} > ce_rsi_entry_threshold={config.ce_rsi_entry_threshold}, "
-                            f"adx_prev1={signal.adx_prev1:.2f} > adx_threshold={config.adx_threshold}"
+                            f"adx_prev1={signal.adx_prev1:.2f} > adx_threshold={config.adx_threshold}, "
+                            f"close_prev1={signal.close_prev1:.2f} > vwap_prev1={signal.vwap_prev1:.2f}, "
+                            f"ltp={signal.ltp:.2f} > vwap_prev1={signal.vwap_prev1:.2f}"
                         )
                     else:
                         condition_desc = (
                             f"close_prev1={signal.close_prev1:.2f} < ema_low_prev1={signal.ema_low_prev1:.2f}, "
                             f"rsi_prev1={signal.rsi_prev1:.2f} < pe_rsi_entry_threshold={config.pe_rsi_entry_threshold}, "
-                            f"adx_prev1={signal.adx_prev1:.2f} > adx_threshold={config.adx_threshold}"
+                            f"adx_prev1={signal.adx_prev1:.2f} > adx_threshold={config.adx_threshold}, "
+                            f"close_prev1={signal.close_prev1:.2f} < vwap_prev1={signal.vwap_prev1:.2f}, "
+                            f"ltp={signal.ltp:.2f} < vwap_prev1={signal.vwap_prev1:.2f}"
                         )
                     self._enter_leg(leg_key, inst, option_type, spot=signal.ltp, futures_symbol=futures_symbol,
                                      condition_desc=condition_desc)
