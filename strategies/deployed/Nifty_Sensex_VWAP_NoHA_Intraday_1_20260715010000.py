@@ -275,7 +275,11 @@ class Config:
 
     entry_start: time = time(9, 20)
     entry_end: time = time(14, 45)
-    universal_exit_time: time = time(15, 15)
+    # 2026-08-11: moved 15:15 -> 15:00 -- SEBI's 15:15-15:20 transition/
+    # reference-price window disallows fresh order entry (including
+    # closes), so this must clear well before that window opens rather
+    # than racing its start.
+    universal_exit_time: time = time(15, 0)
     market_close: time = time(15, 30)
     atm_lock_after: time = time(9, 17)   # lock the day's ATM strike from the first cycle at/after
                                           # this time, using the closing price of the 09:15-09:17

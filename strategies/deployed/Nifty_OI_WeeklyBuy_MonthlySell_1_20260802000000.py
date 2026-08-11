@@ -240,13 +240,14 @@ class Config:
 
     market_open: time = time(9, 15)
     market_close: time = time(15, 30)
-    # 10 minutes of buffer before market_close (was 15:15, the same instant
-    # as the broker's MIS square-off cutoff -- see product's docstring above;
-    # kept the earlier time even after moving to NRML since poll_fill's
-    # reprice loop can itself take up to ~5 minutes, and that needs to finish
-    # well before the exchange closes at 15:30, not run right up against it).
-    weekly_universal_exit_time: time = time(15, 20)   # spec SS5.B
-    monthly_universal_exit_time: time = time(15, 20)
+    # 2026-08-11: moved 15:20 -> 15:10 -- SEBI's 15:15-15:20 transition/
+    # reference-price window disallows fresh order entry (including
+    # closes); 15:20 sat right at the window's own end, racing it instead
+    # of clearing before it opens. 15:10 also keeps poll_fill's reprice
+    # loop (up to ~5 minutes) comfortably clear of the window and of the
+    # 15:30 exchange close.
+    weekly_universal_exit_time: time = time(15, 10)   # spec SS5.B, revised
+    monthly_universal_exit_time: time = time(15, 10)
     # No NEW entries (Weekly or Monthly, either side) from this time onward --
     # existing open legs are still managed/exited normally by their own rules.
     entry_cutoff_time: time = time(14, 45)

@@ -427,7 +427,13 @@ class Config:
     product: str = "NRML"
     price_type: str = "MARKET"
 
-    universal_exit_time: time = time(15, 15)   # 15 min buffer before market_close -- the ONLY backstop under NRML
+    # 2026-08-11: moved 15:15 -> 15:05 -- SEBI's 15:15-15:20 transition/
+    # reference-price window disallows fresh order entry (including
+    # closes), so this must clear well before that window opens rather
+    # than racing its start -- especially important here since this is the
+    # ONLY backstop under NRML (no broker-side square-off net if this
+    # order fails).
+    universal_exit_time: time = time(15, 5)
     market_close: time = time(15, 30)
 
     scheduler_interval: int = 10
