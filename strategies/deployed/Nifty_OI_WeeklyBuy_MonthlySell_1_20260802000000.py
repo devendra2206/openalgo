@@ -995,117 +995,112 @@ def _years_to_expiry(expiry_raw: str) -> float:
 def select_monthly_delta_strike(client, spot: float, expiry_raw: str, option_type: str) -> tuple[float, float]:
     """Strike where |Delta| is within [monthly_delta_low, monthly_delta_high]
     (spec SS9), but ALWAYS a multiple of 100 -- explicit requirement, since
-    round-100 strikes are the liquid ones actually worth trading for
-    NIFTY Monthly. Scans every REAL listed strike (50pts apart, not just
-    every 100pt one) outward from ATM on the OTM side for `option_type`,
-    since delta moves monotonically away from 0.50 as strikes go further
-    OTM -- this finds a qualifying strike far more often than only checking
-    every other (100pt) strike would, since the target delta zone can land
-    on either grid point as spot/time move. If the qualifying strike is
-    already a multiple of 100, use it directly. If it's only a multiple of
-    50, snap to the next strike further OTM that IS a multiple of 100 and
-    trade that instead -- its own delta may now sit slightly outside
-    [monthly_delta_low, monthly_delta_high] (moving further OTM only
-    lowers delta further), and that's accepted deliberately: the 50pt
-    match locates the right neighborhood, the round-100 strike next to it
-    is what actually gets traded, by explicit design decision (2026-08-10).
-    Returns (strike, delta_at_the_strike_actually_returned).
+    round-100 strikes are the liquid ones actually worth trading for NIFTY
+    Monthly. Scans ONLY round-100 strikes directly, outward from ATM on the
+    OTM side for `option_type` (2026-08-11, second pass: dropped the
+    earlier 50pt-scan-then-snap-to-100 approach -- the strike actually
+    traded is now the exact strike whose own delta is checked, no
+    snap-and-hope step, and no "snapped strike's delta may sit outside
+    target range" caveat). Returns (strike, delta_at_that_strike).
+
+    Fetches in expanding BANDS: tries the nearest band_step_count round-100
+    strikes first (fast, cheap -- fewer symbols to fetch), and only if
+    nothing qualifies there, fetches one band further out before giving up
+    entirely. Each band re-fetches from ATM (optionchain() has no
+    offset/skip param), but only strikes beyond the previous band's
+    coverage are evaluated -- already-checked strikes aren't re-scored.
 
     2026-08-10: replaced up to 20 sequential optiongreeks() calls (each 2
-    broker round-trips -- underlying LTP + that one option's LTP -- worst
-    case ~40 round-trips run synchronously inline on run_cycle's own
-    thread) with ONE optionchain(with_quotes=True) call covering the full
-    scan range, then local Black-76 math (opengreeks) per candidate, no
-    further network calls. Confirmed live: run_cycle's "maximum number of
-    running instances reached" pileup on nearly every 10s cycle correlated
-    directly with this function's worst-case (no-strike-found) scans.
+    broker round-trips) with ONE optionchain(with_quotes=True) call, local
+    Black-76 math (opengreeks) per candidate, no further network calls.
 
-    2026-08-11: strike_count/scan range cut from 40 to 15 (+/-750pts,
-    down from +/-2000pts) -- confirmed live the SINGLE optionchain() call
-    above was itself the bottleneck, not the number of calls: Shoonya's
-    get_multiquotes() is not a true broker batch endpoint, it fans out to
-    one HTTP call per symbol in batches of 20 with a forced 1s sleep
-    between batches, and with_quotes fetches BOTH ce+pe for every strike
-    in range regardless of which side we need -- strike_count=40 meant up
-    to 160 symbols (80 strikes x 2 legs), 8 batches, 7+ forced seconds of
-    sleep alone, and was observed live timing out entirely ("Request timed
-    out. The server took too long to respond.") -> run_cycle pileup, same
-    symptom as the original 20-sequential-calls version, different cause.
-    +/-750pts retains a comfortable margin: live matches so far have
-    landed 370-400pts OTM (2026-08-10 CE @ 25000/400pts,
-    PE @ 24200/370pts)."""
-    atm_50 = round(spot / 50.0) * 50.0
+    2026-08-11 (first pass): cut the fetch range from +/-2000pts to
+    +/-750pts -- confirmed live that Shoonya's get_multiquotes() is not a
+    true broker batch endpoint (fans out one HTTP call per symbol, batches
+    of 20, forced 1s sleep between batches), and with_quotes fetches BOTH
+    ce+pe for every strike regardless of which side is needed, so the
+    original +/-2000pt range meant up to 160 symbols and was observed live
+    timing out entirely ("Request timed out") -> run_cycle pileup, same
+    symptom as the pre-2026-08-10 version, different cause.
+
+    2026-08-11 (second pass): switched to round-100-only scanning (half
+    the candidate strikes to price per point of range vs the old 50pt
+    scan) AND added the expanding-band fallback above, so a day where the
+    qualifying strike sits further out than usual degrades to one extra
+    (still cheap) fetch instead of failing outright."""
+    atm_100 = round(spot / 100.0) * 100.0
     direction = 1 if option_type == "CE" else -1
     side_key = "ce" if option_type == "CE" else "pe"
-    scan_steps = 15  # keep in sync with strike_count below
-
-    resp = client.optionchain(
-        # optionchain()'s expiry_date needs the COMPACT form ("25AUG26"), not
-        # expiry_raw's dash form ("25-Aug-26") -- see fetch_option_chain_strikes's
-        # docstring above for the 2026-08-03 production bug this exact mismatch
-        # caused elsewhere in this file.
-        underlying=UNDERLYING_SYMBOL, exchange=UNDERLYING_SPOT_EXCHANGE,
-        expiry_date=_compact_expiry(expiry_raw), strike_count=scan_steps, with_quotes=True,
-    )
-    if resp.get("status") != "success" or not resp.get("chain"):
-        raise RuntimeError(f"optionchain() failed for expiry {expiry_raw}: {resp}")
-
-    forward = float(resp.get("underlying_ltp") or spot)
-    premium_by_strike: dict[float, float] = {}
-    for row in resp["chain"]:
-        leg = row.get(side_key)
-        if not leg or not leg.get("ltp"):
-            continue
-        if not leg.get("bid") or not leg.get("ask"):
-            # No genuine two-sided market -- seen live: an illiquid strike
-            # (bid=0, ask=0) can still carry a nonzero ltp that's actually a
-            # stale/fallback value close to the underlying's own price, not a
-            # real premium (e.g. a deep-OTM PE showing ltp far above its own
-            # strike, its theoretical max). Treat as no usable price rather
-            # than trust it and rely on the Black-76 solver to reject it.
-            continue
-        premium_by_strike[float(row["strike"])] = float(leg["ltp"])
+    band_step_count = 8   # 8 round-100 strikes = 800pts per band
+    max_bands = 2         # extend once (+/-800 -> +/-1600) before giving up
 
     years_to_expiry = _years_to_expiry(expiry_raw)
     flag = "c" if option_type == "CE" else "p"
 
-    def _delta_at(strike: float) -> float | None:
-        premium = premium_by_strike.get(strike)
-        if premium is None:
-            return None
-        try:
-            iv = black76.implied_volatility(premium, forward, strike, 0.0, years_to_expiry, flag)
-            return float(black76.delta(flag, forward, strike, years_to_expiry, 0.0, iv))
-        except Exception as exc:
-            Log.warning(f"Local Greeks computation failed for strike {strike}: {exc}")
-            return None
+    for band in range(1, max_bands + 1):
+        # optionchain()'s strike_count counts real LISTED strikes (50pt
+        # spacing for NIFTY) -- band_step_count*band*2 listed strikes each
+        # side covers band_step_count*band*100 points.
+        strike_count = band_step_count * band * 2
+        resp = client.optionchain(
+            # optionchain()'s expiry_date needs the COMPACT form ("25AUG26"), not
+            # expiry_raw's dash form ("25-Aug-26") -- see fetch_option_chain_strikes's
+            # docstring above for the 2026-08-03 production bug this exact mismatch
+            # caused elsewhere in this file.
+            underlying=UNDERLYING_SYMBOL, exchange=UNDERLYING_SPOT_EXCHANGE,
+            expiry_date=_compact_expiry(expiry_raw), strike_count=strike_count, with_quotes=True,
+        )
+        if resp.get("status") != "success" or not resp.get("chain"):
+            raise RuntimeError(f"optionchain() failed for expiry {expiry_raw}: {resp}")
 
-    # Bounded scan -- scan_steps steps of 50pts covers +/-750 points from
-    # ATM (see 2026-08-11 note above for why this shrank from +/-2000).
-    for step in range(1, scan_steps + 1):
-        strike = atm_50 + direction * step * 50.0
-        delta = _delta_at(strike)
-        if delta is None:
-            continue
-        if not (config.monthly_delta_low <= abs(delta) <= config.monthly_delta_high):
-            continue
-        if strike % 100 == 0:
-            return strike, delta
-        # 50pt-only match -- snap to the next OTM 100-multiple and trade
-        # that instead, even if ITS delta falls outside the target range
-        # (explicit decision: the round-100 strike is what actually gets
-        # traded, the 50pt scan only locates the neighborhood).
-        snapped_strike = strike + direction * 50.0
-        snapped_delta = _delta_at(snapped_strike)
-        if snapped_delta is None:
-            # Snapped strike's premium/Greeks unavailable -- can't safely
-            # trade what we can't price. Keep scanning further OTM rather
-            # than silently skip straight past this neighborhood.
-            continue
-        return snapped_strike, snapped_delta
+        forward = float(resp.get("underlying_ltp") or spot)
+        premium_by_strike: dict[float, float] = {}
+        for row in resp["chain"]:
+            leg = row.get(side_key)
+            if not leg or not leg.get("ltp"):
+                continue
+            if not leg.get("bid") or not leg.get("ask"):
+                # No genuine two-sided market -- seen live: an illiquid strike
+                # (bid=0, ask=0) can still carry a nonzero ltp that's actually a
+                # stale/fallback value close to the underlying's own price, not a
+                # real premium (e.g. a deep-OTM PE showing ltp far above its own
+                # strike, its theoretical max). Treat as no usable price rather
+                # than trust it and rely on the Black-76 solver to reject it.
+                continue
+            premium_by_strike[float(row["strike"])] = float(leg["ltp"])
+
+        def _delta_at(strike: float) -> float | None:
+            premium = premium_by_strike.get(strike)
+            if premium is None:
+                return None
+            try:
+                iv = black76.implied_volatility(premium, forward, strike, 0.0, years_to_expiry, flag)
+                return float(black76.delta(flag, forward, strike, years_to_expiry, 0.0, iv))
+            except Exception as exc:
+                Log.warning(f"Local Greeks computation failed for strike {strike}: {exc}")
+                return None
+
+        band_start = band_step_count * (band - 1) + 1
+        band_end = band_step_count * band
+        for step in range(band_start, band_end + 1):
+            strike = atm_100 + direction * step * 100.0
+            delta = _delta_at(strike)
+            if delta is None:
+                continue
+            if config.monthly_delta_low <= abs(delta) <= config.monthly_delta_high:
+                return strike, delta
+
+        if band < max_bands:
+            Log.info(
+                f"[MONTHLY_{option_type}] no round-100 strike within delta range in "
+                f"+/-{band_step_count * band * 100}pts, extending to "
+                f"+/-{band_step_count * (band + 1) * 100}pts"
+            )
+
     raise RuntimeError(
         f"No {option_type} strike found within delta "
-        f"[{config.monthly_delta_low}, {config.monthly_delta_high}] near spot {spot}, expiry {expiry_raw}"
+        f"[{config.monthly_delta_low}, {config.monthly_delta_high}] near spot {spot}, expiry {expiry_raw} "
+        f"(scanned up to +/-{band_step_count * max_bands * 100}pts)"
     )
 
 
