@@ -75,33 +75,36 @@ Computed off the front-month futures contract's own 45-minute candles:
   both are the same (long, bounded) risk class so there's no priority-
   ordering concern between them.
 
-  Trailing stop-loss (added 2026-08-11), software-monitored -- checked
-  every 10s run_cycle tick using LIVE premium, independent of the 45m
-  candle gating above (a long option's premium can move fast within a
-  candle). OR'd with the EMA/RSI/ADX exit_condition, not a replacement --
-  either one closes the leg. % is against the OPTION'S OWN premium
-  (current_ltp/entry_px - 1), scales with entry price, and RATCHETS on the
-  highest profit % ever reached since entry (never loosens back down on a
-  pullback):
+  Trailing stop-loss (added 2026-08-11, flat-trail shape as of the second
+  pass same day), software-monitored -- checked every 10s run_cycle tick
+  using LIVE premium, independent of the 45m candle gating above (a long
+  option's premium can move fast within a candle). OR'd with the EMA/RSI/
+  ADX exit_condition, not a replacement -- either one closes the leg. % is
+  against the OPTION'S OWN premium (current_ltp/entry_px - 1), scales
+  with entry price, and RATCHETS on the highest profit % ever reached
+  since entry (never loosens back down on a pullback). Flat, constant-gap
+  shape: below sl_trail_pct (10%) profit ever reached, SL stays at
+  sl_initial_pct (-25%); once profit crosses each 10% step, SL locks
+  exactly one step behind:
 
-    Profit tier    Effective SL
-    (none yet)     -50% (sl_initial_pct)
-    +10%           -50% (unchanged)
-    +20%           -20%
-    +30%           breakeven (0%)
-    +50%           lock +20%
-    +75%           lock +40%
-    +100%          lock +60%
-    +150%          lock +100%
+    Profit reached   Effective SL     Example (entry 259.4, qty 100)
+    (none yet)        -25%             194.55 (-Rs.6,485 worst case)
+    +10%               0% (breakeven)  259.40 (Rs.0)
+    +20%              +10%             285.34 (+Rs.2,594)
+    +30%              +20%             311.28 (+Rs.5,188)
+    +40%              +30%             337.22 (+Rs.7,782)
+    +50%              +40%             363.16 (+Rs.10,376)
+    ...continues in the same constant-10-point-gap pattern uncapped
+    (+150% locks +140%, etc.)
 
-  See compute_trailing_sl_price() / Config.sl_trail_tiers. No broker-side
-  resting SL/SL-M order is placed -- a breach triggers the exact same
-  _exit_leg()/LIMIT-crossing/error-recovery path as the EMA/RSI exit, just
-  with reason="stop_loss". A stop-loss exit also blocks a fresh entry on
-  THAT SAME leg (CE stop-out only blocks CE, PE unaffected) until the
-  candle advances, so a stopped-out trade can't immediately re-enter
-  against the identical stale-candle reading that just stopped it out --
-  see LegState.last_sl_exit_candle_key.
+  See compute_trailing_sl_price() / Config.sl_trail_pct/sl_initial_pct.
+  No broker-side resting SL/SL-M order is placed -- a breach triggers the
+  exact same _exit_leg()/LIMIT-crossing/error-recovery path as the EMA/
+  RSI exit, just with reason="stop_loss". A stop-loss exit also blocks a
+  fresh entry on THAT SAME leg (CE stop-out only blocks CE, PE
+  unaffected) until the candle advances, so a stopped-out trade can't
+  immediately re-enter against the identical stale-candle reading that
+  just stopped it out -- see LegState.last_sl_exit_candle_key.
 
 Strike selection, expiry, and product
 ------------------------------------------------------------------------
@@ -211,6 +214,7 @@ import copy
 import csv
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -329,15 +333,20 @@ class Config:
     # OR'd with the EMA/RSI/ADX exit_condition above, not a replacement.
     # % is against the OPTION'S OWN premium (current_ltp/entry_px - 1), not
     # the underlying futures price. Ratchets on the highest profit % ever
-    # reached since entry -- see compute_trailing_sl_price(). sl_initial_pct
-    # applies until the first tier threshold is reached.
-    sl_initial_pct: float = -0.50
-    # (profit_threshold_pct, locked_sl_pct) -- descending order; the first
-    # tuple whose threshold is <= the highest profit % ever reached wins.
-    sl_trail_tiers: tuple = (
-        (1.50, 1.00), (1.00, 0.60), (0.75, 0.40), (0.50, 0.20),
-        (0.30, 0.00), (0.20, -0.20), (0.10, -0.50),
-    )
+    # reached since entry -- see compute_trailing_sl_price().
+    #
+    # 2026-08-11 (second pass, same day): replaced the original 7-tier
+    # table (uneven gaps -- 30pts at the +50% tier, 40pts at +100%) with a
+    # flat, constant-gap trail, and tightened the initial floor -50% ->
+    # -25% (the -50% initial risked ~Rs.12,970 on a single lot at a 259.4
+    # entry, judged too large). Below sl_trail_pct (10%) profit ever
+    # reached, SL stays at sl_initial_pct. Once profit crosses each
+    # sl_trail_pct step (10%, 20%, 30%, ...), SL locks exactly one step
+    # behind -- +10% locks breakeven, +20% locks +10%, +30% locks +20%,
+    # ..., +150% locks +140%, continuing the same pattern uncapped beyond
+    # that. See compute_trailing_sl_price().
+    sl_initial_pct: float = -0.25
+    sl_trail_pct: float = 0.10   # step size AND trailing gap AND activation threshold
 
     strike_round: int = 100           # strike selection restricted to strike % strike_round == 0 only
     # Options expiry rolls to the NEXT expiry once this many TRADING days
@@ -1383,20 +1392,26 @@ def pick_atm_plus1_round100_leg(chain: dict, option_type: str, spot: float) -> d
 
 
 def compute_trailing_sl_price(entry_px: float, highest_profit_pct: float) -> float:
-    """Effective stop-loss price for a long option leg -- see Config.
-    sl_trail_tiers's own comment for the (threshold, locked_pct) shape.
-    Scans tiers highest-threshold-first (config.sl_trail_tiers is already
-    stored in descending order) and uses the first tier whose threshold is
-    <= highest_profit_pct (the RATCHET: based on the best profit % ever
-    reached since entry, never the current one -- a pullback after
-    touching a higher tier does not loosen the SL back down). Falls back
-    to config.sl_initial_pct if no tier has been reached yet."""
-    effective_pct = config.sl_initial_pct
-    for threshold, locked_pct in config.sl_trail_tiers:
-        if highest_profit_pct >= threshold:
-            effective_pct = locked_pct
-            break
-    return entry_px * (1 + effective_pct)
+    """Effective stop-loss price for a long option leg -- flat, constant-
+    gap trail (2026-08-11, second pass). Below config.sl_trail_pct (10%)
+    profit ever reached, SL stays at config.sl_initial_pct. Once profit
+    crosses each sl_trail_pct step, SL locks exactly one step behind that
+    step: +10% locks breakeven (0%), +20% locks +10%, +30% locks +20%,
+    ..., +150% locks +140%, continuing uncapped beyond that -- a constant
+    10-point trailing gap for the rest of the trade. Based on the highest
+    profit % EVER reached (the RATCHET, via highest_profit_pct), never the
+    current one -- a pullback after touching a higher step does not
+    loosen the SL back down.
+
+    round(..., 6) before flooring guards against float noise from the
+    repeated (ltp/entry_px)-1 division elsewhere landing just under a
+    clean step boundary (e.g. 0.19999999997 instead of 0.20)."""
+    step = config.sl_trail_pct
+    if highest_profit_pct < step:
+        return entry_px * (1 + config.sl_initial_pct)
+    steps_crossed = math.floor(round(highest_profit_pct / step, 6))
+    locked_pct = (steps_crossed - 1) * step
+    return entry_px * (1 + locked_pct)
 
 
 class OrderNeedsAttention(Exception):
@@ -2465,7 +2480,7 @@ class StrategyEngine:
 
     def _check_stop_loss(self, leg_key: str, pos: LegPosition, inst: InstrumentConfig) -> tuple[bool, Optional[float]]:
         """Trailing stop-loss check -- see compute_trailing_sl_price() and
-        Config.sl_trail_tiers for the spec. Checked every run_cycle tick
+        Config.sl_trail_pct/sl_initial_pct for the spec. Checked every run_cycle tick
         (10s), independent of the 45m candle gating that governs the EMA/
         RSI/ADX signal -- a long option's premium can move fast within a
         candle, so this can't wait for the next candle close the way the
@@ -3193,8 +3208,8 @@ def print_banner():
     print(f"Max trades/leg/day   : {config.max_trades_per_leg_per_day}")
     print(f"Product              : {config.product}")
     print("Order pricing        : LIMIT crossing spread (MARKET rejected by broker)")
-    print(f"Stop-loss            : initial {config.sl_initial_pct:.0%}, "
-          f"{len(config.sl_trail_tiers)}-tier trailing ratchet (see module docstring)")
+    print(f"Stop-loss            : initial {config.sl_initial_pct:.0%}, then flat "
+          f"{config.sl_trail_pct:.0%} trailing gap per step (see module docstring)")
     print(f"Strike selection     : ATM+1, round-{config.strike_round} only")
     print(f"Expiry roll buffer   : {config.expiry_roll_trading_days_before} trading day(s)")
     print("LONG OPTION BUYING -- BOUNDED RISK, PREMIUM CAN DECAY TO NEAR-ZERO")
