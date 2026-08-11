@@ -2049,16 +2049,33 @@ class StrategyEngine:
         run_cycle(), so a slow/stuck broker response stalled the whole
         scheduler cycle for every leg. Now run_cycle only ever reads
         self._signal_cache / self._chain_cache -- never waits on the network
-        call itself."""
+        call itself.
+
+        Chain refresh is skipped when the indicator refresh comes back with
+        the SAME candle_key already cached -- confirmed live 2026-08-11:
+        right after a 45m boundary, the broker's history() data for the
+        just-closed bar can lag several cycles behind wall-clock, so
+        get_signal's due_for_refresh retries compute_instrument_signal every
+        ~10s until it finally advances. Each of those retries used to ALSO
+        unconditionally re-fetch the entire option chain (optionchain()),
+        even though nothing about the chain needed refreshing yet -- 13-15
+        redundant optionchain() calls observed per candle boundary while
+        waiting on the same stale candle. The chain only actually needs
+        refreshing once the candle genuinely advances (its own documented
+        cadence, see self._chain_cache's comment), so skip it on a no-progress
+        retry and let the NEXT genuinely-new-candle refresh pick it up."""
+        previous = self._signal_cache.get(inst.name)
+        skip_chain_refresh = False
         try:
             fresh = compute_instrument_signal(self.client, inst, futures_symbol, ltp=ltp)
             if fresh is not None:
+                skip_chain_refresh = previous is not None and previous.candle_key == fresh.candle_key
                 self._signal_cache[inst.name] = fresh
                 self._last_indicator_refresh[inst.name] = datetime.now(IST)
         except Exception as exc:
             Log.warning(f"[{inst.name}] Background indicator refresh failed (will retry "
                         f"next cycle): {exc}")
-        if refresh_chain:
+        if refresh_chain and not skip_chain_refresh:
             self._refresh_chain_cache(inst, futures_symbol)
         self._signal_refresh_pending.discard(inst.name)
 
