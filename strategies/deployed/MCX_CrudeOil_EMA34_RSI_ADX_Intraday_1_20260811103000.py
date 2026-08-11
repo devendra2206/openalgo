@@ -2463,7 +2463,7 @@ class StrategyEngine:
         twice."""
         return self._pending_action_cache.pop(leg_key, None)
 
-    def _check_stop_loss(self, pos: LegPosition, inst: InstrumentConfig) -> tuple[bool, Optional[float]]:
+    def _check_stop_loss(self, leg_key: str, pos: LegPosition, inst: InstrumentConfig) -> tuple[bool, Optional[float]]:
         """Trailing stop-loss check -- see compute_trailing_sl_price() and
         Config.sl_trail_tiers for the spec. Checked every run_cycle tick
         (10s), independent of the 45m candle gating that governs the EMA/
@@ -2480,7 +2480,11 @@ class StrategyEngine:
 
         Updates pos.highest_profit_pct (the ratchet) and persists it via
         _save_state() whenever it advances, so a restart mid-trade resumes
-        with the correct trail level rather than resetting to 0."""
+        with the correct trail level rather than resetting to 0. Logs a
+        line ONLY when the effective SL price actually moves to a new tier
+        (not on every tiny highest_profit_pct tick that doesn't cross a
+        tier boundary) -- keeps this visible without spamming a line every
+        10s during a normal favorable move."""
         ltp = self.price_stream.get_ltp(pos.symbol, inst.options_exchange, max_age=config.ws_stale_seconds)
         if ltp is None:
             ltp = fetch_symbol_ltp(self.ltp_client, pos.symbol, inst.options_exchange, require_two_sided=True)
@@ -2488,11 +2492,16 @@ class StrategyEngine:
             return False, None
 
         current_profit_pct = (ltp / pos.entry_px) - 1
+        sl_price = compute_trailing_sl_price(pos.entry_px, pos.highest_profit_pct)
         if current_profit_pct > pos.highest_profit_pct:
             pos.highest_profit_pct = current_profit_pct
+            new_sl_price = compute_trailing_sl_price(pos.entry_px, pos.highest_profit_pct)
+            if new_sl_price != sl_price:
+                Log.info(f"[{leg_key}] Trailing SL advanced: profit={pos.highest_profit_pct:.2%} "
+                          f"-> sl_price={new_sl_price:.2f} (was {sl_price:.2f}), ltp={ltp:.2f}")
+            sl_price = new_sl_price
             self._save_state()
 
-        sl_price = compute_trailing_sl_price(pos.entry_px, pos.highest_profit_pct)
         return ltp <= sl_price, sl_price
 
     def _exit_leg(self, leg_key: str, inst: InstrumentConfig, reason: str = "unknown"):
@@ -3103,7 +3112,7 @@ class StrategyEngine:
                         # Trailing stop-loss -- checked every cycle using LIVE price,
                         # independent of the 45m candle gating that governs
                         # exit_condition above (see _check_stop_loss's own docstring).
-                        sl_hit, sl_price = self._check_stop_loss(leg.position, inst)
+                        sl_hit, sl_price = self._check_stop_loss(leg_key, leg.position, inst)
                         if exit_condition or sl_hit or exit_already_committed:
                             if not exit_already_committed:
                                 if sl_hit and not exit_condition:
