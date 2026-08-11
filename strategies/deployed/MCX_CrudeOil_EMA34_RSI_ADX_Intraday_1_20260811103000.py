@@ -2066,23 +2066,28 @@ class StrategyEngine:
         call itself.
 
         Chain refresh is skipped only when self._chain_cache was already
-        SUCCESSFULLY populated for the exact candle_key the indicator refresh
-        just came back with -- confirmed live 2026-08-11: right after a 45m
-        boundary, the broker's history() data for the just-closed bar can
-        lag several cycles behind wall-clock, so get_signal's due_for_refresh
-        retries compute_instrument_signal every ~10s until it finally
-        advances. Each of those retries used to ALSO unconditionally
-        re-fetch the entire option chain (optionchain()), even though
-        nothing about the chain needed refreshing yet -- 13-15 redundant
-        optionchain() calls observed per candle boundary while waiting on
-        the same stale candle. Deliberately tracked via
-        self._chain_cache_candle_key (what candle the cache actually
-        reflects), NOT just "did compute_instrument_signal's candle_key
-        change" -- if the CHAIN fetch itself fails independently (e.g. a
-        network blip on THIS candle's first attempt, unrelated to the
-        indicator succeeding), it must keep retrying every cycle rather than
-        silently going without a chain for the rest of the candle just
-        because the indicator's candle_key stopped moving."""
+        SUCCESSFULLY populated for the "reference" candle_key -- this
+        cycle's fresh signal if the indicator fetch succeeded, else the
+        PREVIOUSLY cached signal (see reference_signal below). Two distinct
+        live bugs motivated this, both confirmed 2026-08-11:
+          1. Right after a 45m boundary, the broker's history() data for the
+             just-closed bar can lag several cycles behind wall-clock, so
+             get_signal's due_for_refresh retries compute_instrument_signal
+             every ~10s until it finally advances. Naively re-fetching the
+             chain on every one of those retries produced 13-15 redundant
+             optionchain() calls per candle boundary. Fixed by tracking
+             self._chain_cache_candle_key (what candle the cache actually
+             reflects) instead of just "did the candle_key change."
+          2. That fix alone still forced a chain re-fetch on every bare
+             history() failure (fresh is None) even when the chain was
+             already correctly cached for the still-current candle, since it
+             only compared against fresh.candle_key -- a transient indicator
+             blip unrelated to candle boundaries would otherwise unnecessarily
+             burn an optionchain() call every such cycle. Fixed by falling
+             back to the PREVIOUS cached signal's candle_key as the
+             reference when this cycle's fetch failed, so only a genuine
+             "chain not yet fetched for the current candle" gap triggers a
+             retry -- never a same-candle indicator hiccup alone."""
         previous = self._signal_cache.get(inst.name)
         fresh = None
         try:
@@ -2095,15 +2100,23 @@ class StrategyEngine:
                         f"next cycle): {exc}")
 
         if refresh_chain:
+            # The candle to check the chain cache against: prefer this
+            # cycle's fresh signal, but fall back to the PREVIOUS cached
+            # signal when this cycle's indicator fetch itself failed
+            # (fresh is None) -- a bare history() blip, unrelated to candle
+            # boundaries, must not force a chain re-fetch when the chain is
+            # still correctly cached for the last known-good candle. Only
+            # when neither is available (very first call, and it failed) is
+            # there no reference to compare against.
+            reference_signal = fresh if fresh is not None else previous
+            reference_candle_key = reference_signal.candle_key if reference_signal is not None else None
             chain_already_current = (
-                fresh is not None
-                and previous is not None
-                and previous.candle_key == fresh.candle_key
-                and self._chain_cache_candle_key.get(inst.name) == fresh.candle_key
+                reference_candle_key is not None
+                and self._chain_cache_candle_key.get(inst.name) == reference_candle_key
             )
             if not chain_already_current:
-                if self._refresh_chain_cache(inst, futures_symbol) and fresh is not None:
-                    self._chain_cache_candle_key[inst.name] = fresh.candle_key
+                if self._refresh_chain_cache(inst, futures_symbol) and reference_candle_key is not None:
+                    self._chain_cache_candle_key[inst.name] = reference_candle_key
 
         self._signal_refresh_pending.discard(inst.name)
 
