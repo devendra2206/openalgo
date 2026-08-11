@@ -1018,10 +1018,26 @@ def select_monthly_delta_strike(client, spot: float, expiry_raw: str, option_typ
     scan range, then local Black-76 math (opengreeks) per candidate, no
     further network calls. Confirmed live: run_cycle's "maximum number of
     running instances reached" pileup on nearly every 10s cycle correlated
-    directly with this function's worst-case (no-strike-found) scans."""
+    directly with this function's worst-case (no-strike-found) scans.
+
+    2026-08-11: strike_count/scan range cut from 40 to 15 (+/-750pts,
+    down from +/-2000pts) -- confirmed live the SINGLE optionchain() call
+    above was itself the bottleneck, not the number of calls: Shoonya's
+    get_multiquotes() is not a true broker batch endpoint, it fans out to
+    one HTTP call per symbol in batches of 20 with a forced 1s sleep
+    between batches, and with_quotes fetches BOTH ce+pe for every strike
+    in range regardless of which side we need -- strike_count=40 meant up
+    to 160 symbols (80 strikes x 2 legs), 8 batches, 7+ forced seconds of
+    sleep alone, and was observed live timing out entirely ("Request timed
+    out. The server took too long to respond.") -> run_cycle pileup, same
+    symptom as the original 20-sequential-calls version, different cause.
+    +/-750pts retains a comfortable margin: live matches so far have
+    landed 370-400pts OTM (2026-08-10 CE @ 25000/400pts,
+    PE @ 24200/370pts)."""
     atm_50 = round(spot / 50.0) * 50.0
     direction = 1 if option_type == "CE" else -1
     side_key = "ce" if option_type == "CE" else "pe"
+    scan_steps = 15  # keep in sync with strike_count below
 
     resp = client.optionchain(
         # optionchain()'s expiry_date needs the COMPACT form ("25AUG26"), not
@@ -1029,7 +1045,7 @@ def select_monthly_delta_strike(client, spot: float, expiry_raw: str, option_typ
         # docstring above for the 2026-08-03 production bug this exact mismatch
         # caused elsewhere in this file.
         underlying=UNDERLYING_SYMBOL, exchange=UNDERLYING_SPOT_EXCHANGE,
-        expiry_date=_compact_expiry(expiry_raw), strike_count=40, with_quotes=True,
+        expiry_date=_compact_expiry(expiry_raw), strike_count=scan_steps, with_quotes=True,
     )
     if resp.get("status") != "success" or not resp.get("chain"):
         raise RuntimeError(f"optionchain() failed for expiry {expiry_raw}: {resp}")
@@ -1064,11 +1080,9 @@ def select_monthly_delta_strike(client, spot: float, expiry_raw: str, option_typ
             Log.warning(f"Local Greeks computation failed for strike {strike}: {exc}")
             return None
 
-    # Bounded scan -- 40 steps of 50pts covers +/-2000 points from ATM,
-    # comfortably beyond where a 0.20-0.25 delta strike would ever sit for
-    # NIFTY's typical monthly IV/DTE combinations (same total range as the
-    # original 20-step-by-100pt scan, just twice as fine-grained).
-    for step in range(1, 41):
+    # Bounded scan -- scan_steps steps of 50pts covers +/-750 points from
+    # ATM (see 2026-08-11 note above for why this shrank from +/-2000).
+    for step in range(1, scan_steps + 1):
         strike = atm_50 + direction * step * 50.0
         delta = _delta_at(strike)
         if delta is None:
