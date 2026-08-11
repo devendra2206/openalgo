@@ -2011,6 +2011,13 @@ class StrategyEngine:
         # has to place the order once a signal condition is true (see its own
         # comment for why this matters for reaction speed).
         self._chain_cache: dict[str, dict] = {}
+        # Which candle_key self._chain_cache[inst.name] was actually
+        # successfully populated for -- lets _refresh_signal_and_chain_bg
+        # tell "chain already fetched for THIS candle, skip re-fetching" apart
+        # from "chain fetch failed and was never populated for this candle,
+        # keep retrying" (see that method's own comment for why this
+        # distinction matters).
+        self._chain_cache_candle_key: dict[str, str] = {}
         # Guards get_signal so it submits at most one in-flight
         # indicator/chain refresh per instrument at a time -- without this, a
         # refresh that takes longer than indicator_refresh_interval to
@@ -2026,16 +2033,23 @@ class StrategyEngine:
         with self._state_lock:
             self.store.save()
 
-    def _refresh_chain_cache(self, inst: InstrumentConfig, futures_symbol: str):
+    def _refresh_chain_cache(self, inst: InstrumentConfig, futures_symbol: str) -> bool:
+        """Returns True if self._chain_cache[inst.name] was actually updated
+        (fetch succeeded), False if it failed and the prior (possibly stale
+        or missing) entry was left untouched -- callers use this to decide
+        whether it's safe to mark the chain as "done" for the current
+        candle, or whether it must keep being retried."""
         try:
             expiry = self._expiry_cache.get(inst.name)
             if expiry is None:
                 expiry = resolve_current_month_expiry(self.client, inst)
                 self._expiry_cache[inst.name] = expiry
             self._chain_cache[inst.name] = fetch_chain(self.client, inst, expiry, futures_symbol)
+            return True
         except Exception as exc:
             Log.warning(f"[{inst.name}] Background chain refresh failed (will retry live at "
                         f"entry if needed): {exc}")
+            return False
 
     def _refresh_signal_and_chain_bg(self, inst: InstrumentConfig, futures_symbol: str,
                                        ltp: Optional[float], refresh_chain: bool):
@@ -2051,32 +2065,46 @@ class StrategyEngine:
         self._signal_cache / self._chain_cache -- never waits on the network
         call itself.
 
-        Chain refresh is skipped when the indicator refresh comes back with
-        the SAME candle_key already cached -- confirmed live 2026-08-11:
-        right after a 45m boundary, the broker's history() data for the
-        just-closed bar can lag several cycles behind wall-clock, so
-        get_signal's due_for_refresh retries compute_instrument_signal every
-        ~10s until it finally advances. Each of those retries used to ALSO
-        unconditionally re-fetch the entire option chain (optionchain()),
-        even though nothing about the chain needed refreshing yet -- 13-15
-        redundant optionchain() calls observed per candle boundary while
-        waiting on the same stale candle. The chain only actually needs
-        refreshing once the candle genuinely advances (its own documented
-        cadence, see self._chain_cache's comment), so skip it on a no-progress
-        retry and let the NEXT genuinely-new-candle refresh pick it up."""
+        Chain refresh is skipped only when self._chain_cache was already
+        SUCCESSFULLY populated for the exact candle_key the indicator refresh
+        just came back with -- confirmed live 2026-08-11: right after a 45m
+        boundary, the broker's history() data for the just-closed bar can
+        lag several cycles behind wall-clock, so get_signal's due_for_refresh
+        retries compute_instrument_signal every ~10s until it finally
+        advances. Each of those retries used to ALSO unconditionally
+        re-fetch the entire option chain (optionchain()), even though
+        nothing about the chain needed refreshing yet -- 13-15 redundant
+        optionchain() calls observed per candle boundary while waiting on
+        the same stale candle. Deliberately tracked via
+        self._chain_cache_candle_key (what candle the cache actually
+        reflects), NOT just "did compute_instrument_signal's candle_key
+        change" -- if the CHAIN fetch itself fails independently (e.g. a
+        network blip on THIS candle's first attempt, unrelated to the
+        indicator succeeding), it must keep retrying every cycle rather than
+        silently going without a chain for the rest of the candle just
+        because the indicator's candle_key stopped moving."""
         previous = self._signal_cache.get(inst.name)
-        skip_chain_refresh = False
+        fresh = None
         try:
             fresh = compute_instrument_signal(self.client, inst, futures_symbol, ltp=ltp)
             if fresh is not None:
-                skip_chain_refresh = previous is not None and previous.candle_key == fresh.candle_key
                 self._signal_cache[inst.name] = fresh
                 self._last_indicator_refresh[inst.name] = datetime.now(IST)
         except Exception as exc:
             Log.warning(f"[{inst.name}] Background indicator refresh failed (will retry "
                         f"next cycle): {exc}")
-        if refresh_chain and not skip_chain_refresh:
-            self._refresh_chain_cache(inst, futures_symbol)
+
+        if refresh_chain:
+            chain_already_current = (
+                fresh is not None
+                and previous is not None
+                and previous.candle_key == fresh.candle_key
+                and self._chain_cache_candle_key.get(inst.name) == fresh.candle_key
+            )
+            if not chain_already_current:
+                if self._refresh_chain_cache(inst, futures_symbol) and fresh is not None:
+                    self._chain_cache_candle_key[inst.name] = fresh.candle_key
+
         self._signal_refresh_pending.discard(inst.name)
 
     def get_signal(self, inst: InstrumentConfig, futures_symbol: str,
