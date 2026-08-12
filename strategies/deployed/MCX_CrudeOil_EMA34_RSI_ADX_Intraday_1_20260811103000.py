@@ -151,8 +151,13 @@ Strike selection, expiry, and product
     chain response, never hardcoded).
   - Trading window: MCX's official session is 09:00-23:55
     (`database/market_calendar_db.py`'s MCX offsets). Entry window
-    09:20-22:00 (tightened from 22:30 on 2026-08-11 -- no new entries after
-    10 PM); universal exit at 23:15, leaving a buffer for square-off order
+    09:45-22:00 (start moved from 09:20 to 09:45 on 2026-08-12 -- the
+    09:00-09:45 candle is the first genuinely CLOSED 45m bar after the
+    overnight gap; before 09:45, get_signal's cache still legitimately
+    holds the PREVIOUS day's last candle, so entries between 09:20-09:45
+    were firing off yesterday's indicator values, not today's. End
+    tightened from 22:30 on 2026-08-11 -- no new entries after 10 PM);
+    universal exit at 23:15, leaving a buffer for square-off order
     execution before the 23:55 hard close. All config values -- adjust
     freely.
   - Max 3 entries per leg per day.
@@ -382,7 +387,7 @@ class Config:
     # anywhere; kept only as a documented record of why MARKET isn't used.
     price_type: str = "LIMIT"
 
-    entry_start: time = time(9, 20)
+    entry_start: time = time(9, 45)
     entry_end: time = time(22, 0)
     universal_exit_time: time = time(23, 15)
     market_open: time = time(9, 0)
