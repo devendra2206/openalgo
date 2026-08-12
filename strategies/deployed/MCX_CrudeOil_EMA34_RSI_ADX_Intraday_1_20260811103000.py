@@ -65,6 +65,34 @@ Computed off the front-month futures contract's own 45-minute candles:
              AND adx_prev1 > 25                (trend strength gate --
                                                 shared by both sides, no
                                                 directional +DI/-DI check)
+             AND adx_prev1 > adx_prev2 >
+                 adx_prev3                     (ADX must be RISING across
+                                                3 candles, not just above
+                                                25 -- a static level check
+                                                is equally true whether ADX
+                                                just crossed up through 25
+                                                on its way to 60, or is
+                                                falling back down through
+                                                some higher value after
+                                                already peaking; the latter
+                                                produced two live stop-
+                                                losses on 2026-08-12. Not
+                                                direction-specific -- same
+                                                check for CE and PE, ADX
+                                                measures strength, not
+                                                direction. Cross-day
+                                                continuous, same as
+                                                EMA34/RSI's own warmup --
+                                                adx_prev2/adx_prev3 read
+                                                into yesterday's candles
+                                                for the first candle of a
+                                                new session, no special-
+                                                casing needed)
+             AND adx_prev2 > 20                (floor on the middle candle
+                                                of the 3 -- the rise must
+                                                be sustained, not a single
+                                                wild jump from near-zero;
+                                                added 2026-08-12)
              AND close_prev1 > vwap_prev1      (price also above session
                                                 VWAP -- value/location
                                                 confirmation, independent
@@ -80,6 +108,10 @@ Computed off the front-month futures contract's own 45-minute candles:
   PE entry : close_prev1 < ema_low34_prev1    (mirror, below 34-EMA of Lows)
              AND rsi_prev1 < 47
              AND adx_prev1 > 25
+             AND adx_prev1 > adx_prev2 > adx_prev3   (mirror -- same
+                                                check, not direction-
+                                                specific)
+             AND adx_prev2 > 20                (mirror)
              AND close_prev1 < vwap_prev1      (mirror)
              AND ltp < vwap_prev1              (mirror)
 
@@ -347,6 +379,15 @@ class Config:
     rsi_period: int = 14
     adx_period: int = 14
     adx_threshold: float = 25.0       # shared trend-strength gate for both CE and PE entries, no directional DI check
+    # 2026-08-12: adx_threshold alone is a static level check -- equally
+    # true whether ADX just crossed up through it (fresh, strengthening
+    # trend) or is falling back down through it after already peaking (an
+    # exhausting trend -- traced to two live stop-losses this session).
+    # adx_rising_floor pairs with the entry_condition's 3-candle rising
+    # check (adx_prev1 > adx_prev2 > adx_prev3 AND adx_prev2 >
+    # adx_rising_floor) to require the rise be sustained, not a single
+    # noisy uptick from near-zero.
+    adx_rising_floor: float = 20.0
     ce_rsi_entry_threshold: float = 53.0
     pe_rsi_entry_threshold: float = 47.0
     ce_rsi_exit_threshold: float = 47.0
@@ -1233,6 +1274,8 @@ class InstrumentSignal:
     ema_low_prev1: float
     rsi_prev1: float
     adx_prev1: float
+    adx_prev2: float   # one candle before adx_prev1 -- ADX-rising gate, see entry_condition
+    adx_prev3: float   # two candles before adx_prev1 -- ADX-rising gate, see entry_condition
     vwap_prev1: float
     ltp: float
     candle_key: str
@@ -1333,7 +1376,9 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
     # would be.
     if len(bars) >= 2:
         bars = bars.iloc[:-1]
-    warmup_needed = max(config.ema_period, config.adx_period) + 2
+    # +3 (not +2): entry_condition's ADX-rising gate reads adx[-3], so the
+    # warmup floor must guarantee that index exists too, not just adx[-2].
+    warmup_needed = max(config.ema_period, config.adx_period) + 3
     if len(bars) < warmup_needed:
         Log.warning(
             f"[{inst.name}] only {len(bars)} {config.candle_interval_minutes}m bars after dropping "
@@ -1363,7 +1408,9 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
     signal = InstrumentSignal(
         close_prev1=float(close[-1]),
         ema_high_prev1=float(ema_high[-1]), ema_low_prev1=float(ema_low[-1]),
-        rsi_prev1=float(rsi[-1]), adx_prev1=float(adx[-1]), vwap_prev1=float(vwap[-1]),
+        rsi_prev1=float(rsi[-1]),
+        adx_prev1=float(adx[-1]), adx_prev2=float(adx[-2]), adx_prev3=float(adx[-3]),
+        vwap_prev1=float(vwap[-1]),
         ltp=ltp, candle_key=candle_key,
     )
 
@@ -1372,7 +1419,9 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
         Log.info(
             f"[{inst.name}] futures={futures_symbol} candle={candle_key} close={signal.close_prev1:.2f} "
             f"ema_high{config.ema_period}={signal.ema_high_prev1:.2f} ema_low{config.ema_period}={signal.ema_low_prev1:.2f} "
-            f"rsi={signal.rsi_prev1:.2f} adx={signal.adx_prev1:.2f} vwap={signal.vwap_prev1:.2f} ltp={ltp:.2f}"
+            f"rsi={signal.rsi_prev1:.2f} adx={signal.adx_prev1:.2f} "
+            f"adx_prev2={signal.adx_prev2:.2f} adx_prev3={signal.adx_prev3:.2f} "
+            f"vwap={signal.vwap_prev1:.2f} ltp={ltp:.2f}"
         )
     return signal
 
@@ -3228,6 +3277,8 @@ class StrategyEngine:
                             signal.close_prev1 > signal.ema_high_prev1
                             and signal.rsi_prev1 > config.ce_rsi_entry_threshold
                             and signal.adx_prev1 > config.adx_threshold
+                            and signal.adx_prev1 > signal.adx_prev2 > signal.adx_prev3
+                            and signal.adx_prev2 > config.adx_rising_floor
                             and signal.close_prev1 > signal.vwap_prev1
                             and signal.ltp > signal.vwap_prev1
                         )
@@ -3240,6 +3291,8 @@ class StrategyEngine:
                             signal.close_prev1 < signal.ema_low_prev1
                             and signal.rsi_prev1 < config.pe_rsi_entry_threshold
                             and signal.adx_prev1 > config.adx_threshold
+                            and signal.adx_prev1 > signal.adx_prev2 > signal.adx_prev3
+                            and signal.adx_prev2 > config.adx_rising_floor
                             and signal.close_prev1 < signal.vwap_prev1
                             and signal.ltp < signal.vwap_prev1
                         )
@@ -3301,6 +3354,9 @@ class StrategyEngine:
                             f"close_prev1={signal.close_prev1:.2f} > ema_high_prev1={signal.ema_high_prev1:.2f}, "
                             f"rsi_prev1={signal.rsi_prev1:.2f} > ce_rsi_entry_threshold={config.ce_rsi_entry_threshold}, "
                             f"adx_prev1={signal.adx_prev1:.2f} > adx_threshold={config.adx_threshold}, "
+                            f"adx_prev1={signal.adx_prev1:.2f} > adx_prev2={signal.adx_prev2:.2f} > "
+                            f"adx_prev3={signal.adx_prev3:.2f}, "
+                            f"adx_prev2={signal.adx_prev2:.2f} > adx_rising_floor={config.adx_rising_floor}, "
                             f"close_prev1={signal.close_prev1:.2f} > vwap_prev1={signal.vwap_prev1:.2f}, "
                             f"ltp={signal.ltp:.2f} > vwap_prev1={signal.vwap_prev1:.2f}"
                         )
@@ -3309,6 +3365,9 @@ class StrategyEngine:
                             f"close_prev1={signal.close_prev1:.2f} < ema_low_prev1={signal.ema_low_prev1:.2f}, "
                             f"rsi_prev1={signal.rsi_prev1:.2f} < pe_rsi_entry_threshold={config.pe_rsi_entry_threshold}, "
                             f"adx_prev1={signal.adx_prev1:.2f} > adx_threshold={config.adx_threshold}, "
+                            f"adx_prev1={signal.adx_prev1:.2f} > adx_prev2={signal.adx_prev2:.2f} > "
+                            f"adx_prev3={signal.adx_prev3:.2f}, "
+                            f"adx_prev2={signal.adx_prev2:.2f} > adx_rising_floor={config.adx_rising_floor}, "
                             f"close_prev1={signal.close_prev1:.2f} < vwap_prev1={signal.vwap_prev1:.2f}, "
                             f"ltp={signal.ltp:.2f} < vwap_prev1={signal.vwap_prev1:.2f}"
                         )
