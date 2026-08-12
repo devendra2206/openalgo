@@ -54,10 +54,12 @@ Computed off the front-month futures contract's own 45-minute candles:
     all computed over the last-closed 45m bars (the newest fetched bar is
     unconditionally dropped as still-forming, same defensive pattern used
     everywhere else in this project).
-  - Evaluated purely off the last CLOSED candle's own values -- no live-LTP
-    breakout-confirmation layer (that pattern in the 3m EMA9/RSI reference
-    exists for its fast timeframe; a 45m candle doesn't need it, so entry/
-    exit can only actually change once per 45-minute bar).
+  - Entry has a live-LTP confirmation layer (added 2026-08-11, see below) on
+    top of the last CLOSED candle's own values -- exit remains evaluated
+    purely off the closed candle, so exit can only actually change once per
+    45-minute bar, but entry can additionally be blocked/gated by where live
+    price sits relative to that candle's VWAP/high/low at the moment of
+    entry, not just as of the last close.
 
   CE entry : close_prev1 > ema_high34_prev1   (price closed above its own
                                                 34-EMA of Highs -- trend up)
@@ -77,11 +79,18 @@ Computed off the front-month futures contract's own 45-minute candles:
                                                 of entry, not just as of
                                                 the last closed candle --
                                                 added 2026-08-11)
+             AND ltp > high_prev1              (live price breaking above
+                                                the last CLOSED candle's own
+                                                raw high -- NOT ema_high_prev1
+                                                -- breakout confirmation;
+                                                added 2026-08-12)
   PE entry : close_prev1 < ema_low34_prev1    (mirror, below 34-EMA of Lows)
              AND rsi_prev1 < 47
              AND adx_prev1 > 25
              AND close_prev1 < vwap_prev1      (mirror)
              AND ltp < vwap_prev1              (mirror)
+             AND ltp < low_prev1               (mirror -- breakdown below the
+                                                last closed candle's raw low)
 
   CE exit  : close_prev1 < ema_low34_prev1  OR  rsi_prev1 < 47
   PE exit  : close_prev1 > ema_high34_prev1 OR  rsi_prev1 > 53
@@ -1224,6 +1233,8 @@ def fetch_symbol_bid_ask(client, symbol: str, exchange: str) -> tuple[Optional[f
 @dataclass
 class InstrumentSignal:
     close_prev1: float
+    high_prev1: float   # raw last-closed candle's own high (NOT ema_high_prev1) -- breakout confirmation
+    low_prev1: float     # raw last-closed candle's own low (NOT ema_low_prev1) -- breakdown confirmation
     ema_high_prev1: float
     ema_low_prev1: float
     rsi_prev1: float
@@ -1356,7 +1367,7 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
         ltp = float(close[-1])  # fallback: closed-candle close is a reasonable proxy
 
     signal = InstrumentSignal(
-        close_prev1=float(close[-1]),
+        close_prev1=float(close[-1]), high_prev1=float(high[-1]), low_prev1=float(low[-1]),
         ema_high_prev1=float(ema_high[-1]), ema_low_prev1=float(ema_low[-1]),
         rsi_prev1=float(rsi[-1]), adx_prev1=float(adx[-1]), vwap_prev1=float(vwap[-1]),
         ltp=ltp, candle_key=candle_key,
@@ -1366,6 +1377,7 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
         _last_logged_candle[inst.name] = candle_key
         Log.info(
             f"[{inst.name}] futures={futures_symbol} candle={candle_key} close={signal.close_prev1:.2f} "
+            f"high={signal.high_prev1:.2f} low={signal.low_prev1:.2f} "
             f"ema_high{config.ema_period}={signal.ema_high_prev1:.2f} ema_low{config.ema_period}={signal.ema_low_prev1:.2f} "
             f"rsi={signal.rsi_prev1:.2f} adx={signal.adx_prev1:.2f} vwap={signal.vwap_prev1:.2f} ltp={ltp:.2f}"
         )
@@ -3225,6 +3237,7 @@ class StrategyEngine:
                             and signal.adx_prev1 > config.adx_threshold
                             and signal.close_prev1 > signal.vwap_prev1
                             and signal.ltp > signal.vwap_prev1
+                            and signal.ltp > signal.high_prev1
                         )
                         exit_condition = (
                             signal.close_prev1 < signal.ema_low_prev1
@@ -3237,6 +3250,7 @@ class StrategyEngine:
                             and signal.adx_prev1 > config.adx_threshold
                             and signal.close_prev1 < signal.vwap_prev1
                             and signal.ltp < signal.vwap_prev1
+                            and signal.ltp < signal.low_prev1
                         )
                         exit_condition = (
                             signal.close_prev1 > signal.ema_high_prev1
@@ -3297,7 +3311,8 @@ class StrategyEngine:
                             f"rsi_prev1={signal.rsi_prev1:.2f} > ce_rsi_entry_threshold={config.ce_rsi_entry_threshold}, "
                             f"adx_prev1={signal.adx_prev1:.2f} > adx_threshold={config.adx_threshold}, "
                             f"close_prev1={signal.close_prev1:.2f} > vwap_prev1={signal.vwap_prev1:.2f}, "
-                            f"ltp={signal.ltp:.2f} > vwap_prev1={signal.vwap_prev1:.2f}"
+                            f"ltp={signal.ltp:.2f} > vwap_prev1={signal.vwap_prev1:.2f}, "
+                            f"ltp={signal.ltp:.2f} > high_prev1={signal.high_prev1:.2f}"
                         )
                     else:
                         condition_desc = (
@@ -3305,7 +3320,8 @@ class StrategyEngine:
                             f"rsi_prev1={signal.rsi_prev1:.2f} < pe_rsi_entry_threshold={config.pe_rsi_entry_threshold}, "
                             f"adx_prev1={signal.adx_prev1:.2f} > adx_threshold={config.adx_threshold}, "
                             f"close_prev1={signal.close_prev1:.2f} < vwap_prev1={signal.vwap_prev1:.2f}, "
-                            f"ltp={signal.ltp:.2f} < vwap_prev1={signal.vwap_prev1:.2f}"
+                            f"ltp={signal.ltp:.2f} < vwap_prev1={signal.vwap_prev1:.2f}, "
+                            f"ltp={signal.ltp:.2f} < low_prev1={signal.low_prev1:.2f}"
                         )
                     self._enter_leg(leg_key, inst, option_type, spot=signal.ltp, futures_symbol=futures_symbol,
                                      condition_desc=condition_desc)
