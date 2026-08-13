@@ -266,6 +266,18 @@ class Config:
 
     candle_interval_fetch: str = "1m"   # standard interval; bucketed into 2-min bars locally
     candle_bucket_minutes: int = 2
+    # Floor between due_for_refresh-triggered history() attempts for the same
+    # leg. resample_to_bars() always drops the last (still-forming) bucket --
+    # correct only if raw 1m data already reaches one minute past the bucket
+    # that just closed. The broker's own 1m reporting lag (confirmed live,
+    # 2026-08-13: normally ~1min, but observed sustained higher under load)
+    # can leave the just-closed 2min bucket sitting as the still-forming tail
+    # for as long as that lag persists, making due_for_refresh's wall-clock
+    # comparison correctly stay True with nothing to catch up to yet -- not a
+    # bug in the comparison itself, but retrying every 5s scheduler tick
+    # while waiting serves no purpose but hammering the broker. This cooldown
+    # paces retries to roughly the real 1m-bar cadence instead.
+    option_signal_refresh_cooldown_sec: float = 20.0
 
     lot_multiplier: int = 1
     max_trades_per_leg_per_day: int = 3
@@ -1967,7 +1979,21 @@ class StrategyEngine:
         )
         have_current_candle = cached_boundary is not None and cached_boundary >= last_closed_boundary
         due = last is None or not have_current_candle
-        if due and leg_key not in self._option_signal_refresh_pending:
+        # Cooldown floor, separate from `due`: due can correctly stay True for
+        # a while when the broker's own 1m reporting lag hasn't yet caught up
+        # to the bucket resample_to_bars needs (see option_signal_refresh_cooldown_sec's
+        # definition) -- retrying every 5s scheduler tick in that window just
+        # hammers the broker for no benefit, since there's nothing new to
+        # fetch until real time or the broker's feed moves. `last` is only
+        # set on a SUCCESSFUL fetch (_refresh_option_signal_bg leaves it
+        # untouched on a None/failed result), so this paces retries during
+        # the "fetched fine, just still stale" case this fix targets --
+        # a genuine fetch failure still retries every tick, same as before.
+        cooldown_elapsed = (
+            last is None
+            or (now - last).total_seconds() >= config.option_signal_refresh_cooldown_sec
+        )
+        if due and cooldown_elapsed and leg_key not in self._option_signal_refresh_pending:
             self._option_signal_refresh_pending.add(leg_key)
             self._fill_executor.submit(
                 self._refresh_option_signal_bg, leg_key, symbol, exchange, ltp

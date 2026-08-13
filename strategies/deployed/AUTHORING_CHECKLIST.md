@@ -240,7 +240,82 @@ sat in `error_state`, not just rarely.
 - [ ] `report_pnl_to_platform()` is fire-and-forget: short timeout, any
   failure logged and swallowed, must never raise into the scheduler.
 
-## 5. Before calling it done
+## 5. Candle-boundary caching (`due_for_refresh` patterns)
+
+Any script that caches a per-candle signal (VWAP, OI/premium, EMA/RSI/ADX...)
+and refreshes it via a background `history()` call only when a new candle has
+closed — instead of fetching on every scheduler tick — needs this pattern
+done correctly. Found and fixed live, 2026-08-13, across
+`MCX_CrudeOil_EMA34_RSI_ADX_Intraday` and `Nifty_Sensex_VWAP_NoHA_Intraday`:
+**three separate, independent bugs in this exact pattern**, each one
+confirmed only by comparing against real production data (`latency.db`,
+live debug logging), not by code review alone.
+
+- [ ] **If locally resampling a raw interval into a custom bucket size
+  (e.g. fetching `"1m"` and bucketing into 2-minute bars yourself), anchor
+  the "current candle boundary" wall-clock calculation to the session open
+  (09:15 IST = 555 minutes from midnight), not to midnight.** Midnight-
+  anchoring only happens to produce correct boundaries when the bucket size
+  evenly divides 555 (true for native 5-minute/10-minute broker intervals,
+  since 555/5=111 exactly — **not** true for a locally-resampled 2-minute
+  bucket, since 555 is odd). A midnight-anchored 2-minute calc and a
+  09:15-anchored `resample()` call disagree on every single bucket, all day.
+  *(`Nifty_Sensex_VWAP_NoHA_Intraday`: `_current_candle_boundary` was
+  midnight-anchored while its own `resample_to_bars()` anchored to 09:15 —
+  confirmed live via a dedicated boundary-matching test against the real
+  resample function, not just eyeballing the two implementations.)*
+
+- [ ] **Compare the cached signal's own candle boundary against the LAST
+  CLOSED candle's boundary (`current_boundary - interval`), never against
+  `current_boundary` itself.** A resample step that always drops the
+  still-forming last bucket (the correct, standard pattern — see below)
+  means a fresh signal's own candle_key is *always* one full interval
+  behind "now"'s currently-forming bucket. Comparing `cached_boundary >=
+  current_boundary` can therefore structurally never be satisfied — this
+  silently keeps `due_for_refresh` permanently `True`, firing a real
+  `history()` call on *every single scheduler tick* (5s) instead of once
+  per real candle close, confirmed live via `latency.db` showing
+  continuous unbroken calls for 15+ minutes.
+
+- [ ] **A retry cooldown, separate from `due`, is needed even after both of
+  the above are correct.** The broker's own 1-minute-bar reporting lag
+  (normally ~1min, confirmed via a live rapid-poll test) can leave a
+  genuinely just-closed bucket sitting as the resampled frame's *last*
+  group — and therefore still get dropped as "still forming" — for as long
+  as that lag persists. `due_for_refresh` staying `True` in that window is
+  *correct* (there's nothing new to fetch yet), but retrying on every 5s
+  scheduler tick while waiting only hammers the broker for nothing. Add a
+  config-driven floor (e.g. `option_signal_refresh_cooldown_sec`, ~20s for
+  a 2-minute bucket) gating retry *attempts* independently of the `due`
+  decision itself — first attempt still fires immediately
+  (`last is None`), later ones wait at least the cooldown. Confirmed live:
+  candle_key was observed frozen at the same stale value across four
+  consecutive 5s-apart calls while wall clock had already moved two full
+  buckets past it.
+
+- [ ] **Prefer comparing the fetched candle's own implied end-time against
+  wall-clock `now` directly, over maintaining a separate
+  independently-computed "current boundary" function, if the shape of the
+  script allows it.** `Nifty_OI_WeeklyBuy_MonthlySell`'s
+  `fetch_candle_oi_premium` does exactly this
+  (`if bars.index[-1] + candle_interval > datetime.now(IST): drop it`) and
+  is immune to all three bugs above by construction — there is no second
+  boundary calculation to drift out of sync with the resample/broker data
+  in the first place. This is the preferred pattern for a *new* script;
+  the wall-clock-boundary-comparison pattern above is what you're stuck
+  maintaining correctly if you copy an older script that already uses it.
+
+- [ ] **Validate any fix to this pattern with a live-data test, not a
+  synthetic one that assumes zero broker lag.** A first-pass fix to the
+  VWAP_NoHA bug above shipped with a test whose mock returned
+  `candle_key = current_boundary` (matching a *fixed* system) instead of
+  what the real `compute_option_signal` actually returns
+  (`candle_key = current_boundary - interval`, always) — the test passed
+  for the wrong reason and gave false confidence. Confirm any such test by
+  deliberately reverting the fix and checking the test now fails with the
+  live bug's actual shape, before trusting it.
+
+## 6. Before calling it done
 
 - [ ] `uv run python -m py_compile strategies/deployed/<your_script>.py`
 - [ ] If a test file exists for a sibling script with similar structure,
