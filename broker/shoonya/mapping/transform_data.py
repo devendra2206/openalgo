@@ -1,11 +1,20 @@
 # Mapping OpenAlgo API Request https://openalgo.in/docs
 # Mapping Shoonya Broking Parameters https://shoonya.com/api-documentation
 
+import time
+
 from database.token_db import get_br_symbol, get_symbol_info
 from utils.logging import get_logger
 from utils.mpp_slab import calculate_protected_price, get_instrument_type_from_symbol
 
 logger = get_logger(__name__)
+
+# One retry, brief pause, before giving up on a bad MPP quote -- confirmed
+# live (2026-08-13) that a bad quote (an option's GetQuotes returning the
+# underlying index's data, bid=0/ask=0) can be a momentary glitch: a fresh
+# quote for the SAME symbol 7 seconds later was completely normal
+# (real bid/ask). Cheap enough to always try before falling back.
+_MPP_QUOTE_RETRY_DELAY_SEC = 0.5
 
 
 def transform_data(data, token, auth_token=None):
@@ -38,89 +47,102 @@ def transform_data(data, token, auth_token=None):
         logger.info(
             f"MPP: {original_type} order detected for Symbol={data['symbol']}, Exchange={data['exchange']}, Action={action}"
         )
-        try:
-            if auth_token:
-                # Lazy import to avoid circular dependency
-                from broker.shoonya.api.data import BrokerData
+        mpp_converted = False
+        if auth_token:
+            # Lazy import to avoid circular dependency
+            from broker.shoonya.api.data import BrokerData
 
-                # Create BrokerData instance to fetch quotes
-                broker_data = BrokerData(auth_token)
+            broker_data = BrokerData(auth_token)
 
-                # Fetch quotes for the symbol
-                quote_data = broker_data.get_quotes(data["symbol"], data["exchange"])
-                logger.info(
-                    f"MPP Quote Response: Symbol={data['symbol']}, Exchange={data['exchange']}, "
-                    f"LTP={quote_data.get('ltp')}, Bid={quote_data.get('bid')}, Ask={quote_data.get('ask')}, "
-                    f"TickSize={quote_data.get('tick_size')}"
-                )
-
-                # Get instrument type from symbol
-                instrument_type = get_instrument_type_from_symbol(data["symbol"])
-
-                # Get tick_size from quote response
-                tick_size = quote_data.get("tick_size")
-                logger.info(
-                    f"MPP Symbol Info: InstrumentType={instrument_type}, TickSize={tick_size}"
-                )
-
-                # Get LTP/bid/ask for price calculation
-                ltp = float(quote_data.get("ltp", 0))
-                bid = float(quote_data.get("bid", 0))
-                ask = float(quote_data.get("ask", 0))
-
-                # A real, live two-sided quote always has bid>0 AND ask>0
-                # during market hours -- requiring both, not just ltp>0, is a
-                # defensive guard against a bad/placeholder quote silently
-                # feeding a nonsensical protected price into a real order.
-                # Confirmed in production (2026-08-10): Shoonya's GetQuotes
-                # for a specific BFO SENSEX option token returned
-                # ltp=78525.19 (the underlying INDEX level, not the option's
-                # own ~450 premium) with bid=0.0/ask=0.0 -- the old ltp>0-only
-                # check happily computed a "protected" price from that
-                # (77739.95), which the broker rejected outright, but left
-                # the leg unentered for 46 minutes until manually retried.
-                # Falling back to the regular (unconverted) order type here
-                # is the SAME safe fallback this function already takes when
-                # ltp<=0 -- not a new risk, just the existing safety net
-                # reused for a second failure mode.
-                if ltp > 0 and bid > 0 and ask > 0:
-                    # Calculate protected price using centralized MPP slab with tick size rounding
-                    protected_price = calculate_protected_price(
-                        price=ltp,
-                        action=action,
-                        symbol=data["symbol"],
-                        instrument_type=instrument_type,
-                        tick_size=tick_size,
-                    )
-                    price = str(protected_price)
-
-                    if original_type == "MARKET":
-                        # Convert MARKET to LIMIT
-                        order_type = "LMT"
-                    else:
-                        # Convert SL-M to SL-LMT (keep trigger price)
-                        order_type = "SL-LMT"
-
+            # Up to 2 attempts (1 retry) before giving up on a bad quote --
+            # see _MPP_QUOTE_RETRY_DELAY_SEC's docstring: confirmed live
+            # that a bad quote here is often a momentary glitch, not a
+            # persistent one.
+            for attempt in range(1, 3):
+                try:
+                    quote_data = broker_data.get_quotes(data["symbol"], data["exchange"])
                     logger.info(
-                        f"MPP Conversion Complete: Symbol={data['symbol']}, "
-                        f"OrderType={original_type}->{order_type}, FinalPrice={protected_price}"
+                        f"MPP Quote Response (attempt {attempt}/2): Symbol={data['symbol']}, "
+                        f"Exchange={data['exchange']}, LTP={quote_data.get('ltp')}, "
+                        f"Bid={quote_data.get('bid')}, Ask={quote_data.get('ask')}, "
+                        f"TickSize={quote_data.get('tick_size')}"
                     )
-                else:
+
+                    instrument_type = get_instrument_type_from_symbol(data["symbol"])
+                    tick_size = quote_data.get("tick_size")
+
+                    ltp = float(quote_data.get("ltp", 0))
+                    bid = float(quote_data.get("bid", 0))
+                    ask = float(quote_data.get("ask", 0))
+
+                    # A real, live two-sided quote always has bid>0 AND ask>0
+                    # during market hours -- requiring both, not just ltp>0, is a
+                    # defensive guard against a bad/placeholder quote silently
+                    # feeding a nonsensical protected price into a real order.
+                    # Confirmed in production (2026-08-10): Shoonya's GetQuotes
+                    # for a specific BFO SENSEX option token returned
+                    # ltp=78525.19 (the underlying INDEX level, not the option's
+                    # own ~450 premium) with bid=0.0/ask=0.0 -- the old ltp>0-only
+                    # check happily computed a "protected" price from that
+                    # (77739.95), which the broker rejected outright, but left
+                    # the leg unentered for 46 minutes until manually retried.
+                    if ltp > 0 and bid > 0 and ask > 0:
+                        protected_price = calculate_protected_price(
+                            price=ltp,
+                            action=action,
+                            symbol=data["symbol"],
+                            instrument_type=instrument_type,
+                            tick_size=tick_size,
+                        )
+                        price = str(protected_price)
+                        order_type = "LMT" if original_type == "MARKET" else "SL-LMT"
+                        mpp_converted = True
+                        logger.info(
+                            f"MPP Conversion Complete: Symbol={data['symbol']}, "
+                            f"OrderType={original_type}->{order_type}, FinalPrice={protected_price}"
+                        )
+                        break
+
                     logger.warning(
-                        f"MPP Warning: quote looks invalid for Symbol={data['symbol']}, "
-                        f"Exchange={data['exchange']} (ltp={ltp}, bid={bid}, ask={ask}) -- "
-                        f"missing a genuine two-sided market (or ltp<=0). "
-                        f"Proceeding with regular {original_type} order."
+                        f"MPP Warning (attempt {attempt}/2): quote looks invalid for "
+                        f"Symbol={data['symbol']}, Exchange={data['exchange']} "
+                        f"(ltp={ltp}, bid={bid}, ask={ask}) -- missing a genuine "
+                        f"two-sided market (or ltp<=0)."
                     )
-            else:
-                logger.warning(
-                    f"MPP Warning: No auth token available for Symbol={data['symbol']}. "
-                    f"Cannot fetch quotes for MPP adjustment"
-                )
-        except Exception as e:
-            logger.error(
-                f"MPP Error: Failed to apply MPP for Symbol={data['symbol']}, "
-                f"Exchange={data['exchange']}, Error={str(e)}. Proceeding with regular {original_type} order."
+                except Exception as e:
+                    logger.error(
+                        f"MPP Error (attempt {attempt}/2): Failed to apply MPP for "
+                        f"Symbol={data['symbol']}, Exchange={data['exchange']}, Error={str(e)}."
+                    )
+                if attempt < 2:
+                    time.sleep(_MPP_QUOTE_RETRY_DELAY_SEC)
+        else:
+            logger.warning(
+                f"MPP Warning: No auth token available for Symbol={data['symbol']}. "
+                f"Cannot fetch quotes for MPP adjustment"
+            )
+
+        # A MARKET order has no trigger/reference price to fall back on --
+        # unlike SL-M below, there is no safe way to build a protective
+        # LIMIT without a genuine quote. Shoonya rejects raw MKT orders
+        # from the API outright (ALGO_CHK), so silently sending one here
+        # is not a "safe fallback", it is a GUARANTEED rejection --
+        # confirmed live (2026-08-13): "Rejected : ALGO_CHK: MKT Order
+        # type not allowed for API order", which place_order_service.py
+        # then mishandled as a false "success" (see that file's own fix,
+        # same incident) rather than the clean, retryable rejection this
+        # raise now produces instead. Raising here is caught by
+        # place_order_api's caller (place_order_service.place_order_with_auth's
+        # existing try/except around broker_module.place_order_api) and
+        # surfaces as a normal {"status": "error", ...} response -- the
+        # strategy's own place_order_max_attempts retry loop (a "clean
+        # rejection, nothing was placed" case) picks it up from there,
+        # the same recovery path a manual UI Retry already proved works.
+        if original_type == "MARKET" and not mpp_converted:
+            raise RuntimeError(
+                f"MPP could not obtain a valid two-sided quote for Symbol={data['symbol']}, "
+                f"Exchange={data['exchange']} after 2 attempts -- refusing to send an "
+                f"unprotected MARKET order (Shoonya rejects MKT for API orders outright)."
             )
 
         # A missing auth token, a zero LTP or a quote exception must NOT leave an
@@ -130,7 +152,7 @@ def transform_data(data, token, auth_token=None):
         # carries a trigger price, so derive the protective limit from the
         # trigger and still send SL-LMT. Same fallback as
         # broker/tradesmart/mapping/transform_data.py::_apply_mpp.
-        if original_type == "SL-M" and order_type != "SL-LMT":
+        if original_type == "SL-M" and not mpp_converted:
             order_type = "SL-LMT"
             trigger = float(data.get("trigger_price") or 0)
             if trigger > 0:

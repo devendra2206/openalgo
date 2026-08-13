@@ -216,7 +216,22 @@ def place_order_with_auth(
         ))
         return False, error_response, 500
 
-    if res.status == 200:
+    # res.status is the raw HTTP status code the broker adapter set (see
+    # e.g. broker/shoonya/api/order_api.py's `response.status =
+    # response.status_code`) -- it only reflects that the REST call itself
+    # reached the broker, never whether the broker actually ACCEPTED the
+    # order. Confirmed live (2026-08-13, Nifty_Sensex_VWAP_NoHA_Intraday):
+    # Shoonya returns HTTP 200 even for a rejected order (its own
+    # `{"stat": "Not_Ok", "emsg": "..."}` body, e.g. an ALGO_CHK rejection
+    # of a MARKET order), and broker_module.place_order_api() correctly
+    # extracts order_id=None for that case -- but this check only looked
+    # at res.status==200, so it built {"status": "success", "orderid":
+    # None} anyway. The strategy trusted that "success" and spent its full
+    # ~5-minute reprice/poll budget polling a nonexistent order before
+    # finally erroring, instead of hitting a clean rejection its own
+    # place_order_max_attempts retry loop could have recovered from in
+    # seconds. order_id must be checked, not just the HTTP status.
+    if res.status == 200 and order_id:
         order_response_data = {"status": "success", "orderid": order_id}
 
         if emit_event:
@@ -238,11 +253,24 @@ def place_order_with_auth(
 
         return True, order_response_data, 200
     else:
-        message = (
-            response_data.get("message", "Failed to place order")
-            if isinstance(response_data, dict)
-            else "Failed to place order"
-        )
+        # response_data is each broker's own raw response body, shape
+        # varies by broker -- "message" (Zerodha/Fyers), "emsg" (Shoonya),
+        # "errorMessage" (Dhan), "error" (several others) are the field
+        # names actually seen across the existing broker adapters. Trying
+        # them in order beats always falling back to the generic message,
+        # which previously hid the broker's real rejection reason (e.g.
+        # Shoonya's "Rejected : ALGO_CHK: MKT Order type not allowed for
+        # API order") behind "Failed to place order" for every broker that
+        # doesn't happen to use the "message" key.
+        message = "Failed to place order"
+        if isinstance(response_data, dict):
+            message = (
+                response_data.get("message")
+                or response_data.get("emsg")
+                or response_data.get("errorMessage")
+                or response_data.get("error")
+                or message
+            )
         error_response = {"status": "error", "message": message}
         bus.publish(OrderFailedEvent(
             mode="live",
