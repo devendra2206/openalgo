@@ -129,29 +129,40 @@ Computed off the front-month futures contract's own 45-minute candles:
   both are the same (long, bounded) risk class so there's no priority-
   ordering concern between them.
 
-  Trailing stop-loss (added 2026-08-11, flat-trail shape as of the second
-  pass same day), software-monitored -- checked every 10s run_cycle tick
-  using LIVE premium, independent of the 45m candle gating above (a long
-  option's premium can move fast within a candle). OR'd with the EMA/RSI/
-  ADX exit_condition, not a replacement -- either one closes the leg. % is
-  against the OPTION'S OWN premium (current_ltp/entry_px - 1), scales
-  with entry price, and RATCHETS on the highest profit % ever reached
-  since entry (never loosens back down on a pullback). Flat, constant-gap
-  shape: below sl_trail_pct (10%) profit ever reached, SL stays at
-  sl_initial_pct (-25%); once profit crosses each 10% step, SL locks
-  exactly one step behind:
+  Trailing stop-loss (added 2026-08-11, three-tier guard/25%/10% shape as
+  of the 2026-08-13 pass), software-monitored -- checked every 10s
+  run_cycle tick using LIVE premium, independent of the 45m candle gating
+  above (a long option's premium can move fast within a candle). OR'd with
+  the EMA/RSI/ADX exit_condition, not a replacement -- either one closes
+  the leg. % is against the OPTION'S OWN premium (current_ltp/entry_px -
+  1), scales with entry price, and RATCHETS on the highest profit % ever
+  reached since entry (never loosens back down on a pullback). Three
+  tiers: below sl_guard_activation_pct (10%) profit ever reached, SL stays
+  at sl_initial_pct (-25%); from 10% up to sl_trail_pct (25%), a single
+  flat guard level locks SL at sl_guard_locked_pct (-10%) -- cuts the
+  worst case roughly in half without yet reaching breakeven; from 25%
+  onward, SL locks one sl_trail_pct (25%) step behind the highest step
+  crossed, until the locked level itself would reach
+  sl_trail_tighten_threshold_pct (100%), at which point the step narrows
+  to sl_trail_step_late (10%) for the rest of the trade:
 
     Profit reached   Effective SL     Example (entry 259.4, qty 100)
     (none yet)        -25%             194.55 (-Rs.6,485 worst case)
-    +10%               0% (breakeven)  259.40 (Rs.0)
-    +20%              +10%             285.34 (+Rs.2,594)
-    +30%              +20%             311.28 (+Rs.5,188)
-    +40%              +30%             337.22 (+Rs.7,782)
-    +50%              +40%             363.16 (+Rs.10,376)
-    ...continues in the same constant-10-point-gap pattern uncapped
+    +10%              -10% (guard)     233.46 (-Rs.2,594)
+    +25%               0% (breakeven)  259.40 (Rs.0)
+    +50%              +25%             324.25 (+Rs.6,485)
+    +75%              +50%             389.10 (+Rs.12,970)
+    +100%             +90% (10-pt steps begin) 492.86 (+Rs.23,346)
+    +110%             +100%            518.80 (+Rs.25,940)
+    ...continues in 10-point-gap steps uncapped from here
     (+150% locks +140%, etc.)
 
-  See compute_trailing_sl_price() / Config.sl_trail_pct/sl_initial_pct.
+  Every tier boundary is strictly increasing (never loosens the SL) --
+  100% was chosen as the step-narrowing threshold because it is a common
+  multiple of both 25 and 10, so the switch itself cannot cause a drop.
+  See compute_trailing_sl_price() / Config.sl_trail_pct/sl_initial_pct/
+  sl_guard_activation_pct/sl_guard_locked_pct/sl_trail_tighten_threshold_pct/
+  sl_trail_step_late.
   No broker-side resting SL/SL-M order is placed -- a breach triggers the
   exact same _exit_leg()/LIMIT-crossing/error-recovery path as the EMA/
   RSI exit, just with reason="stop_loss". A stop-loss exit also blocks a
@@ -412,14 +423,25 @@ class Config:
     # table (uneven gaps -- 30pts at the +50% tier, 40pts at +100%) with a
     # flat, constant-gap trail, and tightened the initial floor -50% ->
     # -25% (the -50% initial risked ~Rs.12,970 on a single lot at a 259.4
-    # entry, judged too large). Below sl_trail_pct (10%) profit ever
-    # reached, SL stays at sl_initial_pct. Once profit crosses each
-    # sl_trail_pct step (10%, 20%, 30%, ...), SL locks exactly one step
-    # behind -- +10% locks breakeven, +20% locks +10%, +30% locks +20%,
-    # ..., +150% locks +140%, continuing the same pattern uncapped beyond
-    # that. See compute_trailing_sl_price().
+    # entry, judged too large).
+    #
+    # 2026-08-13 (third pass): widened the main step from 10% to 25% (to
+    # match sl_initial_pct's own magnitude, per explicit request) and
+    # added two more tiers around it -- a single flat guard level between
+    # sl_guard_activation_pct (10%) and sl_trail_pct (25%) so a trade
+    # reversing in that zone doesn't ride the full -25% floor with zero
+    # protection, and a tightened sl_trail_step_late (10%) once the main
+    # 25%-step formula's locked value would reach
+    # sl_trail_tighten_threshold_pct (100%), so a big winner doesn't keep
+    # giving back a full 25 points per step forever. See
+    # compute_trailing_sl_price() for the exact tier logic and the module
+    # docstring for the worked example table.
     sl_initial_pct: float = -0.25
-    sl_trail_pct: float = 0.10   # step size AND trailing gap AND activation threshold
+    sl_guard_activation_pct: float = 0.10   # profit level the single flat guard kicks in at
+    sl_guard_locked_pct: float = -0.10      # flat SL level the guard locks to (10%-25% profit zone)
+    sl_trail_pct: float = 0.25   # main step size AND trailing gap AND breakeven-lock threshold
+    sl_trail_tighten_threshold_pct: float = 1.00   # LOCKED profit level at which the step narrows
+    sl_trail_step_late: float = 0.10   # step/gap used once sl_trail_tighten_threshold_pct is reached
 
     strike_round: int = 100           # strike selection restricted to strike % strike_round == 0 only
     # Options expiry rolls to the NEXT expiry once this many TRADING days
@@ -427,7 +449,7 @@ class Config:
     expiry_roll_trading_days_before: int = 2
 
     lot_multiplier: int = 1
-    max_trades_per_leg_per_day: int = 3
+    max_trades_per_leg_per_day: int = 5   # 2026-08-13: raised from 3
 
     product: str = "NRML"             # not MIS -- see module docstring for why
     # 2026-08-11: MARKET is rejected outright by this broker for API orders
@@ -1521,23 +1543,43 @@ def pick_atm_plus1_round100_leg(chain: dict, option_type: str, spot: float) -> d
 
 
 def compute_trailing_sl_price(entry_px: float, highest_profit_pct: float) -> float:
-    """Effective stop-loss price for a long option leg -- flat, constant-
-    gap trail (2026-08-11, second pass). Below config.sl_trail_pct (10%)
-    profit ever reached, SL stays at config.sl_initial_pct. Once profit
-    crosses each sl_trail_pct step, SL locks exactly one step behind that
-    step: +10% locks breakeven (0%), +20% locks +10%, +30% locks +20%,
-    ..., +150% locks +140%, continuing uncapped beyond that -- a constant
-    10-point trailing gap for the rest of the trade. Based on the highest
-    profit % EVER reached (the RATCHET, via highest_profit_pct), never the
-    current one -- a pullback after touching a higher step does not
-    loosen the SL back down.
+    """Effective stop-loss price for a long option leg -- three-tier trail
+    (2026-08-13, third pass). Based on the highest profit % EVER reached
+    (the RATCHET, via highest_profit_pct), never the current one -- a
+    pullback after touching a higher tier does not loosen the SL back
+    down. Every tier boundary below is strictly increasing so the switch
+    itself can never violate that ratchet.
+
+    Tier 1 (below config.sl_guard_activation_pct, 10%): SL stays at
+    config.sl_initial_pct (-25%).
+
+    Tier 2 (10% up to config.sl_trail_pct, 25%): a single FLAT guard
+    level, config.sl_guard_locked_pct (-10%) -- not a multi-step trail,
+    because tier 3 must land exactly on breakeven (0%) at 25% and a
+    multi-step trail would already have locked something above 0% before
+    then, which would have to drop back down at the 25% mark.
+
+    Tier 3 (25% and up): locks one config.sl_trail_pct (25%) step behind
+    the highest step crossed -- +25% locks breakeven (0%), +50% locks
+    +25%, +75% locks +50% -- until highest_profit_pct itself reaches
+    config.sl_trail_tighten_threshold_pct (100%), at which point the step
+    narrows to config.sl_trail_step_late (10%) for the rest of the trade
+    (100% is a common multiple of both 25 and 10, so this switch is also
+    ratchet-safe: just below it the 25%-step formula locks +50%; right at
+    it the 10%-step formula locks +90%, i.e. still only ever increasing).
 
     round(..., 6) before flooring guards against float noise from the
     repeated (ltp/entry_px)-1 division elsewhere landing just under a
-    clean step boundary (e.g. 0.19999999997 instead of 0.20)."""
-    step = config.sl_trail_pct
-    if highest_profit_pct < step:
+    clean step boundary (e.g. 0.24999999997 instead of 0.25)."""
+    if highest_profit_pct < config.sl_guard_activation_pct:
         return entry_px * (1 + config.sl_initial_pct)
+    if highest_profit_pct < config.sl_trail_pct:
+        return entry_px * (1 + config.sl_guard_locked_pct)
+    step = (
+        config.sl_trail_step_late
+        if highest_profit_pct >= config.sl_trail_tighten_threshold_pct
+        else config.sl_trail_pct
+    )
     steps_crossed = math.floor(round(highest_profit_pct / step, 6))
     locked_pct = (steps_crossed - 1) * step
     return entry_px * (1 + locked_pct)
@@ -3416,8 +3458,11 @@ def print_banner():
     print(f"Max trades/leg/day   : {config.max_trades_per_leg_per_day}")
     print(f"Product              : {config.product}")
     print("Order pricing        : LIMIT crossing spread (MARKET rejected by broker)")
-    print(f"Stop-loss            : initial {config.sl_initial_pct:.0%}, then flat "
-          f"{config.sl_trail_pct:.0%} trailing gap per step (see module docstring)")
+    print(f"Stop-loss            : initial {config.sl_initial_pct:.0%}, guard "
+          f"{config.sl_guard_locked_pct:.0%} from {config.sl_guard_activation_pct:.0%}, "
+          f"then {config.sl_trail_pct:.0%} steps from {config.sl_trail_pct:.0%} narrowing to "
+          f"{config.sl_trail_step_late:.0%} past {config.sl_trail_tighten_threshold_pct:.0%} "
+          f"locked (see module docstring)")
     print(f"Strike selection     : ATM+1, round-{config.strike_round} only")
     print(f"Expiry roll buffer   : {config.expiry_roll_trading_days_before} trading day(s)")
     print("LONG OPTION BUYING -- BOUNDED RISK, PREMIUM CAN DECAY TO NEAR-ZERO")
