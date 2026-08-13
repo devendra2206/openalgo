@@ -549,10 +549,28 @@ def _current_candle_boundary(interval_minutes: int) -> datetime:
     _get_option_signal() fetch on the very first cycle after a new bucket
     begins, cutting both the wasted-fetch count and the worst-case
     detection latency down to ~scheduler_interval + one broker
-    round-trip."""
+    round-trip.
+
+    MUST anchor to the 09:15 session open, matching resample_to_bars'
+    own anchor (`session_start = idx[0].normalize() + Timedelta(hours=9,
+    minutes=15)`) -- NOT midnight. 09:15 is minute 555 of the day (odd),
+    so every real bucket start (555, 557, 559, ...) is an ODD minute;
+    a midnight-anchored `(total_minutes // interval) * interval` is
+    always EVEN for interval=2, so it could never equal a real bucket's
+    start. Confirmed live 2026-08-13: this meant cached_boundary (from a
+    real, odd-minute candle_key) could never satisfy `cached_boundary >=
+    current_boundary` against the old midnight-anchored value, so
+    due_for_refresh evaluated True on essentially every 5s scheduler
+    tick for all 4 legs, instead of once per real 2-minute candle --
+    same class of bug as the CrudeOil due_for_refresh fix from
+    2026-08-11/12, different root cause (cross-scheme misalignment here,
+    a same-scheme off-by-one there)."""
     now = datetime.now(IST)
     total_minutes = now.hour * 60 + now.minute
-    bucket_start_minutes = (total_minutes // interval_minutes) * interval_minutes
+    session_open_minutes = 9 * 60 + 15  # 555 -- must match resample_to_bars' 09:15 anchor
+    minutes_since_open = total_minutes - session_open_minutes
+    bucket_offset = (minutes_since_open // interval_minutes) * interval_minutes
+    bucket_start_minutes = session_open_minutes + bucket_offset
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight + timedelta(minutes=bucket_start_minutes)
 
