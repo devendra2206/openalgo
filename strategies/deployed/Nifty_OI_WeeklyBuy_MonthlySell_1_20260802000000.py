@@ -385,6 +385,13 @@ class LegPosition:
 class LegState:
     trade_count: int = 0
     position: LegPosition = field(default_factory=LegPosition)
+    # MonthlySideEngine only -- ISO string of the candle boundary (matches
+    # StrategyEngine._last_candle_boundary) this leg's entry check has
+    # already fully resolved for (whether it found a trade or not). Set
+    # only once Weekly's same-side verdict for that exact candle is
+    # confirmed available -- see _maybe_evaluate_entry_bg's docstring.
+    # "" means not yet evaluated for the current candle.
+    last_entry_eval_boundary: str = ""
 
 
 @dataclass
@@ -770,6 +777,7 @@ class StateStore:
             leg_raw = legs_data.get(key, {})
             leg = LegState()
             leg.trade_count = leg_raw.get("trade_count", 0)
+            leg.last_entry_eval_boundary = leg_raw.get("last_entry_eval_boundary", "")
             pos_raw = leg_raw.get("position", {})
             leg.position = LegPosition(**{**asdict(LegPosition()), **filter_known_fields(LegPosition, pos_raw)})
             self.state.legs[key] = leg
@@ -785,7 +793,11 @@ class StateStore:
             "last_execution_id": self.state.last_execution_id,
             "reference": asdict(self.state.reference),
             "legs": {
-                k: {"trade_count": v.trade_count, "position": asdict(v.position)}
+                k: {
+                    "trade_count": v.trade_count,
+                    "last_entry_eval_boundary": v.last_entry_eval_boundary,
+                    "position": asdict(v.position),
+                }
                 for k, v in self.state.legs.items()
             },
         }
@@ -1604,6 +1616,18 @@ class WeeklySideEngine:
         self.option_type = option_type
         self.leg_key = f"WEEKLY_{option_type}"
         self.engine = engine
+        # ISO string of the candle boundary this side last FINISHED an
+        # entry-eval or position-management pass for, regardless of outcome
+        # (found nothing, errored, exited) -- set by the two _bg wrappers'
+        # own finally block below, never by the inner methods themselves,
+        # so every return path is covered without hunting down each one.
+        # MonthlySideEngine's same-side gate polls this (not
+        # latest_weekly_detail, which is only populated when a verdict was
+        # actually produced) to tell "weekly hasn't looked at this candle
+        # yet, keep waiting" apart from "weekly looked and found nothing".
+        # In-memory only, not persisted -- self-corrects within one
+        # scheduler tick after a restart, no need to survive one.
+        self._last_completed_boundary: Optional[str] = None
 
     @property
     def leg(self) -> LegState:
@@ -1655,10 +1679,73 @@ class WeeklySideEngine:
                 # actually filled (2026-08-04: fixed).
                 self._finalize_exit(pos, pos.pending_exit_reason, pos.pending_exit_reenter)
                 return
-            if new_candle:
-                self._manage_open_position()
-        elif new_candle:
-            self._evaluate_entry()
+            if self._due_for_boundary():
+                self._manage_open_position_bg()
+        elif self._due_for_boundary():
+            self._evaluate_entry_bg()
+
+    def _due_for_boundary(self) -> bool:
+        """Replaces a plain `new_candle` gate for both dispatch calls below
+        -- confirmed via independent review (2026-08-13) that `new_candle`
+        alone makes both paths one-shot: if _eval_pending is still set when
+        the NEXT new_candle=True tick arrives (background task still
+        running from the prior candle -- broker slowness, not a bug by
+        itself), that tick's `if new_candle:` is the ONLY chance this
+        candle gets, and since new_candle goes False again on every
+        following tick, a task that finishes even one tick late means this
+        candle's entry-eval or exit-check (SL/universal-exit-time) is
+        silently skipped entirely, not just delayed -- no error, no log,
+        nothing to notice. True whenever this side hasn't yet completed a
+        background pass for the CURRENT boundary, checked every tick (not
+        just new_candle=True) so a dispatch that was blocked by
+        _eval_pending on the boundary tick itself gets retried on the very
+        next tick once that in-flight task actually finishes, instead of
+        waiting for the next real candle. _dispatch_eval_bg's own
+        _eval_pending guard still prevents a duplicate dispatch while one
+        is genuinely still running."""
+        boundary = self.engine._last_candle_boundary
+        if boundary is None:
+            return False
+        return self._last_completed_boundary != boundary.isoformat()
+
+    def _dispatch_eval_bg(self, fn):
+        """Shared wrapper for _evaluate_entry_bg/_manage_open_position_bg --
+        both are the multi-round-trip (history()/optionchain() calls) shape
+        that caused the documented scheduler-skip warnings ("maximum number
+        of running instances reached") when run inline on run_cycle's own
+        thread: worst case, evaluating all 4 legs sequentially in one
+        new_candle=True tick outlasted scheduler_interval, and APScheduler
+        (max_instances=1) simply skipped the next tick rather than
+        overlapping -- delaying SL/exit checks and pending-action resolution
+        for every leg by up to that overrun. Runs on _fill_executor (same
+        pool used for fill-watching -- a leg is never doing both at once,
+        see evaluate()'s own branching). _last_completed_boundary is always
+        updated in `finally`, regardless of how `fn` returns, so
+        MonthlySideEngine's same-side gate has a single, always-correct
+        signal for "weekly finished looking at this candle" independent of
+        whether a verdict was actually produced."""
+        if self.leg_key in self.engine._eval_pending:
+            return
+        self.engine._eval_pending.add(self.leg_key)
+        boundary = self.engine._last_candle_boundary
+        boundary_key = boundary.isoformat() if boundary is not None else None
+
+        def _run():
+            try:
+                fn()
+            except Exception as exc:
+                Log.exception(f"[{self.leg_key}] Background evaluation failed: {exc}")
+            finally:
+                self._last_completed_boundary = boundary_key
+                self.engine._eval_pending.discard(self.leg_key)
+
+        self.engine._fill_executor.submit(_run)
+
+    def _evaluate_entry_bg(self):
+        self._dispatch_eval_bg(self._evaluate_entry)
+
+    def _manage_open_position_bg(self):
+        self._dispatch_eval_bg(self._manage_open_position)
 
     def _evaluate_entry(self):
         if datetime.now(IST).time() >= config.entry_cutoff_time:
@@ -2188,7 +2275,13 @@ class WeeklySideEngine:
         if reenter:
             # Spec SS5: immediately re-select a fresh OTM1 strike off
             # current spot and re-enter if this side's signal still holds.
-            self._evaluate_entry()
+            # Backgrounded like every other entry-eval call -- this runs
+            # from _finalize_exit, itself called inline from evaluate() on
+            # run_cycle's own thread (see evaluate()'s comment on why
+            # finalize can't wait for a candle boundary); calling the heavy
+            # synchronous version here would reintroduce exactly the
+            # inline-blocking bug this whole refactor removes elsewhere.
+            self._evaluate_entry_bg()
 
 
 class MonthlySideEngine:
@@ -2203,10 +2296,24 @@ class MonthlySideEngine:
         self.leg_key = f"MONTHLY_{option_type}"
         self.engine = engine
         self.weekly_sibling = weekly_sibling
+        # Own-side completion marker for _manage_open_position_bg only --
+        # NOT read by anyone else (unlike WeeklySideEngine's, which
+        # MonthlySideEngine's entry gate depends on). In-memory only, same
+        # reasoning as WeeklySideEngine's own marker.
+        self._last_completed_boundary: Optional[str] = None
 
     @property
     def leg(self) -> LegState:
         return self.engine.state.legs[self.leg_key]
+
+    def _due_for_boundary(self) -> bool:
+        """See WeeklySideEngine._due_for_boundary's docstring -- same
+        one-shot-dispatch-can-silently-skip-a-candle risk, fixed the same
+        way, for this side's own position-management dispatch."""
+        boundary = self.engine._last_candle_boundary
+        if boundary is None:
+            return False
+        return self._last_completed_boundary != boundary.isoformat()
 
     def evaluate(self, new_candle: bool = True):
         if self.leg_key in self.engine._pending_fills:
@@ -2230,10 +2337,89 @@ class MonthlySideEngine:
                 # by up to one full candle interval (2026-08-04: fixed).
                 self._finalize_exit(pos, pos.pending_exit_reason)
                 return
-            if new_candle:
+            if self._due_for_boundary():
+                self._manage_open_position_bg()
+        else:
+            self._maybe_evaluate_entry_bg()
+
+    def _manage_open_position_bg(self):
+        """Same reasoning as WeeklySideEngine._dispatch_eval_bg -- this leg's
+        own exit check (fetch_candle_oi_premium -> a real history() call)
+        must not run inline on run_cycle's thread. No cross-leg dependency
+        here (Monthly's exit logic never reads Weekly's verdict), but gated
+        by _due_for_boundary() rather than a plain new_candle for the same
+        reason as WeeklySideEngine's dispatches (see that class's
+        _due_for_boundary docstring) -- otherwise a background task that's
+        still running when the next new_candle=True tick arrives means this
+        candle's own exit check (SL/universal-exit-time/opposite-signal)
+        silently never runs at all, not just late."""
+        if self.leg_key in self.engine._eval_pending:
+            return
+        self.engine._eval_pending.add(self.leg_key)
+        boundary = self.engine._last_candle_boundary
+        boundary_key = boundary.isoformat() if boundary is not None else None
+
+        def _run():
+            try:
                 self._manage_open_position()
-        elif new_candle:
-            self._evaluate_entry()
+            except Exception as exc:
+                Log.exception(f"[{self.leg_key}] Background position management failed: {exc}")
+            finally:
+                self._last_completed_boundary = boundary_key
+                self.engine._eval_pending.discard(self.leg_key)
+
+        self.engine._fill_executor.submit(_run)
+
+    def _maybe_evaluate_entry_bg(self):
+        """Unlike WeeklySideEngine's entry dispatch, this cannot simply fire
+        once per new_candle=True -- Monthly's own verdict depends on
+        Weekly's SAME-CANDLE verdict (plan doc SS1.4), and Weekly's own
+        evaluation is now itself backgrounded, so it may not have finished
+        by the exact tick new_candle turns True. Checked EVERY tick instead
+        (cheap, no I/O below this point until the real dispatch): retries
+        on later ticks within the same candle window until Weekly's
+        background pass for this exact boundary completes, without ever
+        repeating the real network-calling work more than once per candle.
+
+        Two separate "done" markers, deliberately not conflated:
+          - weekly_sibling._last_completed_boundary: did WEEKLY finish
+            looking at this candle yet (regardless of what it found)?
+          - leg.last_entry_eval_boundary: did MONTHLY finish resolving this
+            candle's entry decision yet (regardless of what it found)? Only
+            set once Weekly's fresh-for-this-candle answer was actually
+            read -- never while still waiting on Weekly, so an early "not
+            ready yet" tick is retried, not treated as a completed
+            no-signal candle."""
+        if datetime.now(IST).time() >= config.entry_cutoff_time:
+            return
+        boundary = self.engine._last_candle_boundary
+        if boundary is None:
+            return  # no candle has closed yet since startup
+        boundary_key = boundary.isoformat()
+        if self.leg.last_entry_eval_boundary == boundary_key:
+            return  # already fully resolved this leg's decision for this candle
+        if self.weekly_sibling._last_completed_boundary != boundary_key:
+            return  # Weekly hasn't finished evaluating this exact candle yet -- retry next tick
+        if self.leg_key in self.engine._eval_pending:
+            return
+        self.engine._eval_pending.add(self.leg_key)
+
+        def _run():
+            try:
+                self._evaluate_entry()
+            except Exception as exc:
+                Log.exception(f"[{self.leg_key}] Background entry evaluation failed: {exc}")
+            finally:
+                # Marked done regardless of outcome (no weekly signal, no
+                # matching strike, a genuine entry) -- Weekly's own verdict
+                # for this candle has definitely been read by now either
+                # way, so retrying more on this same candle would only
+                # repeat the same negative/positive result for nothing.
+                self.leg.last_entry_eval_boundary = boundary_key
+                self.engine.save_state()
+                self.engine._eval_pending.discard(self.leg_key)
+
+        self.engine._fill_executor.submit(_run)
 
     def _evaluate_entry(self):
         if datetime.now(IST).time() >= config.entry_cutoff_time:
@@ -2709,6 +2895,11 @@ class StrategyEngine:
         # evaluate() never submits (or auto-manages) a duplicate one.
         self._state_lock = threading.Lock()
         self._pending_fills: set = set()
+        # Guards WeeklySideEngine/MonthlySideEngine's _evaluate_entry_bg /
+        # _manage_open_position_bg dispatches -- a leg is never doing both
+        # at once (evaluate() branches on pos.symbol), so one shared
+        # per-leg_key guard covers both dispatch kinds for that leg.
+        self._eval_pending: set = set()
         # check_force_exit is a synchronous local HTTP call -- run inline on
         # the main scheduler thread it would be the same class of blocking
         # bug as poll_fill (see _bg_executor above). Dispatched every cycle
@@ -2775,6 +2966,10 @@ class StrategyEngine:
             self.state.reference = ReferenceSnapshot()
             for leg in self.state.legs.values():
                 leg.trade_count = 0
+                leg.last_entry_eval_boundary = ""
+            for ot in OPTION_TYPES:
+                self.weekly[ot]._last_completed_boundary = None
+                self.monthly[ot]._last_completed_boundary = None
             self._weekly_expiry_cache = None
             self._monthly_expiry_cache = None
             self.save_state()

@@ -67,6 +67,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from opengreeks import black76
 
 import oi_simulation_data as sim
 
@@ -163,6 +164,69 @@ def _parse_ts(ts: str) -> real_datetime:
     return real_datetime.fromisoformat(ts)
 
 
+def _years_to_expiry_from_dash(expiry_raw: str, now: real_datetime) -> float:
+    """Test-local copy of the deployed script's _years_to_expiry -- same NFO
+    15:30 expiry time, same 0.0001-year floor -- but takes `now` explicitly
+    (the simulated clock) instead of calling datetime.now(IST) itself, so
+    FakeClient doesn't need a live reference to the monkeypatched module."""
+    expiry_date = real_datetime.strptime(expiry_raw, "%d-%b-%y")
+    expiry_dt = now.replace(
+        year=expiry_date.year, month=expiry_date.month, day=expiry_date.day,
+        hour=15, minute=30, second=0, microsecond=0,
+    )
+    years = (expiry_dt - now).total_seconds() / (60 * 60 * 24) / 365.0
+    return max(years, 0.0001)
+
+
+def _premium_for_target_delta(target_abs_delta: float, flag: str, forward: float,
+                               strike: float, years_to_expiry: float) -> float:
+    """Inverse of what select_monthly_delta_strike itself does
+    (implied_volatility(premium) -> delta(iv)): given a TARGET |delta| (the
+    GREEKS fixture's intent), find an IV whose Black-76 premium round-trips
+    back through the strategy's own implied_volatility()+delta() calls to
+    approximately that same delta -- so with_quotes=True's synthetic ltp is
+    genuinely Black-76-consistent, not just a label.
+
+    |delta| for an OTM strike is NOT monotonically increasing in IV for
+    every case -- confirmed via independent review (2026-08-13) directly
+    against black76.delta(): OTM CALLS rise ~monotonically toward 1 as IV
+    grows, but OTM PUTS are hump-shaped, peaking at a moderate IV and then
+    DECLINING -- a plain bisection over a fixed [lo, hi] range can silently
+    converge on the wrong (declining) side of that peak for a put,
+    returning a premium that round-trips to a materially different delta
+    than intended, with no error raised. A coarse grid sweep locates the
+    actual peak first (handles calls and puts uniformly, no special-casing
+    by flag, no assumption about where the peak sits for a given
+    strike/expiry); bisection then only ever runs on the sub-range below
+    that peak, where monotonicity is guaranteed by construction. If
+    target_abs_delta itself is unreachable (e.g. a deliberately
+    out-of-band fixture on a far-OTM put whose |delta| caps below the
+    target at every IV), this returns the premium AT the peak -- the
+    closest achievable value -- rather than converging past it into the
+    declining region."""
+    grid = [0.02 + i * 0.05 for i in range(48)]  # 2% .. ~240% IV
+    best_iv = grid[0]
+    best_delta = abs(black76.delta(flag, forward, strike, years_to_expiry, 0.0, best_iv))
+    for iv in grid[1:]:
+        d = abs(black76.delta(flag, forward, strike, years_to_expiry, 0.0, iv))
+        if d > best_delta:
+            best_iv, best_delta = iv, d
+
+    if target_abs_delta >= best_delta:
+        return float(black76.black(flag, forward, strike, years_to_expiry, 0.0, best_iv))
+
+    lo, hi = grid[0], best_iv
+    for _ in range(60):
+        mid = (lo + hi) / 2.0
+        d = abs(black76.delta(flag, forward, strike, years_to_expiry, 0.0, mid))
+        if d < target_abs_delta:
+            lo = mid  # |delta| too low -- need more IV
+        else:
+            hi = mid  # |delta| already at/above target -- need less IV
+    iv = (lo + hi) / 2.0
+    return float(black76.black(flag, forward, strike, years_to_expiry, 0.0, iv))
+
+
 class FakeClient:
     """Serves the synthetic dataset in place of real broker calls. Orders
     fill immediately at the current simulated quote -- this simulation is
@@ -223,6 +287,39 @@ class FakeClient:
             raise AssertionError(f"FakeClient: no candle yet for {symbol} at {now}")
         return float(eligible[-1]["close"])
 
+    def _latest_close_or_none(self, symbol) -> float | None:
+        rows = sorted(self.candles_by_symbol.get(symbol, []), key=lambda r: _parse_ts(r["timestamp"]))
+        now = self.clock.now()
+        eligible = [r for r in rows if _parse_ts(r["timestamp"]) <= now]
+        return float(eligible[-1]["close"]) if eligible else None
+
+    def _infer_forward_from_greeks_fixture(self) -> float:
+        """Median strike among self.greeks_by_symbol's own keys -- used only
+        when optionchain(with_quotes=True) has no real candle data to read a
+        forward price from (see its docstring). Symbols look like
+        "NIFTY27AUG2624200CE": strip the leading "NIFTY", the expiry
+        (2-digit day + 3-letter month + 2-digit year), and the trailing
+        CE/PE, leaving just the strike digits."""
+        strikes = []
+        for symbol in self.greeks_by_symbol:
+            body = symbol.removeprefix("NIFTY")
+            for suffix in ("CE", "PE"):
+                if body.endswith(suffix):
+                    body = body[:-len(suffix)]
+                    break
+            strike_digits = body[7:]  # skip the 7-char compact expiry (DDMMMYY)
+            if strike_digits.isdigit():
+                strikes.append(float(strike_digits))
+        if not strikes:
+            raise AssertionError(
+                "FakeClient.optionchain(with_quotes=True): no candle data for the "
+                "underlying AND no parseable NIFTY<expiry><strike><CE/PE> symbols in "
+                "greeks_by_symbol -- nothing to derive a forward price from. Provide "
+                "candle data for the underlying, or at least one greeks_by_symbol entry."
+            )
+        strikes.sort()
+        return strikes[len(strikes) // 2]
+
     def quotes(self, symbol, exchange):
         px = self._latest_close(symbol)
         return {"status": "success", "data": {"ltp": px, "bid": px, "ask": px}}
@@ -230,7 +327,7 @@ class FakeClient:
     def expiry(self, symbol, exchange, instrumenttype):
         return {"status": "success", "data": [self.weekly_expiry_raw, self.monthly_expiry_raw]}
 
-    def optionchain(self, underlying, exchange, expiry_date, strike_count=20):
+    def optionchain(self, underlying, exchange, expiry_date, strike_count=20, with_quotes=False):
         # Enforce the COMPACT expiry format ("13AUG26", no dashes) --
         # the real optionchain() 404s on the raw dash form ("13-Aug-26"),
         # confirmed in production 2026-08-03 (select_weekly_otm1_strike was
@@ -249,7 +346,87 @@ class FakeClient:
         # production 2026-08-03: optionchain() actually returns {"status":
         # "success", "chain": [...], ...}), which is why this bug also slipped
         # past 92 passing tests.
-        return {"status": "success", "chain": [{"strike": s} for s in self.chain_strikes]}
+        if not with_quotes:
+            return {"status": "success", "chain": [{"strike": s} for s in self.chain_strikes]}
+
+        # with_quotes=True (added 2026-08-13, matching the deployed script's
+        # select_monthly_delta_strike, which replaced per-symbol
+        # optiongreeks() calls with a single optionchain(with_quotes=True)
+        # fetch + local Black-76 math on 2026-08-10) -- synthesize a
+        # Black-76-consistent ltp/bid/ask for BOTH ce and pe at every
+        # strike, reverse-solved from self.greeks_by_symbol's target delta
+        # for that exact option symbol so the strategy's own
+        # implied_volatility()+delta() round-trip reproduces the fixture's
+        # intended delta, not an arbitrary number.
+        forward = self._latest_close_or_none(underlying)
+        if forward is None:
+            # Some tests exercise select_monthly_delta_strike() in
+            # isolation with an empty candles_by_symbol (they pass spot
+            # directly as a function argument, which optionchain() itself
+            # never receives) -- fall back to inferring a forward price
+            # from the GREEKS fixture's own symbol keys instead of
+            # requiring real candle data just to run this synthesis.
+            forward = self._infer_forward_from_greeks_fixture()
+        weekly_compact = self.weekly_expiry_raw.replace("-", "").upper()
+        monthly_compact = self.monthly_expiry_raw.replace("-", "").upper()
+        if expiry_date == monthly_compact:
+            expiry_raw = self.monthly_expiry_raw
+        elif expiry_date == weekly_compact:
+            expiry_raw = self.weekly_expiry_raw
+        else:
+            raise AssertionError(
+                f"optionchain(with_quotes=True) called with expiry_date={expiry_date!r}, "
+                f"matching neither the fixture's weekly ({weekly_compact}) nor monthly "
+                f"({monthly_compact}) expiry -- FakeClient can't synthesize quotes for it."
+            )
+        years_to_expiry = _years_to_expiry_from_dash(expiry_raw, self.clock.now())
+
+        def _leg_quote(strike: float, option_type: str) -> dict | None:
+            symbol = f"NIFTY{expiry_date}{int(strike)}{option_type}"
+            target_delta = self.greeks_by_symbol.get(symbol)
+            if target_delta is None:
+                return None  # no fixture intent for this symbol -- leave it unpriced/illiquid
+            flag = "c" if option_type == "CE" else "p"
+            premium = _premium_for_target_delta(abs(target_delta), flag, forward, strike, years_to_expiry)
+            return {"ltp": premium, "bid": premium * 0.98, "ask": premium * 1.02}
+
+        # select_monthly_delta_strike scans ROUND-100 strikes computed as
+        # atm_100 +/- step*100, NOT self.chain_strikes (a small,
+        # weekly-context, 300pt-spaced fixture list that generally won't
+        # even contain those exact values) -- reusing chain_strikes here
+        # would make every premium_by_strike lookup miss and the real
+        # function raise "No usable premium found" regardless of what the
+        # GREEKS fixture intends. Generate a real listed-strike ladder
+        # instead (50pt spacing for NIFTY, matching the docstring's own
+        # "strike_count counts real LISTED strikes" note), wide enough to
+        # cover every round-100 strike production's own band math can ask
+        # for at this strike_count.
+        # strike_count is strikes PER SIDE, not the total -- confirmed
+        # against services/option_chain_service.py's own
+        # start_index = atm_index - strike_count / end_index = atm_index +
+        # strike_count + 1, matching the deployed script's own comment at
+        # select_monthly_delta_strike's band loop ("strike_count counts
+        # real LISTED strikes -- band_step_count*band*2 listed strikes each
+        # side"). An earlier version of this ladder treated strike_count as
+        # the total width, silently starving every band-2 scan (up to
+        # +/-1600pts) of any priced strikes at all -- caught by independent
+        # review 2026-08-13, not by any test, since the fixtures only ever
+        # exercised band-1 strikes.
+        atm_100 = round(forward / 100.0) * 100.0
+        span = strike_count * 50.0
+        ladder = [atm_100 - span + i * 50.0 for i in range(2 * strike_count + 1)]
+
+        chain = []
+        for s in ladder:
+            row = {"strike": s}
+            ce = _leg_quote(s, "CE")
+            pe = _leg_quote(s, "PE")
+            if ce is not None:
+                row["ce"] = ce
+            if pe is not None:
+                row["pe"] = pe
+            chain.append(row)
+        return {"status": "success", "chain": chain, "underlying_ltp": forward}
 
     def optiongreeks(self, symbol, exchange, **kwargs):
         delta = self.greeks_by_symbol.get(symbol)
@@ -354,14 +531,28 @@ def _drain_fills(engine, timeout=2.0):
     ThreadPoolExecutor task (see StrategyEngine._fill_executor), not inline
     -- even with FakeClient's instant/synchronous poll_fill, the watcher
     still runs on another thread, so the test's main thread must wait for
-    it before asserting on state. Busy-waits on _pending_fills draining to
-    empty rather than a fixed sleep, since FakeClient normally resolves in
-    well under a millisecond."""
+    it before asserting on state. Busy-waits on _pending_fills AND
+    _eval_pending draining to empty rather than a fixed sleep, since
+    FakeClient normally resolves in well under a millisecond.
+
+    _eval_pending added 2026-08-13: WeeklySideEngine/MonthlySideEngine's
+    own entry-eval/position-management calls are now ALSO dispatched to
+    _fill_executor (see AUTHORING_CHECKLIST.md's candle-boundary section
+    and this script's _dispatch_eval_bg/_maybe_evaluate_entry_bg) instead
+    of running inline in run_cycle -- fixes the "maximum number of running
+    instances reached" scheduler-skip warnings from a slow synchronous
+    cycle. Without waiting on _eval_pending too, a test could assert on
+    leg.position/trade_count before that background task actually ran,
+    since run_cycle() now returns immediately after dispatching rather than
+    after the work completes."""
     deadline = time.monotonic() + timeout
-    while engine._pending_fills and time.monotonic() < deadline:
+    while (engine._pending_fills or engine._eval_pending) and time.monotonic() < deadline:
         time.sleep(0.005)
     assert not engine._pending_fills, (
         f"fill watcher(s) still pending after {timeout}s: {engine._pending_fills}"
+    )
+    assert not engine._eval_pending, (
+        f"background entry-eval/position-management still pending after {timeout}s: {engine._eval_pending}"
     )
 
 
@@ -406,6 +597,20 @@ def _run_day(module, engine, clock, day: str, start_hhmm: str, end_hhmm: str):
         clock._current = IST.localize(t)
         engine.run_cycle()
         _settle(engine)
+        # A real scheduler fires roughly every scheduler_interval (10s)
+        # while this simulation advances in whole 5-min candle steps -- one
+        # run_cycle() call per step models only the FIRST of ~30 real ticks
+        # within that candle window. MonthlySideEngine's same-side entry
+        # gate (_maybe_evaluate_entry_bg, added 2026-08-13) needs a LATER
+        # tick to observe WeeklySideEngine's own verdict for this exact
+        # candle once its now-backgrounded evaluation actually finishes --
+        # in production that's free (scheduler_interval << candle length);
+        # here it needs a couple more same-candle ticks modeled explicitly.
+        # These don't affect new_candle (still the same wall-clock t, so
+        # _new_candle_closed() correctly returns False for them).
+        for _ in range(2):
+            engine.run_cycle()
+            _settle(engine)
         t += timedelta(minutes=5)
 
 
@@ -1056,6 +1261,14 @@ def test_monthly_leg_force_closed_by_universal_exit_time_even_without_opposite_s
         entry_order_id="SIM-entry", reference_oi=70_000.0, reference_premium=230.0,
     )
     clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY1} 15:20", "%Y-%m-%d %H:%M"))
+    # evaluate() called directly here, bypassing run_cycle() -- but
+    # MonthlySideEngine._due_for_boundary() (added 2026-08-13, independent
+    # review fix) needs engine._last_candle_boundary to already reflect the
+    # current simulated tick, same as a real run_cycle() would establish
+    # via _new_candle_closed() before ever calling evaluate(). Establish it
+    # explicitly here rather than relying on the default new_candle=True
+    # parameter, which no longer gates this dispatch by itself.
+    engine._new_candle_closed()
 
     engine.monthly["PE"].evaluate()
     _settle(engine)
@@ -1161,6 +1374,19 @@ def test_monthly_gate_open_but_own_confirmation_closed_means_no_entry(script_mod
     engine.state.reference.reference_time_iso = sim.DAY0
     engine.state.reference.computed = True
     clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY1} 09:45", "%Y-%m-%d %H:%M"))
+    # MonthlySideEngine._maybe_evaluate_entry_bg (2026-08-13) only proceeds
+    # past its cheap pre-check once engine._last_candle_boundary is known
+    # AND weekly_sibling._last_completed_boundary matches it -- normally
+    # both come from a real run_cycle()/WeeklySideEngine dispatch, but this
+    # test fakes Weekly's verdict directly (latest_weekly_detail above)
+    # rather than running Weekly's own evaluate(), so both markers must be
+    # set by hand too. Without this, the test would "pass" by Monthly
+    # bailing out on the boundary-is-None guard before ever reaching its
+    # own confirmation check -- which is exactly the behavior this test
+    # exists to prove, so an accidental short-circuit here would silently
+    # stop testing anything.
+    engine._new_candle_closed()
+    engine.weekly["CE"]._last_completed_boundary = engine._last_candle_boundary.isoformat()
 
     # Monthly CE's OWN candle at this moment shows Accumulation (premium
     # UP, OI UP vs. its Day-0 reference 250/80,000) -- confirmation #2 fails.
@@ -1170,6 +1396,7 @@ def test_monthly_gate_open_but_own_confirmation_closed_means_no_entry(script_mod
     ]
 
     engine.monthly["CE"].evaluate()
+    _settle(engine)
 
     assert client.placed_orders == []
     assert engine.state.legs["MONTHLY_CE"].position.symbol == ""
@@ -1381,11 +1608,20 @@ def test_history_failure_mid_cycle_skips_gracefully_without_crashing_or_fabricat
     engine.state.reference.reference_time_iso = sim.DAY0
     engine.state.reference.computed = True
     clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY1} 09:35", "%Y-%m-%d %H:%M"))
+    # WeeklySideEngine._due_for_boundary (2026-08-13) needs
+    # engine._last_candle_boundary set before _evaluate_entry_bg will
+    # dispatch anything -- normally established by run_cycle()'s own
+    # _new_candle_closed() call. Without this, evaluate() would silently
+    # do nothing at all (boundary is None), which would make this test
+    # "pass" without ever actually calling the mocked-to-fail history()
+    # below -- proving nothing about graceful-skip behavior.
+    engine._new_candle_closed()
 
     original_history = client.history
     client.history = lambda *a, **k: {"status": "error", "message": "broker timeout"}
     try:
         engine.weekly["CE"].evaluate()  # must not raise
+        _settle(engine)
     finally:
         client.history = original_history
 
