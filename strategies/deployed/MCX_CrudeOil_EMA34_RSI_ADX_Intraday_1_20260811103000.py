@@ -62,24 +62,26 @@ Computed off the front-month futures contract's own 45-minute candles:
   CE entry : close_prev1 > ema_high34_prev1   (price closed above its own
                                                 34-EMA of Highs -- trend up)
              AND rsi_prev1 > 53                (momentum confirms)
-             AND adx_prev1 > 25                (trend strength gate --
+             AND adx_prev1 > 20                (trend strength gate --
                                                 shared by both sides, no
-                                                directional +DI/-DI check)
+                                                directional +DI/-DI check;
+                                                lowered from 25 on
+                                                2026-08-13)
              AND adx_prev1 > adx_prev2 >
                  adx_prev3                     (ADX must be RISING across
                                                 3 candles, not just above
-                                                25 -- a static level check
-                                                is equally true whether ADX
-                                                just crossed up through 25
-                                                on its way to 60, or is
-                                                falling back down through
-                                                some higher value after
-                                                already peaking; the latter
-                                                produced two live stop-
-                                                losses on 2026-08-12. Not
-                                                direction-specific -- same
-                                                check for CE and PE, ADX
-                                                measures strength, not
+                                                the threshold -- a static
+                                                level check is equally true
+                                                whether ADX just crossed up
+                                                through it on its way to 60,
+                                                or is falling back down
+                                                through some higher value
+                                                after already peaking; the
+                                                latter produced two live
+                                                stop-losses on 2026-08-12.
+                                                Not direction-specific --
+                                                same check for CE and PE,
+                                                ADX measures strength, not
                                                 direction. Cross-day
                                                 continuous, same as
                                                 EMA34/RSI's own warmup --
@@ -87,12 +89,17 @@ Computed off the front-month futures contract's own 45-minute candles:
                                                 into yesterday's candles
                                                 for the first candle of a
                                                 new session, no special-
-                                                casing needed)
-             AND adx_prev2 > 20                (floor on the middle candle
-                                                of the 3 -- the rise must
-                                                be sustained, not a single
-                                                wild jump from near-zero;
-                                                added 2026-08-12)
+                                                casing needed. A separate
+                                                floor on the middle candle
+                                                (adx_prev2 > 20) existed
+                                                2026-08-12 through
+                                                2026-08-13, removed once
+                                                adx_threshold was lowered
+                                                to the same 20 value it
+                                                already made redundant --
+                                                adx_prev1 > adx_prev2 > 20
+                                                already guarantees
+                                                adx_prev1 > 20)
              AND close_prev1 > vwap_prev1      (price also above session
                                                 VWAP -- value/location
                                                 confirmation, independent
@@ -107,11 +114,10 @@ Computed off the front-month futures contract's own 45-minute candles:
                                                 added 2026-08-11)
   PE entry : close_prev1 < ema_low34_prev1    (mirror, below 34-EMA of Lows)
              AND rsi_prev1 < 47
-             AND adx_prev1 > 25
+             AND adx_prev1 > 20
              AND adx_prev1 > adx_prev2 > adx_prev3   (mirror -- same
                                                 check, not direction-
                                                 specific)
-             AND adx_prev2 > 20                (mirror)
              AND close_prev1 < vwap_prev1      (mirror)
              AND ltp < vwap_prev1              (mirror)
 
@@ -306,7 +312,7 @@ from openalgo import api, ta
 threading.stack_size(1024 * 1024)  # 1MB, generous for these workloads
 
 try:
-    from _strategy_platform_client import notify_trade_closed, notify_whatsapp_error, filter_known_fields
+    from _strategy_platform_client import notify_trade_closed, notify_telegram_error, filter_known_fields
 except ImportError:
     # Shared helper (strategies/scripts/_strategy_platform_client.py) not
     # present alongside this script -- e.g. it was copied out standalone.
@@ -316,7 +322,7 @@ except ImportError:
     def notify_trade_closed(env, log_warning=None):
         pass
 
-    def notify_whatsapp_error(env, message, log_warning=None):
+    def notify_telegram_error(env, message, log_warning=None):
         pass
 
     # Same behavior as the shared module's version (see its own docstring) --
@@ -378,16 +384,19 @@ class Config:
     ema_period: int = 34
     rsi_period: int = 14
     adx_period: int = 14
-    adx_threshold: float = 25.0       # shared trend-strength gate for both CE and PE entries, no directional DI check
+    adx_threshold: float = 20.0       # shared trend-strength gate for both CE and PE entries, no directional DI check -- lowered from 25.0 (2026-08-13)
     # 2026-08-12: adx_threshold alone is a static level check -- equally
     # true whether ADX just crossed up through it (fresh, strengthening
     # trend) or is falling back down through it after already peaking (an
     # exhausting trend -- traced to two live stop-losses this session).
-    # adx_rising_floor pairs with the entry_condition's 3-candle rising
-    # check (adx_prev1 > adx_prev2 > adx_prev3 AND adx_prev2 >
-    # adx_rising_floor) to require the rise be sustained, not a single
-    # noisy uptick from near-zero.
-    adx_rising_floor: float = 20.0
+    # entry_condition's 3-candle rising check (adx_prev1 > adx_prev2 >
+    # adx_prev3) still requires the rise be sustained, not a single noisy
+    # uptick -- a separate adx_rising_floor on the middle candle used to
+    # pair with it here, removed 2026-08-13 once adx_threshold was lowered
+    # to the same 20.0 value: with the rising check already in place,
+    # adx_prev1 > adx_prev2 > adx_rising_floor(20) made adx_prev1 >
+    # adx_threshold(20) transitively guaranteed, so the floor term was
+    # doing no independent work anymore.
     ce_rsi_entry_threshold: float = 53.0
     pe_rsi_entry_threshold: float = 47.0
     ce_rsi_exit_threshold: float = 47.0
@@ -2567,12 +2576,12 @@ class StrategyEngine:
         # that routes here) -- fires once per transition, not on the
         # periodic _repush_active_errors re-push. Dispatched via
         # _pnl_executor (non-blocking, same pool this file already uses for
-        # push_leg_error) and notify_whatsapp_error() itself never raises --
+        # push_leg_error) and notify_telegram_error() itself never raises --
         # a WhatsApp/network hiccup can never break this method or the
         # calling run_cycle.
         try:
             self._pnl_executor.submit(
-                notify_whatsapp_error, self.env,
+                notify_telegram_error, self.env,
                 f"[{config.strategy_name}] {leg_key} {error_state} ({error_kind}): {message}",
                 log_warning=Log.warning,
             )
@@ -3278,7 +3287,6 @@ class StrategyEngine:
                             and signal.rsi_prev1 > config.ce_rsi_entry_threshold
                             and signal.adx_prev1 > config.adx_threshold
                             and signal.adx_prev1 > signal.adx_prev2 > signal.adx_prev3
-                            and signal.adx_prev2 > config.adx_rising_floor
                             and signal.close_prev1 > signal.vwap_prev1
                             and signal.ltp > signal.vwap_prev1
                         )
@@ -3292,7 +3300,6 @@ class StrategyEngine:
                             and signal.rsi_prev1 < config.pe_rsi_entry_threshold
                             and signal.adx_prev1 > config.adx_threshold
                             and signal.adx_prev1 > signal.adx_prev2 > signal.adx_prev3
-                            and signal.adx_prev2 > config.adx_rising_floor
                             and signal.close_prev1 < signal.vwap_prev1
                             and signal.ltp < signal.vwap_prev1
                         )
@@ -3356,7 +3363,6 @@ class StrategyEngine:
                             f"adx_prev1={signal.adx_prev1:.2f} > adx_threshold={config.adx_threshold}, "
                             f"adx_prev1={signal.adx_prev1:.2f} > adx_prev2={signal.adx_prev2:.2f} > "
                             f"adx_prev3={signal.adx_prev3:.2f}, "
-                            f"adx_prev2={signal.adx_prev2:.2f} > adx_rising_floor={config.adx_rising_floor}, "
                             f"close_prev1={signal.close_prev1:.2f} > vwap_prev1={signal.vwap_prev1:.2f}, "
                             f"ltp={signal.ltp:.2f} > vwap_prev1={signal.vwap_prev1:.2f}"
                         )
@@ -3367,7 +3373,6 @@ class StrategyEngine:
                             f"adx_prev1={signal.adx_prev1:.2f} > adx_threshold={config.adx_threshold}, "
                             f"adx_prev1={signal.adx_prev1:.2f} > adx_prev2={signal.adx_prev2:.2f} > "
                             f"adx_prev3={signal.adx_prev3:.2f}, "
-                            f"adx_prev2={signal.adx_prev2:.2f} > adx_rising_floor={config.adx_rising_floor}, "
                             f"close_prev1={signal.close_prev1:.2f} < vwap_prev1={signal.vwap_prev1:.2f}, "
                             f"ltp={signal.ltp:.2f} < vwap_prev1={signal.vwap_prev1:.2f}"
                         )
@@ -3387,7 +3392,7 @@ class StrategyEngine:
                 self._last_cycle_failure_notify = now
                 try:
                     self._pnl_executor.submit(
-                        notify_whatsapp_error, self.env,
+                        notify_telegram_error, self.env,
                         f"[{config.strategy_name}] Cycle failed: {exc}",
                         log_warning=Log.warning,
                     )
