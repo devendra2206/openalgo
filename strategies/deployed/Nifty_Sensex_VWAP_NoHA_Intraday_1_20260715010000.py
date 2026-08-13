@@ -1947,12 +1947,25 @@ class StrategyEngine:
         now = datetime.now(IST)
         last = self._option_signal_refresh.get(leg_key)
         current_boundary = _current_candle_boundary(config.candle_bucket_minutes)
+        # compute_option_signal (via resample_to_bars) always drops the
+        # still-forming last bucket, so a fresh signal's candle_key is
+        # always the LAST CLOSED candle -- one full interval BEFORE
+        # current_boundary (the start of the candle currently in progress),
+        # never equal to or after it. Comparing cached_boundary directly
+        # against current_boundary can therefore NEVER be satisfied --
+        # confirmed live 2026-08-13: even after fixing the 09:15-anchor
+        # mismatch, this second bug alone kept due_for_refresh permanently
+        # True, firing client.history() every ~5s scheduler tick all day
+        # for any flat leg. Compare against the last-CLOSED candle's own
+        # boundary instead -- same fix already applied to the CrudeOil
+        # strategy's get_signal(), missed here until now.
+        last_closed_boundary = current_boundary - timedelta(minutes=config.candle_bucket_minutes)
         cached_for_boundary = self._option_signal_cache.get(leg_key)
         cached_boundary = (
             _candle_key_boundary(cached_for_boundary.candle_key)
             if cached_for_boundary is not None else None
         )
-        have_current_candle = cached_boundary is not None and cached_boundary >= current_boundary
+        have_current_candle = cached_boundary is not None and cached_boundary >= last_closed_boundary
         due = last is None or not have_current_candle
         if due and leg_key not in self._option_signal_refresh_pending:
             self._option_signal_refresh_pending.add(leg_key)
