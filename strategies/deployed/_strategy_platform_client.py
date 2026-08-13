@@ -135,6 +135,46 @@ def notify_whatsapp_error(env, message: str, log_warning=None) -> None:
             log_warning(f"notify_whatsapp_error failed: {exc}")
 
 
+def notify_telegram_error(env, message: str, log_warning=None) -> None:
+    """Fire-and-forget Telegram self-notify on a strategy failure -- order
+    rejection, timeout, or any other runtime error requiring user
+    attention. Never raises: any failure is reported via `log_warning`
+    (pass the caller's own Log.warning) if given, and swallowed either
+    way -- must never block or crash the calling strategy's scheduler loop
+    over a notification hiccup, same contract as notify_trade_closed and
+    notify_whatsapp_error above.
+
+    Replaces notify_whatsapp_error as of 2026-08-13: WhatsApp alerts here
+    are a self-linked-device echo (see services/whatsapp_alert_service.py's
+    docstring) and arrive already marked read on the phone, making them
+    useless for "notice this immediately". Telegram is a genuine separate
+    bot identity, so a message from it arrives as a real unread push.
+
+    Uses POST /api/v1/telegram/notify with no `username` -- the endpoint
+    resolves the apikey's own linked Telegram user itself (added
+    2026-08-13 alongside this function; OpenAlgo is single-user per
+    deployment, so this always resolves to exactly one user). Requires
+    the strategy owner to have linked their Telegram account and enabled
+    notifications via the /telegram page; if not linked, the endpoint
+    call fails and is silently swallowed here exactly like an unpaired
+    WhatsApp bot silently queued before -- never special-cased.
+
+    `env`: the calling script's own Environment instance -- read-only
+    here, just needs .api_key, .host (identical shape across every
+    deployed script). Callers should prefix `message` with the strategy
+    name/tag so a phone receiving alerts from multiple strategies can
+    tell them apart."""
+    payload = json.dumps({
+        "apikey": env.api_key,
+        "message": message[:4096],  # endpoint's own documented max length
+    }).encode("utf-8")
+    try:
+        _post_json_local(env.host, "/api/v1/telegram/notify", payload)
+    except Exception as exc:
+        if log_warning is not None:
+            log_warning(f"notify_telegram_error failed: {exc}")
+
+
 def filter_known_fields(cls, raw: dict) -> dict:
     """Drop any keys in `raw` that aren't fields of `cls` before it gets
     spread into that dataclass's constructor.

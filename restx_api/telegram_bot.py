@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import jsonify, make_response, request
 from flask_restx import Namespace, Resource, fields
 
-from database.auth_db import verify_api_key
+from database.auth_db import get_username_by_apikey, verify_api_key
 from database.telegram_db import (
     get_all_telegram_users,
     get_bot_config,
@@ -67,7 +67,12 @@ notification_model = api.model(
     "Notification",
     {
         "apikey": fields.String(required=True, description="API Key"),
-        "username": fields.String(required=True, description="OpenAlgo Username"),
+        "username": fields.String(
+            description="OpenAlgo Username -- omit to self-notify the apikey's own linked "
+            "Telegram user (resolved the same way telegram_alert_service resolves order "
+            "alerts). OpenAlgo is single-user per deployment, so this is the normal case "
+            "for a strategy notifying its own owner."
+        ),
         "message": fields.String(required=True, description="Notification message"),
         "priority": fields.Integer(description="Priority (1-10)", default=5),
         "wait_for_delivery": fields.Boolean(
@@ -467,11 +472,27 @@ class SendNotification(Resource):
             except (TypeError, ValueError):
                 priority = 5
 
-            if not username or not message:
+            if not message:
                 return make_response(
-                    jsonify({"status": "error", "message": "Username and message are required"}),
-                    400,
+                    jsonify({"status": "error", "message": "message is required"}), 400
                 )
+
+            # No username -> self-notify: resolve the apikey's own OpenAlgo
+            # username, same lookup telegram_alert_service.send_order_alert/
+            # send_failure_alert already use internally. OpenAlgo is
+            # single-user per deployment (see CLAUDE.md), so this apikey
+            # always maps to exactly one username -- lets a strategy script
+            # (which only ever has its own env.api_key, no DB access) notify
+            # its own owner without needing to already know its username.
+            if not username:
+                username = get_username_by_apikey(api_key)
+                if not username:
+                    return make_response(
+                        jsonify(
+                            {"status": "error", "message": "Could not resolve username for this apikey"}
+                        ),
+                        400,
+                    )
 
             # Get user's telegram ID
             user = get_telegram_user_by_username(username)

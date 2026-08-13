@@ -317,7 +317,7 @@ from openalgo import api
 threading.stack_size(1024 * 1024)  # 1MB, generous for these workloads
 
 try:
-    from _strategy_platform_client import notify_trade_closed, notify_whatsapp_error, filter_known_fields
+    from _strategy_platform_client import notify_trade_closed, notify_telegram_error, filter_known_fields
 except ImportError:
     # Shared helper (strategies/scripts/_strategy_platform_client.py) not
     # present alongside this script -- degrade gracefully: the live "trade
@@ -326,7 +326,7 @@ except ImportError:
     def notify_trade_closed(env, log_warning=None):
         pass
 
-    def notify_whatsapp_error(env, message, log_warning=None):
+    def notify_telegram_error(env, message, log_warning=None):
         pass
 
     def filter_known_fields(cls, raw):
@@ -1956,13 +1956,13 @@ class StrategyEngine:
         # that routes here) -- fires once per transition, not on the
         # periodic _repush_active_errors re-push above. Dispatched via
         # _bg_executor (non-blocking, shared across both instruments) and
-        # notify_whatsapp_error() itself never raises -- a WhatsApp/network
+        # notify_telegram_error() itself never raises -- a WhatsApp/network
         # hiccup can never break this method or the calling run_cycle. The
         # message includes leg_key so a WhatsApp alert always identifies
         # which instrument tripped it.
         try:
             self._bg_executor.submit(
-                notify_whatsapp_error, self.env,
+                notify_telegram_error, self.env,
                 f"[{config.strategy_name}] {leg_key} {error_state} ({error_kind}): {message}",
                 log_warning=Log.warning,
             )
@@ -2642,7 +2642,7 @@ class StrategyEngine:
             # already routed through _enter_error_mode's own alert.
             # Throttled (cycle_failure_notify_interval_sec) since an outer
             # catch-all could otherwise fire every scheduler tick if the
-            # same bug keeps recurring -- notify_whatsapp_error() itself
+            # same bug keeps recurring -- notify_telegram_error() itself
             # never raises and this is dispatched via _bg_executor
             # (non-blocking), so a WhatsApp/network hiccup here can never
             # compound the original failure. Single shared throttle (not
@@ -2655,7 +2655,7 @@ class StrategyEngine:
                 self._last_cycle_failure_notify = now
                 try:
                     self._bg_executor.submit(
-                        notify_whatsapp_error, self.env,
+                        notify_telegram_error, self.env,
                         f"[{config.strategy_name}] Cycle failed: {exc}",
                         log_warning=Log.warning,
                     )

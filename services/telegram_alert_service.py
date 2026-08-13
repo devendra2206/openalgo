@@ -52,6 +52,19 @@ class TelegramAlertService:
             "cancelallorder": "*All Orders Cancelled*\n{details}",
             "closeposition": "*Position Closed*\n{details}",
         }
+        # Failure-only alerts (2026-08-13): this Telegram channel now only
+        # ever sends on a genuine failure -- see subscribers/telegram_subscriber.py's
+        # module docstring for why (every success/completion handler there
+        # is now a no-op). The strong visual marker matters here since
+        # there is no way to assign a distinct notification sound per
+        # message via the Bot API -- the marker is the only thing that
+        # makes a failure alert stand out from itself.
+        self.failure_templates = {
+            "placeorder": "🔴 *ORDER FAILED*\n{details}",
+            "placesmartorder": "🔴 *SMART ORDER FAILED*\n{details}",
+            "modifyorder": "🔴 *MODIFY FAILED*\n{details}",
+            "cancelorder": "🔴 *CANCEL FAILED*\n{details}",
+        }
 
     def format_order_details(
         self, order_type: str, order_data: dict[str, Any], response: dict[str, Any]
@@ -272,6 +285,55 @@ class TelegramAlertService:
             logger.exception(f"Error formatting order details: {e}")
             return f"Order Type: {order_type}\nStatus: {response.get('status', 'unknown')}"
 
+    def format_failure_details(
+        self,
+        order_type: str,
+        symbol: str,
+        exchange: str,
+        error_message: str,
+        request_data: dict[str, Any],
+        orderid: str = "",
+    ) -> str:
+        """Format a *FailedEvent (OrderFailedEvent/OrderModifyFailedEvent/
+        OrderCancelFailedEvent) for Telegram -- these carry error_message
+        directly, not a response dict with .get('status')/.get('message')
+        like format_order_details expects, so this is a separate method
+        rather than force-fitting the existing one."""
+        try:
+            details = []
+            timestamp = datetime.now().strftime("%H:%M:%S")
+
+            if symbol:
+                details.append(f"Symbol: `{symbol}`")
+            if exchange:
+                details.append(f"Exchange: {exchange}")
+            if orderid:
+                details.append(f"Order ID: `{orderid}`")
+
+            action = request_data.get("action")
+            if action:
+                details.append(f"Action: {action}")
+            quantity = request_data.get("quantity")
+            if quantity:
+                details.append(f"Quantity: {quantity}")
+
+            # The real broker/validation rejection reason -- confirmed
+            # end-to-end correct as of the 2026-08-13 place_order_service.py/
+            # broker/shoonya/mapping/transform_data.py fix (a broker
+            # rejection is no longer silently reported as a success with
+            # no error_message to show here).
+            details.append(f"Reason: {error_message or 'Unknown error'}")
+            details.append(f"Time: {timestamp}")
+
+            if request_data.get("strategy"):
+                details.insert(0, f"Strategy: *{request_data.get('strategy')}*")
+
+            return "\n".join(details)
+
+        except Exception as e:
+            logger.exception(f"Error formatting failure details: {e}")
+            return f"Order Type: {order_type}\nError: {error_message or 'Unknown error'}"
+
     def _get_bot_token(self) -> str | None:
         """Get bot token from database config."""
         try:
@@ -443,6 +505,87 @@ class TelegramAlertService:
         except Exception as e:
             # Log error but don't raise - we don't want to affect order processing
             logger.error(f"Error queuing telegram alert: {e}", exc_info=True)
+
+    def send_failure_alert(
+        self,
+        order_type: str,
+        symbol: str,
+        exchange: str,
+        error_message: str,
+        request_data: dict[str, Any],
+        api_key: str | None = None,
+        orderid: str = "",
+    ):
+        """
+        Send a failure alert to the telegram user (non-blocking) -- this is
+        the ONLY thing this channel sends as of 2026-08-13 (see
+        subscribers/telegram_subscriber.py's module docstring): every
+        success/completion event is now suppressed here, so a distinct
+        notification sound assigned to this chat effectively becomes "the
+        failure sound".
+
+        Args:
+            order_type: placeorder/modifyorder/cancelorder
+            symbol: Trading symbol, if applicable (modify/cancel may lack one)
+            exchange: Exchange, if applicable
+            error_message: The real broker/validation rejection reason
+            request_data: Original request dict (for strategy/action/quantity)
+            api_key: API key to identify user
+            orderid: Order ID, for modify/cancel failures
+        """
+        try:
+            logger.info(f"Telegram failure alert triggered for {order_type}: {error_message}")
+
+            if not self.enabled:
+                logger.debug("Telegram alerts are disabled globally")
+                return
+
+            if not self.is_bot_active():
+                logger.debug("Telegram bot is stopped; skipping failure alert")
+                return
+
+            username = None
+            api_key_used = api_key or request_data.get("apikey")
+
+            if api_key_used:
+                username = get_username_by_apikey(api_key_used)
+            else:
+                logger.warning("No API key provided for telegram failure alert")
+
+            if not username:
+                try:
+                    from flask import has_request_context, session
+
+                    if has_request_context() and session.get("user"):
+                        username = session.get("user")
+                except Exception:
+                    pass
+
+                if not username:
+                    logger.warning("No username found for telegram failure alert")
+                    return
+
+            telegram_user = get_telegram_user_by_username(username)
+            if not telegram_user:
+                logger.info(f"No telegram user linked for username: {username}")
+                return
+            if not telegram_user.get("notifications_enabled"):
+                logger.info(f"Notifications disabled for telegram user: {username}")
+                return
+
+            template = self.failure_templates.get(order_type, "🔴 *ORDER FAILED*\n{details}")
+            details = self.format_failure_details(
+                order_type, symbol, exchange, error_message, request_data, orderid
+            )
+            message = template.format(details=details)
+
+            telegram_id = telegram_user["telegram_id"]
+            logger.info(f"Queueing failure alert via thread pool for telegram_id: {telegram_id}")
+            alert_executor.submit(self.send_alert_sync, telegram_id, message)
+
+        except Exception as e:
+            # Log error but don't raise - we don't want to affect order processing
+            logger.error(f"Error queuing telegram failure alert: {e}", exc_info=True)
 
     # Backward compatibility wrapper
     _send_alert_sync_wrapper = send_alert_sync

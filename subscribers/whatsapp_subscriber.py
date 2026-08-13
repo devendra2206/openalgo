@@ -1,40 +1,33 @@
 """
-WhatsApp subscriber — mirrors subscribers/telegram_subscriber.py.
+WhatsApp subscriber — order alerts disabled (2026-08-13).
 
-Sends alerts for the same set of order events the Telegram channel covers,
-preserving the same "failures don't notify" behavior so a flood of validation
-rejections doesn't spam either channel.
-
-Called directly from the EventBus thread pool. send_order_alert() internally
-queues onto its own alert_executor pool, so this callback returns quickly
-and doesn't block the bus worker.
+This WhatsApp integration is a self-hosted WhatsApp Web protocol
+connection, linked as one of the user's own devices (see
+services/whatsapp_alert_service.py's module docstring) -- not the
+official Business API. Messages sent this way arrive on the user's phone
+already marked read (a self-linked-device echo, not a genuine push from
+another party), making it useless as a "notice this immediately" channel.
+Telegram (subscribers/telegram_subscriber.py) now covers the one thing
+that actually matters here -- a failure-only alert that arrives as a real
+unread push -- so every handler below is now a no-op rather than sending
+notifications the user can't rely on seeing.
 """
-
-from services.whatsapp_alert_service import whatsapp_alert_service
-from utils.logging import get_logger
-
-logger = get_logger(__name__)
-
-
-def _send(api_type, order_data, response_data, api_key):
-    whatsapp_alert_service.send_order_alert(api_type, order_data, response_data, api_key)
 
 
 def on_order_placed(event):
-    _send(event.api_type, event.request_data, event.response_data, event.api_key)
+    pass
 
 
 def on_order_failed(event):
-    # Mirror telegram: failures are noisy; don't notify on this channel.
     pass
 
 
 def on_smart_order_no_action(event):
-    _send(event.api_type, event.request_data, event.response_data, event.api_key)
+    pass
 
 
 def on_order_modified(event):
-    _send(event.api_type, event.request_data, event.response_data, event.api_key)
+    pass
 
 
 def on_order_modify_failed(event):
@@ -42,7 +35,7 @@ def on_order_modify_failed(event):
 
 
 def on_order_cancelled(event):
-    _send(event.api_type, event.request_data, event.response_data, event.api_key)
+    pass
 
 
 def on_order_cancel_failed(event):
@@ -50,29 +43,28 @@ def on_order_cancel_failed(event):
 
 
 def on_all_orders_cancelled(event):
-    _send(event.api_type, event.request_data, event.response_data, event.api_key)
+    pass
 
 
 def on_position_closed(event):
-    _send(event.api_type, event.request_data, event.response_data, event.api_key)
+    pass
 
 
 def on_basket_completed(event):
-    _send(event.api_type, event.request_data, event.response_data, event.api_key)
+    pass
 
 
 def on_split_completed(event):
-    _send(event.api_type, event.request_data, event.response_data, event.api_key)
+    pass
 
 
 def on_options_completed(event):
-    _send(event.api_type, event.request_data, event.response_data, event.api_key)
+    pass
 
 
 def on_multiorder_completed(event):
-    _send(event.api_type, event.request_data, event.response_data, event.api_key)
+    pass
 
 
 def on_analyzer_error(event):
-    # Mirror telegram: validation errors stay off the chat channels.
     pass

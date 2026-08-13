@@ -165,12 +165,12 @@ from opengreeks import black76
 threading.stack_size(1024 * 1024)  # 1MB, generous for these workloads
 
 try:
-    from _strategy_platform_client import notify_trade_closed, notify_whatsapp_error, filter_known_fields
+    from _strategy_platform_client import notify_trade_closed, notify_telegram_error, filter_known_fields
 except ImportError:
     def notify_trade_closed(env, log_warning=None):
         pass
 
-    def notify_whatsapp_error(env, message, log_warning=None):
+    def notify_telegram_error(env, message, log_warning=None):
         pass
 
     def filter_known_fields(cls, raw):
@@ -1909,7 +1909,7 @@ class WeeklySideEngine:
         self.engine._push_leg_error_bg(self.leg_key, pos, action=action)
         self.engine.save_state()
         Log.error(f"[WEEKLY_{self.option_type}] {error_state} ({error_kind}): {message}")
-        self.engine._notify_whatsapp_error_bg(
+        self.engine._notify_telegram_error_bg(
             f"WEEKLY_{self.option_type} {error_state} ({error_kind}): {message}"
         )
 
@@ -2566,7 +2566,7 @@ class MonthlySideEngine:
         self.engine._push_leg_error_bg(self.leg_key, pos, action=action)
         self.engine.save_state()
         Log.error(f"[MONTHLY_{self.option_type}] {error_state} ({error_kind}): {message}")
-        self.engine._notify_whatsapp_error_bg(
+        self.engine._notify_telegram_error_bg(
             f"MONTHLY_{self.option_type} {error_state} ({error_kind}): {message}"
         )
 
@@ -3119,15 +3119,15 @@ class StrategyEngine:
         blocking-bug class as push_leg_error above."""
         self._bg_executor.submit(notify_trade_closed, self.env, log_warning=Log.warning)
 
-    def _notify_whatsapp_error_bg(self, message: str):
+    def _notify_telegram_error_bg(self, message: str):
         """Fire-and-forget WhatsApp self-alert via _bg_executor -- same
         blocking-bug class as push_leg_error/notify_trade_closed above.
-        notify_whatsapp_error() itself never raises, so a WhatsApp/network
+        notify_telegram_error() itself never raises, so a WhatsApp/network
         hiccup can never break the calling WeeklySideEngine/MonthlySideEngine
         method or run_cycle()."""
         try:
             self._bg_executor.submit(
-                notify_whatsapp_error, self.env, f"[{config.strategy_name}] {message}",
+                notify_telegram_error, self.env, f"[{config.strategy_name}] {message}",
                 log_warning=Log.warning,
             )
         except Exception as exc:
@@ -3244,7 +3244,7 @@ class StrategyEngine:
                     or (now - self._last_cycle_failure_notify).total_seconds()
                     >= config.cycle_failure_notify_interval_sec):
                 self._last_cycle_failure_notify = now
-                self._notify_whatsapp_error_bg(f"Cycle failed: {exc}")
+                self._notify_telegram_error_bg(f"Cycle failed: {exc}")
 
     def reconcile_pending_orders(self):
         """Startup-only crash recovery: finds any leg whose entry/exit order

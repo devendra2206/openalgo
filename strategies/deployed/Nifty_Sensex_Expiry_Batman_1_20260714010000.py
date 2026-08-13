@@ -203,7 +203,7 @@ from openalgo import api
 threading.stack_size(1024 * 1024)  # 1MB, generous for these workloads
 
 try:
-    from _strategy_platform_client import notify_trade_closed, notify_whatsapp_error, filter_known_fields
+    from _strategy_platform_client import notify_trade_closed, notify_telegram_error, filter_known_fields
 except ImportError:
     # Shared helper (strategies/scripts/_strategy_platform_client.py) not
     # present alongside this script -- e.g. it was copied out standalone.
@@ -213,7 +213,7 @@ except ImportError:
     def notify_trade_closed(env, log_warning=None):
         pass
 
-    def notify_whatsapp_error(env, message, log_warning=None):
+    def notify_telegram_error(env, message, log_warning=None):
         pass
 
     # Same behavior as the shared module's version (see its own docstring) --
@@ -1797,12 +1797,12 @@ class StrategyEngine:
         # that routes here) -- fires once per transition, not on the
         # periodic _repush_active_errors re-push. Dispatched via
         # _pnl_executor (non-blocking, same pool this file already uses for
-        # push_leg_error) and notify_whatsapp_error() itself never raises --
+        # push_leg_error) and notify_telegram_error() itself never raises --
         # a WhatsApp/network hiccup can never break this method or the
         # calling run_cycle.
         try:
             self._pnl_executor.submit(
-                notify_whatsapp_error, self.env,
+                notify_telegram_error, self.env,
                 f"[{config.strategy_name}] {leg_key} {error_state} ({error_kind}): {message}",
                 log_warning=Log.warning,
             )
@@ -2863,7 +2863,7 @@ class StrategyEngine:
                 self._last_cycle_failure_notify = now
                 try:
                     self._pnl_executor.submit(
-                        notify_whatsapp_error, self.env,
+                        notify_telegram_error, self.env,
                         f"[{config.strategy_name}] Cycle failed: {exc}",
                         log_warning=Log.warning,
                     )
