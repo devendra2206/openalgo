@@ -47,17 +47,20 @@ CRYPTO`).
 
 Signal Rules
 ------------------------------------------------------------------------
-Computed off the front-month futures contract's own 45-minute candles:
+Computed off the front-month futures contract's own candle_interval_minutes
+candles (15-minute as of 2026-08-14 -- widened from 45-minute on
+2026-08-11/12 for entry-frequency reasons, see Config.candle_interval_minutes'
+own comment):
   - EMA(High, 34) and EMA(Low, 34), RSI(14) on Close, ADX(14), and a
     session-anchored VWAP (see _session_vwap -- same hand-rolled pattern
     as CRUDEOIL_VWAP_EMA20_Positional_1, no openalgo.ta helper exists) --
-    all computed over the last-closed 45m bars (the newest fetched bar is
-    unconditionally dropped as still-forming, same defensive pattern used
-    everywhere else in this project).
-  - Evaluated purely off the last CLOSED candle's own values -- no live-LTP
-    breakout-confirmation layer (that pattern in the 3m EMA9/RSI reference
-    exists for its fast timeframe; a 45m candle doesn't need it, so entry/
-    exit can only actually change once per 45-minute bar).
+    all computed over the last-closed candle_interval_minutes bars (the
+    newest fetched bar is unconditionally dropped as still-forming, same
+    defensive pattern used everywhere else in this project).
+  - Exit is evaluated purely off the last CLOSED candle's own values.
+    Entry additionally requires a live-LTP breakout-confirmation term
+    (added 2026-08-14, same pattern as the 3m EMA9/RSI reference) -- see
+    high_prev1/low_prev1 in the entry rules below.
 
   CE entry : close_prev1 > ema_high34_prev1   (price closed above its own
                                                 34-EMA of Highs -- trend up)
@@ -112,6 +115,27 @@ Computed off the front-month futures contract's own 45-minute candles:
                                                 of entry, not just as of
                                                 the last closed candle --
                                                 added 2026-08-11)
+             AND ltp > high_prev1              (live breakout confirmation
+                                                -- price must actually break
+                                                above the last CLOSED
+                                                candle's own high, not just
+                                                satisfy the EMA/VWAP terms
+                                                at some point within it;
+                                                added 2026-08-14 alongside
+                                                the 45m->15m interval
+                                                change, to filter weaker
+                                                signals now that candles
+                                                are more frequent. Skipped
+                                                -- not enforced -- when
+                                                InstrumentSignal.
+                                                ltp_is_fallback is True (no
+                                                genuine live price this
+                                                cycle; the fallback value
+                                                can never satisfy this term
+                                                by construction, see
+                                                compute_instrument_signal)
+                                                so a feed outage doesn't
+                                                silently block every entry)
   PE entry : close_prev1 < ema_low34_prev1    (mirror, below 34-EMA of Lows)
              AND rsi_prev1 < 47
              AND adx_prev1 > 20
@@ -120,6 +144,11 @@ Computed off the front-month futures contract's own 45-minute candles:
                                                 specific)
              AND close_prev1 < vwap_prev1      (mirror)
              AND ltp < vwap_prev1              (mirror)
+             AND ltp < low_prev1               (mirror -- live breakdown
+                                                confirmation, added
+                                                2026-08-14, same
+                                                ltp_is_fallback skip
+                                                applies)
 
   CE exit  : close_prev1 < ema_low34_prev1  OR  rsi_prev1 < 47
   PE exit  : close_prev1 > ema_high34_prev1 OR  rsi_prev1 > 53
@@ -131,8 +160,8 @@ Computed off the front-month futures contract's own 45-minute candles:
 
   Trailing stop-loss (added 2026-08-11, three-tier guard/25%/10% shape as
   of the 2026-08-13 pass), software-monitored -- checked every 10s
-  run_cycle tick using LIVE premium, independent of the 45m candle gating
-  above (a long option's premium can move fast within a candle). OR'd with
+  run_cycle tick using LIVE premium, independent of the candle_interval_minutes
+  candle gating above (a long option's premium can move fast within a candle). OR'd with
   the EMA/RSI/ADX exit_condition, not a replacement -- either one closes
   the leg. % is against the OPTION'S OWN premium (current_ltp/entry_px -
   1), scales with entry price, and RATCHETS on the highest profit % ever
@@ -200,15 +229,18 @@ Strike selection, expiry, and product
     chain response, never hardcoded).
   - Trading window: MCX's official session is 09:00-23:55
     (`database/market_calendar_db.py`'s MCX offsets). Entry window
-    09:45-22:00 (start moved from 09:20 to 09:45 on 2026-08-12 -- the
-    09:00-09:45 candle is the first genuinely CLOSED 45m bar after the
-    overnight gap; before 09:45, get_signal's cache still legitimately
-    holds the PREVIOUS day's last candle, so entries between 09:20-09:45
-    were firing off yesterday's indicator values, not today's. End
-    tightened from 22:30 on 2026-08-11 -- no new entries after 10 PM);
-    universal exit at 23:15, leaving a buffer for square-off order
-    execution before the 23:55 hard close. All config values -- adjust
-    freely.
+    09:15-22:00 (start moved from 09:20 to 09:45 on 2026-08-12, when the
+    candle was still 45-minute -- the 09:00-09:45 candle was the first
+    genuinely CLOSED bar after the overnight gap; before it, get_signal's
+    cache still legitimately held the PREVIOUS day's last candle, so
+    entries between 09:20-09:45 were firing off yesterday's indicator
+    values, not today's. 2026-08-14: candle_interval_minutes widened the
+    entry frequency 45->15, so this same reasoning now pins entry_start
+    to 09:15 -- the 09:00-09:15 candle is the first genuinely closed
+    15-minute bar. End tightened from 22:30 on 2026-08-11 -- no new
+    entries after 10 PM); universal exit at 23:15, leaving a buffer for
+    square-off order execution before the 23:55 hard close. All config
+    values -- adjust freely.
   - Max 3 entries per leg per day.
 
 Live price feed: WebSocket, DYNAMIC subscription (like VWAP_NoHA/Batman)
@@ -272,9 +304,14 @@ Notes / Assumptions (please verify against your installed `openalgo` SDK):
     2026-08-11, the broker rejects it outright (HTTP 400: "Must be one of:
     1s, 5s, 10s, 15s, 30s, 45s, 1m, 2m, 3m, 5m, 10m, 15m, 20m, 30m, 1h, 2h,
     3h, 4h, D, W, M, Q, Y" -- no 45m). Fetches at `fetch_interval` (15m)
-    instead and resamples to `candle_interval_minutes` (45m) locally via
-    pandas in `_resample_to_candle_interval` -- see that function and
-    `compute_instrument_signal`.
+    instead and resamples to `candle_interval_minutes` (15m as of
+    2026-08-14, previously 45m) locally via pandas in
+    `_resample_to_candle_interval` -- see that function and
+    `compute_instrument_signal`. Now that fetch_interval and
+    candle_interval_minutes are both 15m, the resample step is a 1:1
+    passthrough rather than a genuine aggregation -- kept as-is (not worth
+    special-casing away) since it still does real work if either value is
+    ever changed independently again.
 
 Author
 ------
@@ -386,12 +423,37 @@ class Config:
 
     # 2026-08-11: confirmed live the broker rejects "45m" outright (HTTP 400
     # "Must be one of: ...15m, 20m, 30m, 1h..." -- no 45m). Fetches at
-    # fetch_interval (15m, a supported interval that divides 45 evenly) and
-    # resamples to candle_interval_minutes-minute bars locally in
-    # compute_instrument_signal -- see that function for the resample.
+    # fetch_interval (15m, broker-supported) and resamples to
+    # candle_interval_minutes-minute bars locally in compute_instrument_signal
+    # -- see that function for the resample.
+    #
+    # 2026-08-14: candle_interval_minutes widened from 45 to 15 (user request
+    # -- 45m was producing too few entries/day). Since fetch_interval is
+    # already 15m, the two are now equal and the resample step is a 1:1
+    # passthrough (see _resample_to_candle_interval's docstring). This is a
+    # materially FASTER/NOISIER signal than 45m -- EMA34/RSI14/ADX14 now
+    # cover an ~8.5-hour lookback instead of ~25.5 hours, so expect more
+    # entries but also more whipsaw-prone ADX/RSI readings. Also shortens
+    # the SL-exit re-entry cooldown (last_sl_exit_candle_boundary blocks a
+    # re-entry only until the NEXT candle boundary) from 45 minutes to 15.
+    # Config.entry_start was moved 09:45 -> 09:15 in lockstep -- see the
+    # module docstring's Trading window note for why.
     fetch_interval: str = "15m"
-    candle_interval_minutes: int = 45  # the actual signal timeframe -- also drives get_signal's _current_candle_boundary()
-    history_lookback_days: int = 10   # calendar days of 45m history to fetch (EMA34/RSI14/ADX14 warmup)
+    candle_interval_minutes: int = 15  # the actual signal timeframe -- also drives get_signal's _current_candle_boundary()
+    # 2026-08-14: trimmed 10 -> 5 calendar days. warmup_needed (see
+    # compute_instrument_signal) is max(ema_period, adx_period)+3 = 37 bars
+    # -- at candle_interval_minutes=15m that's ~9.25 market hours, well
+    # under a single MCX session (~14h55m), so even 2 calendar days would
+    # almost always clear it; 5 leaves comfortable margin for a weekend or
+    # short holiday cluster. The 10-day value was already generous margin
+    # at the old 45m interval (37 bars needed ~2 trading days there too)
+    # but get_signal's due_for_refresh now fires this fetch roughly 3x as
+    # often (every 15m candle boundary instead of every 45m), so the same
+    # oversized 10-day payload was being re-fetched 3x more frequently --
+    # trimming it here cuts real per-call payload/parse cost, not call
+    # frequency (the 3x frequency itself is correct and intentional for a
+    # 15m signal, not something to throttle back down).
+    history_lookback_days: int = 5
     ema_period: int = 34
     rsi_period: int = 14
     adx_period: int = 14
@@ -459,14 +521,29 @@ class Config:
     # anywhere; kept only as a documented record of why MARKET isn't used.
     price_type: str = "LIMIT"
 
-    entry_start: time = time(9, 45)
+    # 2026-08-14: moved 09:45 -> 09:15 in lockstep with
+    # candle_interval_minutes going 45 -> 15 -- the 09:00-09:15 candle is
+    # now the first genuinely CLOSED bar after the overnight gap (same
+    # "first closed bar after session open" reasoning as before, just
+    # rescaled). See the module docstring's Trading window note.
+    entry_start: time = time(9, 15)
     entry_end: time = time(22, 0)
     universal_exit_time: time = time(23, 15)
     market_open: time = time(9, 0)
     market_close: time = time(23, 55)   # MCX official session, per database/market_calendar_db.py
 
     scheduler_interval: int = 10
-    indicator_refresh_interval: int = 15     # throttle for the 3m EMA/RSI history fetch
+    # 2026-08-14: removed the unused indicator_refresh_interval field --
+    # unlike its counterpart in the other deployed strategies (kept there
+    # as a documented "what the old naive rolling-timer throttle would
+    # have done" baseline for test_candle_boundary_refresh.py-style
+    # comparisons), this file's get_signal()/due_for_refresh already uses
+    # the candle-boundary comparison exclusively (see get_signal's own
+    # docstring) and never read this field in any conditional -- confirmed
+    # via a repo-wide grep for `config.indicator_refresh_interval`, zero
+    # code hits, only comments. Its own inline comment ("throttle for the
+    # 3m EMA/RSI history fetch") was also factually wrong for this file,
+    # which has never used a 3-minute signal.
     pnl_tick_interval: float = 0.8             # seconds between PnL pushes -- runs on its OWN scheduler
                                                # job (see report_pnl_tick), decoupled from
                                                # scheduler_interval, since it's cache-only/read-only and
@@ -616,8 +693,10 @@ class LegState:
     # boundary that had already passed, stamping the OLD candle_key; the very
     # next cycle's cache refresh landed on the NEW candle_key, made the
     # comparison mismatch, and let a re-entry through 60s after the SL, same
-    # physical 45m window. _current_candle_boundary() is pure wall-clock
-    # (datetime.now() only, no cache/network dependency) so it can't lag.
+    # physical candle_interval_minutes window (45m at the time of that
+    # incident, 15m as of 2026-08-14). _current_candle_boundary() is pure
+    # wall-clock (datetime.now() only, no cache/network dependency) so it
+    # can't lag.
     # Reset daily in _reset_day_if_needed alongside trade_count.
     last_sl_exit_candle_boundary: str = ""
 
@@ -1301,6 +1380,8 @@ def fetch_symbol_bid_ask(client, symbol: str, exchange: str) -> tuple[Optional[f
 @dataclass
 class InstrumentSignal:
     close_prev1: float
+    high_prev1: float   # raw last-closed candle high (NOT ema_high) -- 2026-08-14 breakout-confirmation gate
+    low_prev1: float    # raw last-closed candle low (NOT ema_low) -- 2026-08-14 breakout-confirmation gate
     ema_high_prev1: float
     ema_low_prev1: float
     rsi_prev1: float
@@ -1310,6 +1391,15 @@ class InstrumentSignal:
     vwap_prev1: float
     ltp: float
     candle_key: str
+    # 2026-08-14: True when `ltp` above is the closed-candle-close fallback
+    # (both WS and REST live-price lookups failed), not a genuine live
+    # tick -- see compute_instrument_signal's own comment. entry_condition
+    # uses this to skip the breakout-confirmation term (structurally
+    # unsatisfiable on the fallback value) rather than silently blocking
+    # every entry for the duration of a feed outage. Defaults False so
+    # every other InstrumentSignal(...) construction across this file
+    # (tests, mock harnesses) keeps working unchanged.
+    ltp_is_fallback: bool = False
 
 
 # Log the [inst] candle=... line only when the candle actually advances, not
@@ -1355,13 +1445,16 @@ def _session_vwap(bars) -> np.ndarray:
 
 def _resample_to_candle_interval(bars, interval_minutes: int):
     """Aggregate fetch_interval (15m, broker-supported) bars up to
-    candle_interval_minutes (45m, NOT broker-supported -- confirmed live
-    2026-08-11, HTTP 400 'Must be one of: ...15m, 20m, 30m, 1h...') bars.
+    candle_interval_minutes (15m as of 2026-08-14, previously 45m -- 45m
+    is NOT broker-supported, confirmed live 2026-08-11, HTTP 400 'Must be
+    one of: ...15m, 20m, 30m, 1h...'; now that both values are 15m this is
+    a 1:1 passthrough, see this function's caller for why it's still kept).
     origin='start_day' anchors bins to midnight, matching
     _current_candle_boundary()'s own midnight-based bucketing exactly --
-    MCX's 09:00 session open lands exactly on a midnight-aligned 45-minute
-    boundary (540 minutes = 12*45), so this never misaligns against the
-    candle-boundary detection get_signal relies on."""
+    MCX's 09:00 session open lands exactly on a midnight-aligned boundary
+    for any interval that divides 540 minutes evenly (12*45=540, 36*15=540),
+    so this never misaligns against the candle-boundary detection get_signal
+    relies on."""
     resampled = bars.resample(f"{interval_minutes}min", origin="start_day").agg({
         "open": "first", "high": "max", "low": "min", "close": "last",
         "volume": "sum" if "volume" in bars.columns else "first",
@@ -1374,11 +1467,11 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
     """Fetch fetch_interval (15m) history for the CURRENT MONTH FUTURES
     CONTRACT (not the bare underlying name -- CRUDEOIL has no quotable
     spot/index, see module docstring), resample locally to
-    candle_interval_minutes (45m -- see _resample_to_candle_interval, the
-    broker itself rejects 45m directly), then compute EMA(High,34),
-    EMA(Low,34), RSI(14), ADX(14) off the last genuinely CLOSED resampled
-    bars, plus live LTP. Returns None (with a logged reason) if anything is
-    unavailable."""
+    candle_interval_minutes (15m as of 2026-08-14, previously 45m -- see
+    _resample_to_candle_interval, the broker itself rejects 45m directly),
+    then compute EMA(High,34), EMA(Low,34), RSI(14), ADX(14) off the last
+    genuinely CLOSED resampled bars, plus live LTP. Returns None (with a
+    logged reason) if anything is unavailable."""
     end = datetime.now(IST).date()
 
     raw_bars = client.history(
@@ -1401,10 +1494,12 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
         return None
     # Drop the still-forming last candle -- the broker's last bar keeps
     # updating well past its nominal close, same defensive pattern used
-    # everywhere else in this codebase. Applies post-resample: a 45m bucket
-    # built from a still-incomplete run of 15m bars (e.g. only 1-2 of the 3
-    # expected) is exactly as "still forming" as a raw still-forming bar
-    # would be.
+    # everywhere else in this codebase. Applies post-resample too, for
+    # whatever candle_interval_minutes is currently set to (a bucket built
+    # from an incomplete run of fetch_interval bars is exactly as "still
+    # forming" as a raw still-forming bar would be) -- moot now that
+    # candle_interval_minutes == fetch_interval == 15m (1:1 passthrough),
+    # but still correct if they ever diverge again.
     if len(bars) >= 2:
         bars = bars.iloc[:-1]
     # +3 (not +2): entry_condition's ADX-rising gate reads adx[-3], so the
@@ -1431,24 +1526,38 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
 
     candle_key = str(bars.index[-1])
 
+    ltp_is_fallback = False
     if ltp is None:
         ltp = fetch_symbol_ltp(client, futures_symbol, inst.options_exchange)
     if ltp is None:
         ltp = float(close[-1])  # fallback: closed-candle close is a reasonable proxy
+        # 2026-08-14: this fallback value sits BETWEEN high_prev1 and
+        # low_prev1 by construction (it IS that candle's own close) -- the
+        # breakout-confirmation gate (ltp > high_prev1 / ltp < low_prev1)
+        # can therefore never be satisfied on this path. Flagged via
+        # ltp_is_fallback so entry_condition can skip that one term when
+        # there's no genuine live price to confirm a breakout with,
+        # instead of silently and permanently blocking every entry for as
+        # long as the live feed stays down -- independent-review-caught
+        # regression, see the equivalent guard in entry_condition below.
+        ltp_is_fallback = True
 
     signal = InstrumentSignal(
         close_prev1=float(close[-1]),
+        high_prev1=float(high[-1]), low_prev1=float(low[-1]),
         ema_high_prev1=float(ema_high[-1]), ema_low_prev1=float(ema_low[-1]),
         rsi_prev1=float(rsi[-1]),
         adx_prev1=float(adx[-1]), adx_prev2=float(adx[-2]), adx_prev3=float(adx[-3]),
         vwap_prev1=float(vwap[-1]),
         ltp=ltp, candle_key=candle_key,
+        ltp_is_fallback=ltp_is_fallback,
     )
 
     if _last_logged_candle.get(inst.name) != candle_key:
         _last_logged_candle[inst.name] = candle_key
         Log.info(
             f"[{inst.name}] futures={futures_symbol} candle={candle_key} close={signal.close_prev1:.2f} "
+            f"high={signal.high_prev1:.2f} low={signal.low_prev1:.2f} "
             f"ema_high{config.ema_period}={signal.ema_high_prev1:.2f} ema_low{config.ema_period}={signal.ema_low_prev1:.2f} "
             f"rsi={signal.rsi_prev1:.2f} adx={signal.adx_prev1:.2f} "
             f"adx_prev2={signal.adx_prev2:.2f} adx_prev3={signal.adx_prev3:.2f} "
@@ -2270,6 +2379,12 @@ class StrategyEngine:
             ltp = fetch_symbol_ltp(self.ltp_client, futures_symbol, inst.options_exchange)
         if ltp is not None:
             cached.ltp = ltp
+            # This ltp is always a genuine WS/REST tick (never the
+            # closed-candle-close fallback -- that only happens inside
+            # compute_instrument_signal itself, on a background refresh)
+            # -- so a live tick arriving on ANY later cycle clears the
+            # fallback flag a stale background refresh may have set.
+            cached.ltp_is_fallback = False
         return cached
 
     # ---- state helpers -----------------------------------------------------
@@ -2710,8 +2825,8 @@ class StrategyEngine:
     def _check_stop_loss(self, leg_key: str, pos: LegPosition, inst: InstrumentConfig) -> tuple[bool, Optional[float]]:
         """Trailing stop-loss check -- see compute_trailing_sl_price() and
         Config.sl_trail_pct/sl_initial_pct for the spec. Checked every run_cycle tick
-        (10s), independent of the 45m candle gating that governs the EMA/
-        RSI/ADX signal -- a long option's premium can move fast within a
+        (10s), independent of the candle_interval_minutes candle gating that
+        governs the EMA/RSI/ADX signal -- a long option's premium can move fast within a
         candle, so this can't wait for the next candle close the way the
         EMA/RSI exit does.
 
@@ -3331,6 +3446,14 @@ class StrategyEngine:
                             and signal.adx_prev1 > signal.adx_prev2 > signal.adx_prev3
                             and signal.close_prev1 > signal.vwap_prev1
                             and signal.ltp > signal.vwap_prev1
+                            # ltp_is_fallback: no genuine live price this cycle (both
+                            # WS and REST failed) -- ltp is then just close_prev1,
+                            # which sits BETWEEN high_prev1/low_prev1 by construction,
+                            # so this term would otherwise be structurally
+                            # unsatisfiable and silently block every entry for as
+                            # long as the feed stays down. Skip it (fall back to the
+                            # closed-candle conditions above) instead.
+                            and (signal.ltp_is_fallback or signal.ltp > signal.high_prev1)
                         )
                         exit_condition = (
                             signal.close_prev1 < signal.ema_low_prev1
@@ -3344,6 +3467,7 @@ class StrategyEngine:
                             and signal.adx_prev1 > signal.adx_prev2 > signal.adx_prev3
                             and signal.close_prev1 < signal.vwap_prev1
                             and signal.ltp < signal.vwap_prev1
+                            and (signal.ltp_is_fallback or signal.ltp < signal.low_prev1)
                         )
                         exit_condition = (
                             signal.close_prev1 > signal.ema_high_prev1
@@ -3360,8 +3484,8 @@ class StrategyEngine:
                         # permanently blocking re-entry.
                         exit_already_committed = bool(leg.position.exit_order_id) or leg.position.exit_filled
                         # Trailing stop-loss -- checked every cycle using LIVE price,
-                        # independent of the 45m candle gating that governs
-                        # exit_condition above (see _check_stop_loss's own docstring).
+                        # independent of the candle_interval_minutes candle gating that
+                        # governs exit_condition above (see _check_stop_loss's own docstring).
                         sl_hit, sl_price = self._check_stop_loss(leg_key, leg.position, inst)
                         if exit_condition or sl_hit or exit_already_committed:
                             if not exit_already_committed:
@@ -3406,7 +3530,8 @@ class StrategyEngine:
                             f"adx_prev1={signal.adx_prev1:.2f} > adx_prev2={signal.adx_prev2:.2f} > "
                             f"adx_prev3={signal.adx_prev3:.2f}, "
                             f"close_prev1={signal.close_prev1:.2f} > vwap_prev1={signal.vwap_prev1:.2f}, "
-                            f"ltp={signal.ltp:.2f} > vwap_prev1={signal.vwap_prev1:.2f}"
+                            f"ltp={signal.ltp:.2f} > vwap_prev1={signal.vwap_prev1:.2f}, "
+                            f"ltp={signal.ltp:.2f} > high_prev1={signal.high_prev1:.2f}"
                         )
                     else:
                         condition_desc = (
@@ -3416,7 +3541,8 @@ class StrategyEngine:
                             f"adx_prev1={signal.adx_prev1:.2f} > adx_prev2={signal.adx_prev2:.2f} > "
                             f"adx_prev3={signal.adx_prev3:.2f}, "
                             f"close_prev1={signal.close_prev1:.2f} < vwap_prev1={signal.vwap_prev1:.2f}, "
-                            f"ltp={signal.ltp:.2f} < vwap_prev1={signal.vwap_prev1:.2f}"
+                            f"ltp={signal.ltp:.2f} < vwap_prev1={signal.vwap_prev1:.2f}, "
+                            f"ltp={signal.ltp:.2f} < low_prev1={signal.low_prev1:.2f}"
                         )
                     self._enter_leg(leg_key, inst, option_type, spot=signal.ltp, futures_symbol=futures_symbol,
                                      condition_desc=condition_desc)
