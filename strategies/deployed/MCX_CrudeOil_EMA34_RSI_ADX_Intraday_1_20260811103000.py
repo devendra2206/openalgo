@@ -1256,27 +1256,31 @@ def _trading_days_between(start: "datetime.date", end: "datetime.date") -> int:
 
 
 def _resolve_expiry_with_roll_buffer(client, inst: InstrumentConfig, instrumenttype: str) -> str:
-    """Shared roll-buffer resolution for both OPTIONS and FUTURES expiry --
-    nearest upcoming expiry (DDMMMYY, raw broker format) EXCEPT once
-    config.expiry_roll_trading_days_before (2) or fewer TRADING days remain
-    before it, when it rolls to the NEXT expiry instead. Trading-day count
-    uses `is_trading_day` (see its own import/fallback above).
+    """Roll-buffer resolution: nearest upcoming expiry (DDMMMYY, raw broker
+    format) EXCEPT once config.expiry_roll_trading_days_before (2) or fewer
+    TRADING days remain before it, when it rolls to the NEXT expiry
+    instead. Trading-day count uses `is_trading_day` (see its own
+    import/fallback above).
 
-    2026-08-14: previously ONLY the options side (resolve_current_month_expiry)
-    applied this roll buffer; resolve_current_month_futures used a plain
-    "nearest expiry, no buffer" rule for the contract the EMA34/RSI14/ADX14/
-    VWAP signal is computed off. MCX options typically expire a few calendar
-    days before the futures contract for the same month, so there's a real
-    window where the options side has already rolled to NEXT month (its
-    early-roll buffer triggered) while the futures side -- having no buffer
-    of its own -- is still sitting on THIS month's contract, right as it
-    nears its own expiry-day price distortions (basis convergence, thinning
-    liquidity). Confirmed live 2026-08-14: an entry signal computed off
-    CRUDEOIL19AUG26FUT (5 trading days from its own expiry) for a position
-    actually traded on CRUDEOIL17SEP26 options (already rolled). Both sides
-    now share this exact function so they can never diverge on WHEN to
-    roll -- see resolve_current_month_expiry/resolve_current_month_futures
-    for the (thin) per-type wrapper that formats the return value."""
+    2026-08-14, first pass: made resolve_current_month_futures call this
+    too (previously options-only), reasoning that giving both sides the
+    identical roll RULE would stop them diverging. It didn't fully close
+    the gap: MCX options and futures expire on DIFFERENT calendar dates
+    within the same contract month (options several days before futures),
+    so the identical rule can still trigger each side's early roll on a
+    different day -- confirmed live 2026-08-14, options had already rolled
+    to SEP (its own nearer expiry hit the buffer) while futures (its own
+    later expiry hadn't) stayed on AUG.
+
+    2026-08-14, second pass (the actual fix): resolve_current_month_futures
+    no longer calls this function to make its OWN roll decision at all --
+    StrategyEngine._reset_day_if_needed now resolves OPTIONS via this
+    function first, then passes that resolved month straight into
+    resolve_current_month_futures, which just finds whichever of its own
+    listed contracts falls in that month. Only resolve_current_month_expiry
+    (options) still calls this function directly -- kept as a standalone
+    function (not inlined) because it's still the one genuinely independent
+    roll decision in the whole flow."""
     resp = client.expiry(symbol=inst.name, exchange=inst.options_exchange, instrumenttype=instrumenttype)
     if resp.get("status") != "success" or not resp.get("data"):
         raise RuntimeError(f"Could not resolve {instrumenttype} expiry for {inst.name}: {resp}")
@@ -1312,17 +1316,44 @@ def resolve_current_month_expiry(client, inst: InstrumentConfig) -> str:
     return _compact_expiry(_resolve_expiry_with_roll_buffer(client, inst, "options"))
 
 
-def resolve_current_month_futures(client, inst: InstrumentConfig) -> str:
+def resolve_current_month_futures(client, inst: InstrumentConfig, target_month_year: tuple[int, int]) -> str:
     """Resolve the FUTURES symbol (`[Base][DDMMMYY]FUT`) the EMA34/RSI14/
     ADX14/VWAP signal is computed off -- CRUDEOIL has no quotable spot/index
     (unlike NIFTY/SENSEX, which have NSE_INDEX/BSE_INDEX), so this strategy
-    reads the futures contract's own price series directly. Resolved ONCE
-    PER DAY (see StrategyEngine._reset_day_if_needed). Same early-roll
-    buffer as resolve_current_month_expiry (2026-08-14, see
-    _resolve_expiry_with_roll_buffer's docstring for why the two sides must
-    never diverge on which month they're each using)."""
-    raw = _resolve_expiry_with_roll_buffer(client, inst, "futures")
-    return f"{inst.name}{_compact_expiry(raw)}FUT"
+    reads the futures contract's own price series directly.
+
+    2026-08-14 (second pass): takes `target_month_year` -- the (month, year)
+    of whatever contract month resolve_current_month_expiry has ALREADY
+    resolved the OPTIONS side to -- instead of resolving independently.
+    The first pass of this fix (both sides sharing
+    _resolve_expiry_with_roll_buffer, same 2-trading-day threshold) still
+    left a real gap: MCX options and futures expire on DIFFERENT calendar
+    dates within the same contract month (options several days before
+    futures), so applying the identical rule independently to each can
+    still trigger their early rolls on different days -- confirmed live
+    2026-08-14, options had already rolled to SEP while futures (its own
+    expiry ~5 trading days out) hadn't. Deriving futures' month directly
+    from options' already-resolved choice is the only way to guarantee
+    they can NEVER diverge, since futures no longer makes an independent
+    roll decision at all -- it just finds whichever of its own listed
+    contracts falls in options' month. Resolved ONCE PER DAY, in lockstep
+    with resolve_current_month_expiry (see
+    StrategyEngine._reset_day_if_needed, which resolves options first and
+    passes its month straight into this call)."""
+    resp = client.expiry(symbol=inst.name, exchange=inst.options_exchange, instrumenttype="futures")
+    if resp.get("status") != "success" or not resp.get("data"):
+        raise RuntimeError(f"Could not resolve futures expiry for {inst.name}: {resp}")
+    today = datetime.now(IST).date()
+    target_month, target_year = target_month_year
+    for raw in resp["data"]:
+        d = datetime.strptime(raw, "%d-%b-%y").date()
+        if d >= today and d.month == target_month and d.year == target_year:
+            return f"{inst.name}{_compact_expiry(raw)}FUT"
+    raise RuntimeError(
+        f"{inst.name}: no upcoming futures contract found for {target_month:02d}/{target_year} "
+        f"(the month resolve_current_month_expiry already resolved the options side to) -- "
+        f"broker's futures expiry list may be stale or genuinely missing this month's contract."
+    )
 
 
 def _is_error_response(obj) -> bool:
@@ -2414,7 +2445,15 @@ class StrategyEngine:
 
         def _run():
             try:
-                futures_symbol = resolve_current_month_futures(self.client, INSTRUMENTS[0])
+                # Resolve options FIRST -- futures must follow whatever month
+                # this lands on (see resolve_current_month_futures's own
+                # docstring for why deriving from options, not resolving
+                # independently, is the only way the two can never diverge).
+                options_expiry_raw = _resolve_expiry_with_roll_buffer(self.client, INSTRUMENTS[0], "options")
+                target_date = datetime.strptime(options_expiry_raw, "%d-%b-%y").date()
+                futures_symbol = resolve_current_month_futures(
+                    self.client, INSTRUMENTS[0], target_month_year=(target_date.month, target_date.year)
+                )
             except Exception as exc:
                 Log.warning(f"Could not resolve current-month futures contract yet ({exc}); "
                             f"retrying next cycle.")
@@ -2429,6 +2468,12 @@ class StrategyEngine:
                 self.store.state.today_realized_pnl = 0.0
                 self.store.state.futures_symbol = futures_symbol
                 self._expiry_cache.clear()
+                # Pre-populate with the SAME options-expiry resolution just
+                # used to pick the futures contract above -- otherwise
+                # _refresh_chain_cache's own lazy resolve_current_month_expiry()
+                # call later today would redundantly re-fetch the identical
+                # client.expiry(instrumenttype="options") data.
+                self._expiry_cache[INSTRUMENTS[0].name] = _compact_expiry(options_expiry_raw)
                 self._chain_cache.clear()
                 for leg in self.store.state.legs.values():
                     leg.trade_count = 0
@@ -3608,7 +3653,6 @@ def print_banner():
     print(f"Strike selection     : ATM+1, round-{config.strike_round} only")
     print(f"Expiry roll buffer   : {config.expiry_roll_trading_days_before} trading day(s)")
     print("LONG OPTION BUYING -- BOUNDED RISK, PREMIUM CAN DECAY TO NEAR-ZERO")
-    print("NO NATIVE PER-TRADE STOP-LOSS -- exit is EMA/RSI reversal only")
     if config.test_mode:
         print("TEST MODE ENABLED -- market-hours/entry-window checks are BYPASSED")
     print("=" * 70)
