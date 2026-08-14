@@ -46,7 +46,10 @@ at Reference Time:
     Exit: 2 consecutive opposite-verdict candles on that leg's own frozen
     strike, OR 15:15, OR +100% profit (then immediately re-select a fresh
     OTM1 strike off current spot and re-enter if that side's signal still
-    holds).
+    holds), OR -40% stop-loss on the option's own premium (no re-entry --
+    2026-08-14, a deliberate deviation from the original plan doc's #3
+    decision to ship with no added stop-loss; see Config.weekly_stop_loss_pct's
+    own comment for the reasoning).
 
   Monthly Sell (per side, independently, gated same-side only):
     Requires BOTH, using only that side's own data at every step:
@@ -206,6 +209,19 @@ class Config:
     reference_wait_time: time = time(9, 35)   # large-gap case waits for this candle to close
 
     weekly_profit_target_pct: float = 100.0   # Weekly Buy only
+    # 2026-08-14: added a stop-loss on the Weekly Buy leg. The original
+    # design (docs/plans/2026-08-02-oi-weekly-buy-monthly-sell-strategy-plan.md
+    # #3) deliberately shipped with NO stop-loss beyond the spec's own
+    # 100%-profit / 2-opposite-signal / 15:15 exits -- an explicit,
+    # considered decision to build exactly to spec, not an oversight. This
+    # is a deliberate deviation from that decision (user request,
+    # 2026-08-14): without it, a losing position has no automatic downside
+    # cap at all if the OI/premium reading never flips to "weakening" for
+    # 2 consecutive candles. Does NOT re-enter same day (reenter=False) --
+    # unlike the profit target, a stop-out isn't a signal the thesis is
+    # still good, so no immediate retry (matches universal_exit_time/
+    # opposite_signal's reenter=False, not profit_target's reenter=True).
+    weekly_stop_loss_pct: float = 40.0   # % loss on the option's own premium (Weekly Buy only)
     monthly_delta_low: float = 0.20
     monthly_delta_high: float = 0.25
     # 2026-08-11: select_monthly_delta_strike() now picks whichever scanned
@@ -2156,6 +2172,11 @@ class WeeklySideEngine:
 
         if ltp is not None and pos.entry_px > 0:
             profit_pct = (ltp - pos.entry_px) / pos.entry_px * 100.0
+            if profit_pct <= -config.weekly_stop_loss_pct:
+                Log.info(f"[WEEKLY_{self.option_type}] stop-loss hit: {profit_pct:.1f}% "
+                         f"(entry={pos.entry_px}, ltp={ltp})")
+                self._exit(pos, ltp, "stop_loss", reenter=False)
+                return
             if profit_pct >= config.weekly_profit_target_pct:
                 Log.info(f"[WEEKLY_{self.option_type}] profit target hit: {profit_pct:.1f}% "
                          f"(entry={pos.entry_px}, ltp={ltp})")
@@ -3486,6 +3507,7 @@ def print_banner():
     print(f"Candle interval      : {config.intraday_interval}")
     print(f"Gap threshold        : {config.gap_threshold_pct}%")
     print(f"Weekly profit target : {config.weekly_profit_target_pct}%")
+    print(f"Weekly stop-loss     : -{config.weekly_stop_loss_pct}%")
     print(f"Monthly delta target : {config.monthly_delta_target} (stop-widening band: {config.monthly_delta_low}-{config.monthly_delta_high})")
     print(f"Quantity per leg     : {config.quantity}")
     print(f"Product              : {config.product}")

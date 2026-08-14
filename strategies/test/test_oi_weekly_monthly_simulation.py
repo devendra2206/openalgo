@@ -1278,6 +1278,63 @@ def test_monthly_leg_force_closed_by_universal_exit_time_even_without_opposite_s
     assert engine.state.legs["MONTHLY_PE"].position.symbol == ""
 
 
+def test_weekly_leg_force_closed_by_stop_loss(script_module, clock, tmp_path):
+    """2026-08-14: new -40% stop-loss on the Weekly Buy leg (Config.
+    weekly_stop_loss_pct) -- a deliberate deviation from the original plan
+    doc's decision to ship with no added stop-loss (see that field's own
+    comment in the deployed script). A position whose LTP has dropped past
+    -40% must close via reason=stop_loss, reenter=False, even though this
+    fixture's own OI/premium reading stays Accumulation the whole time
+    (see WEEKLY_PE_CANDLES_DAY4's note) and would never trigger
+    opposite_signal or the +100% profit target on its own -- entry_px is
+    set well above where this fixture's PE premium actually trades (flat
+    ~106 all day) so profit_pct lands at a clean -47%, isolating the new
+    stop-loss as the only thing that can close this leg here."""
+    engine, client, _store = _build_engine(
+        script_module, clock, _CSV_CANDLES, "13-Aug-26", "27-Aug-26",
+        WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
+    )
+    engine.state.legs["WEEKLY_PE"].position = script_module.LegPosition(
+        symbol=sim.WEEKLY_PE_SYMBOL_DAY4, quantity=65, entry_px=200.0, entry_filled=True,
+        entry_order_id="SIM-entry", reference_oi=36_000.0, reference_premium=95.0,
+    )
+    clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY4} 09:40", "%Y-%m-%d %H:%M"))
+    engine._new_candle_closed()
+
+    engine.weekly["PE"].evaluate()
+    _settle(engine)
+
+    pe_orders = [o for o in client.placed_orders if o[0] == sim.WEEKLY_PE_SYMBOL_DAY4]
+    assert pe_orders == [(sim.WEEKLY_PE_SYMBOL_DAY4, "SELL", 65)]  # long leg exits by SELLing
+    assert engine.state.legs["WEEKLY_PE"].position.symbol == ""
+
+
+def test_weekly_leg_not_closed_by_stop_loss_above_threshold(script_module, clock, tmp_path):
+    """Mirror/negative case: a loss that hasn't yet reached -40% must NOT
+    trigger the stop-loss (or anything else) -- confirms the threshold is
+    a genuine boundary, not an off-by-something that fires too early."""
+    engine, client, _store = _build_engine(
+        script_module, clock, _CSV_CANDLES, "13-Aug-26", "27-Aug-26",
+        WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
+    )
+    # Fixture's PE premium is flat ~106 all day (see WEEKLY_PE_CANDLES_DAY4) --
+    # entry_px=150.0 gives profit_pct = (106-150)/150*100 = -29.3%, short of
+    # the -40% threshold.
+    engine.state.legs["WEEKLY_PE"].position = script_module.LegPosition(
+        symbol=sim.WEEKLY_PE_SYMBOL_DAY4, quantity=65, entry_px=150.0, entry_filled=True,
+        entry_order_id="SIM-entry", reference_oi=36_000.0, reference_premium=95.0,
+    )
+    clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY4} 09:40", "%Y-%m-%d %H:%M"))
+    engine._new_candle_closed()
+
+    engine.weekly["PE"].evaluate()
+    _settle(engine)
+
+    pe_orders = [o for o in client.placed_orders if o[0] == sim.WEEKLY_PE_SYMBOL_DAY4]
+    assert pe_orders == []  # untouched -- -29.3% is short of the -40% stop
+    assert engine.state.legs["WEEKLY_PE"].position.symbol == sim.WEEKLY_PE_SYMBOL_DAY4
+
+
 def test_day1_sequential_pe_then_ce_both_weekly_and_monthly(script_module, clock, tmp_path):
     """"weekly PE buy then exit then weekly CE buy... similar for selling
     side": proves leg-slot independence holds for SEQUENTIAL hand-off, not
