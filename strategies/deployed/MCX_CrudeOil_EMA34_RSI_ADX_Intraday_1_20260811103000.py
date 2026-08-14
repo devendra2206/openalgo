@@ -1255,17 +1255,31 @@ def _trading_days_between(start: "datetime.date", end: "datetime.date") -> int:
     return count
 
 
-def resolve_current_month_expiry(client, inst: InstrumentConfig) -> str:
-    """Nearest upcoming OPTIONS expiry (DDMMMYY) for CRUDEOIL -- EXCEPT once
+def _resolve_expiry_with_roll_buffer(client, inst: InstrumentConfig, instrumenttype: str) -> str:
+    """Shared roll-buffer resolution for both OPTIONS and FUTURES expiry --
+    nearest upcoming expiry (DDMMMYY, raw broker format) EXCEPT once
     config.expiry_roll_trading_days_before (2) or fewer TRADING days remain
-    before it, when it rolls to the NEXT expiry instead (avoids holding a
-    long option through its heaviest theta-decay days -- more consequential
-    for a premium BUYER than the EMA9/RSI reference's naked seller, which
-    only rolls on the exact expiry day itself). Trading-day count uses
-    `is_trading_day` (see its own import/fallback above)."""
-    resp = client.expiry(symbol=inst.name, exchange=inst.options_exchange, instrumenttype="options")
+    before it, when it rolls to the NEXT expiry instead. Trading-day count
+    uses `is_trading_day` (see its own import/fallback above).
+
+    2026-08-14: previously ONLY the options side (resolve_current_month_expiry)
+    applied this roll buffer; resolve_current_month_futures used a plain
+    "nearest expiry, no buffer" rule for the contract the EMA34/RSI14/ADX14/
+    VWAP signal is computed off. MCX options typically expire a few calendar
+    days before the futures contract for the same month, so there's a real
+    window where the options side has already rolled to NEXT month (its
+    early-roll buffer triggered) while the futures side -- having no buffer
+    of its own -- is still sitting on THIS month's contract, right as it
+    nears its own expiry-day price distortions (basis convergence, thinning
+    liquidity). Confirmed live 2026-08-14: an entry signal computed off
+    CRUDEOIL19AUG26FUT (5 trading days from its own expiry) for a position
+    actually traded on CRUDEOIL17SEP26 options (already rolled). Both sides
+    now share this exact function so they can never diverge on WHEN to
+    roll -- see resolve_current_month_expiry/resolve_current_month_futures
+    for the (thin) per-type wrapper that formats the return value."""
+    resp = client.expiry(symbol=inst.name, exchange=inst.options_exchange, instrumenttype=instrumenttype)
     if resp.get("status") != "success" or not resp.get("data"):
-        raise RuntimeError(f"Could not resolve options expiry for {inst.name}: {resp}")
+        raise RuntimeError(f"Could not resolve {instrumenttype} expiry for {inst.name}: {resp}")
     today = datetime.now(IST).date()
     dates_raw = resp["data"]
     for i, raw in enumerate(dates_raw):
@@ -1274,39 +1288,41 @@ def resolve_current_month_expiry(client, inst: InstrumentConfig) -> str:
             trading_days_left = _trading_days_between(today, d)
             if trading_days_left <= config.expiry_roll_trading_days_before:
                 if i + 1 < len(dates_raw):
-                    return _compact_expiry(dates_raw[i + 1])
+                    return dates_raw[i + 1]
                 # Broker's expiry list ends within the roll buffer with no
                 # later date to roll to -- silently falling through to the
                 # soon-to-expire contract is exactly what this function
                 # exists to avoid. Raise loudly instead of trading it.
                 raise RuntimeError(
-                    f"{inst.name}: nearest options expiry ({d}) is within "
+                    f"{inst.name}: nearest {instrumenttype} expiry ({d}) is within "
                     f"{config.expiry_roll_trading_days_before} trading day(s) and the "
                     f"broker returned no later expiry date to roll to -- refusing to "
                     f"silently trade a contract this close to expiry."
                 )
-            return _compact_expiry(raw)
-    return _compact_expiry(dates_raw[-1])
+            return raw
+    return dates_raw[-1]
+
+
+def resolve_current_month_expiry(client, inst: InstrumentConfig) -> str:
+    """Nearest upcoming OPTIONS expiry (DDMMMYY) for CRUDEOIL, with the
+    early-roll buffer (avoids holding a long option through its heaviest
+    theta-decay days -- more consequential for a premium BUYER than the
+    EMA9/RSI reference's naked seller, which only rolls on the exact expiry
+    day itself). See _resolve_expiry_with_roll_buffer for the shared logic."""
+    return _compact_expiry(_resolve_expiry_with_roll_buffer(client, inst, "options"))
 
 
 def resolve_current_month_futures(client, inst: InstrumentConfig) -> str:
-    """Resolve the nearest-expiry FUTURES symbol (`[Base][DDMMMYY]FUT`) for
-    the underlying -- CRUDEOIL has no quotable spot/index (unlike
-    NIFTY/SENSEX, which have NSE_INDEX/BSE_INDEX), so this strategy's
-    EMA/RSI signal reads the near-month FUTURES contract's own price series
-    directly. Resolved ONCE PER DAY (see StrategyEngine._reset_day_if_needed)
-    since the front-month contract only changes on monthly rollover, not
-    intraday."""
-    resp = client.expiry(symbol=inst.name, exchange=inst.options_exchange, instrumenttype="futures")
-    if resp.get("status") != "success" or not resp.get("data"):
-        raise RuntimeError(f"Could not resolve futures expiry for {inst.name}: {resp}")
-    today = datetime.now(IST).date()
-    dates_raw = resp["data"]
-    for raw in dates_raw:
-        d = datetime.strptime(raw, "%d-%b-%y").date()
-        if d >= today:
-            return f"{inst.name}{_compact_expiry(raw)}FUT"
-    return f"{inst.name}{_compact_expiry(dates_raw[-1])}FUT"
+    """Resolve the FUTURES symbol (`[Base][DDMMMYY]FUT`) the EMA34/RSI14/
+    ADX14/VWAP signal is computed off -- CRUDEOIL has no quotable spot/index
+    (unlike NIFTY/SENSEX, which have NSE_INDEX/BSE_INDEX), so this strategy
+    reads the futures contract's own price series directly. Resolved ONCE
+    PER DAY (see StrategyEngine._reset_day_if_needed). Same early-roll
+    buffer as resolve_current_month_expiry (2026-08-14, see
+    _resolve_expiry_with_roll_buffer's docstring for why the two sides must
+    never diverge on which month they're each using)."""
+    raw = _resolve_expiry_with_roll_buffer(client, inst, "futures")
+    return f"{inst.name}{_compact_expiry(raw)}FUT"
 
 
 def _is_error_response(obj) -> bool:
