@@ -527,7 +527,26 @@ class Config:
     strike_round: int = 100           # strike selection restricted to strike % strike_round == 0 only
     # Options expiry rolls to the NEXT expiry once this many TRADING days
     # (not calendar days) remain -- see resolve_current_month_expiry.
-    expiry_roll_trading_days_before: int = 2
+    #
+    # 2026-08-15: lowered 2 -> 1 (rolls to next month starting ON the
+    # current month's own expiry day, not 2 trading days early). Real-data
+    # backtesting this session found the 2-day-early roll was moving into
+    # the next month's options while they're still largely illiquid --
+    # confirmed directly: on the day the 2-day buffer triggered
+    # (13-Aug-26, 2 trading days before the 17-Aug-26 AUG expiry), SEP
+    # strikes near the money showed 58-88% flat/stale quote bars over the
+    # following two sessions, vs. AUG showing much healthier price
+    # discovery (~37% flat) by the equivalent point in ITS OWN early life
+    # (mid-July). _trading_days_between(today, expiry_date) counts today
+    # itself when today IS the expiry day (returns 1), so
+    # expiry_roll_trading_days_before=1 rolls starting exactly on expiry
+    # day, not before -- backtested as the "roll-on-expiry-day" variant
+    # (near-parity with the old 2-day buffer on the one window tested,
+    # +Rs.78,054 vs +Rs.82,090; the real motivation is avoiding the
+    # confirmed SEP illiquidity, not a PnL improvement). Trades back some
+    # near-expiry risk on the CURRENT month's last day that the buffer
+    # existed to avoid -- an explicit, deliberate tradeoff.
+    expiry_roll_trading_days_before: int = 1
 
     lot_multiplier: int = 1
     max_trades_per_leg_per_day: int = 5   # 2026-08-13: raised from 3
