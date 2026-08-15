@@ -241,7 +241,7 @@ Strike selection, expiry, and product
     entries after 10 PM); universal exit at 23:15, leaving a buffer for
     square-off order execution before the 23:55 hard close. All config
     values -- adjust freely.
-  - Max 3 entries per leg per day.
+  - Max 5 entries per leg per day (raised from 3 on 2026-08-13).
 
 Live price feed: WebSocket, DYNAMIC subscription (like VWAP_NoHA/Batman)
 ------------------------------------------------------------------------
@@ -300,18 +300,16 @@ Notes / Assumptions (please verify against your installed `openalgo` SDK):
   * `ta.ema(data, period)` -> ndarray. `ta.rsi(data, period=14)` -> ndarray.
   * `ta.adx(high, low, close, period=14)` -> (+DI, -DI, ADX) ndarrays --
     only the ADX (3rd) array is used here, no directional DI check.
-  * `client.history(..., interval='45m')` does NOT work -- confirmed live
-    2026-08-11, the broker rejects it outright (HTTP 400: "Must be one of:
-    1s, 5s, 10s, 15s, 30s, 45s, 1m, 2m, 3m, 5m, 10m, 15m, 20m, 30m, 1h, 2h,
-    3h, 4h, D, W, M, Q, Y" -- no 45m). Fetches at `fetch_interval` (15m)
-    instead and resamples to `candle_interval_minutes` (15m as of
-    2026-08-14, previously 45m) locally via pandas in
-    `_resample_to_candle_interval` -- see that function and
-    `compute_instrument_signal`. Now that fetch_interval and
-    candle_interval_minutes are both 15m, the resample step is a 1:1
-    passthrough rather than a genuine aggregation -- kept as-is (not worth
-    special-casing away) since it still does real work if either value is
-    ever changed independently again.
+  * `client.history(..., interval='45m')` / `'9m'` do NOT work -- confirmed
+    live, the broker rejects both (HTTP 400: "Must be one of: 1s, 5s, 10s,
+    15s, 30s, 45s, 1m, 2m, 3m, 5m, 10m, 15m, 20m, 30m, 1h, 2h, 3h, 4h, D, W,
+    M, Q, Y" -- no 45m, no 9m). Fetches at `fetch_interval` (3m as of
+    2026-08-15, previously 15m) instead and resamples to
+    `candle_interval_minutes` (9m as of 2026-08-15, previously 15m, 45m
+    before that) locally via pandas in `_resample_to_candle_interval` --
+    see that function and `compute_instrument_signal`. fetch_interval and
+    candle_interval_minutes are no longer equal (3m -> 9m, a genuine 3-bar
+    aggregation), unlike the brief period they were both 15m.
 
 Author
 ------
@@ -430,29 +428,50 @@ class Config:
     # 2026-08-14: candle_interval_minutes widened from 45 to 15 (user request
     # -- 45m was producing too few entries/day). Since fetch_interval is
     # already 15m, the two are now equal and the resample step is a 1:1
-    # passthrough (see _resample_to_candle_interval's docstring). This is a
-    # materially FASTER/NOISIER signal than 45m -- EMA34/RSI14/ADX14 now
-    # cover an ~8.5-hour lookback instead of ~25.5 hours, so expect more
-    # entries but also more whipsaw-prone ADX/RSI readings. Also shortens
-    # the SL-exit re-entry cooldown (last_sl_exit_candle_boundary blocks a
-    # re-entry only until the NEXT candle boundary) from 45 minutes to 15.
-    # Config.entry_start was moved 09:45 -> 09:15 in lockstep -- see the
-    # module docstring's Trading window note for why.
-    fetch_interval: str = "15m"
-    candle_interval_minutes: int = 15  # the actual signal timeframe -- also drives get_signal's _current_candle_boundary()
+    # passthrough (see _resample_to_candle_interval's docstring).
+    #
+    # 2026-08-15: candle_interval_minutes changed 15 -> 9, after real-data
+    # backtesting (15 Jul - 15 Aug 2026, MCX CRUDEOIL, look-ahead-bias-
+    # corrected -- see below) across 3/9/15/30/45/60m all found 9m the
+    # clear best on every metric: 49 trades, 41% win rate, profit factor
+    # 2.03, net +Rs.75,920, and by far the shallowest max drawdown (~18%
+    # of peak equity vs 42-100%+ for every other timeframe tested,
+    # including 15m's ~42%). 9m is NOT a broker-native interval (confirmed
+    # live: valid list is 1s,5s,10s,15s,30s,45s,1m,2m,3m,5m,10m,15m,20m,
+    # 30m,1h,2h,3h,4h,D,W,M,Q,Y -- no 9m) but divides evenly into 3m
+    # (9=3x3, also broker-native), so fetch_interval moved 15m -> 3m and
+    # _resample_to_candle_interval does genuine aggregation work here
+    # (3->9m), not the previous 1:1 passthrough. 540 (MCX session minutes)
+    # / 9 = 60 exactly, so 9m candle boundaries still land cleanly on the
+    # 09:00 session open, same alignment guarantee _resample_to_
+    # candle_interval's docstring relies on.
+    #
+    # IMPORTANT CAVEAT carried over from the backtest: the 9m result was
+    # the standout among 6 timeframes tested on a SINGLE month of real
+    # data, with no smooth trend through its neighbors (3m and 15m were
+    # both clearly worse) -- that shape is consistent with either a real
+    # effect or an overfit to this one window. Two follow-up tuning
+    # attempts specific to 9m (a stricter entry-window cutoff, and tighter
+    # ratchet SL tiers) were both backtested and made results WORSE, not
+    # better, so neither was adopted -- the plain 9m timeframe change is
+    # the only piece actually carried into this file. Should be treated as
+    # the best-evidenced configuration from this round of testing, not as
+    # proven out-of-sample.
+    fetch_interval: str = "3m"
+    candle_interval_minutes: int = 9  # the actual signal timeframe -- also drives get_signal's _current_candle_boundary()
     # 2026-08-14: trimmed 10 -> 5 calendar days. warmup_needed (see
     # compute_instrument_signal) is max(ema_period, adx_period)+3 = 37 bars
-    # -- at candle_interval_minutes=15m that's ~9.25 market hours, well
-    # under a single MCX session (~14h55m), so even 2 calendar days would
+    # -- at candle_interval_minutes=9m that's ~5.55 market hours, well
+    # under a single MCX session (~14h55m), so even 1 calendar day would
     # almost always clear it; 5 leaves comfortable margin for a weekend or
     # short holiday cluster. The 10-day value was already generous margin
     # at the old 45m interval (37 bars needed ~2 trading days there too)
-    # but get_signal's due_for_refresh now fires this fetch roughly 3x as
-    # often (every 15m candle boundary instead of every 45m), so the same
-    # oversized 10-day payload was being re-fetched 3x more frequently --
+    # but get_signal's due_for_refresh now fires this fetch roughly 5x as
+    # often (every 9m candle boundary instead of every 45m), so the same
+    # oversized 10-day payload was being re-fetched repeatedly --
     # trimming it here cuts real per-call payload/parse cost, not call
-    # frequency (the 3x frequency itself is correct and intentional for a
-    # 15m signal, not something to throttle back down).
+    # frequency (the higher frequency itself is correct and intentional
+    # for a 9m signal, not something to throttle back down).
     history_lookback_days: int = 5
     ema_period: int = 34
     rsi_period: int = 14
@@ -1491,17 +1510,17 @@ def _session_vwap(bars) -> np.ndarray:
 
 
 def _resample_to_candle_interval(bars, interval_minutes: int):
-    """Aggregate fetch_interval (15m, broker-supported) bars up to
-    candle_interval_minutes (15m as of 2026-08-14, previously 45m -- 45m
-    is NOT broker-supported, confirmed live 2026-08-11, HTTP 400 'Must be
-    one of: ...15m, 20m, 30m, 1h...'; now that both values are 15m this is
-    a 1:1 passthrough, see this function's caller for why it's still kept).
-    origin='start_day' anchors bins to midnight, matching
-    _current_candle_boundary()'s own midnight-based bucketing exactly --
-    MCX's 09:00 session open lands exactly on a midnight-aligned boundary
-    for any interval that divides 540 minutes evenly (12*45=540, 36*15=540),
-    so this never misaligns against the candle-boundary detection get_signal
-    relies on."""
+    """Aggregate fetch_interval (3m as of 2026-08-15, previously 15m,
+    broker-supported) bars up to candle_interval_minutes (9m as of
+    2026-08-15, previously 15m, 45m before that -- neither 45m nor 9m is
+    broker-supported, confirmed live: valid list is 1s,5s,10s,15s,30s,45s,
+    1m,2m,3m,5m,10m,15m,20m,30m,1h,2h,3h,4h,D,W,M,Q,Y). A genuine 3-bar
+    aggregation (3m -> 9m), not a passthrough. origin='start_day' anchors
+    bins to midnight, matching _current_candle_boundary()'s own
+    midnight-based bucketing exactly -- MCX's 09:00 session open lands
+    exactly on a midnight-aligned boundary for any interval that divides
+    540 minutes evenly (12*45=540, 36*15=540, 60*9=540), so this never
+    misaligns against the candle-boundary detection get_signal relies on."""
     resampled = bars.resample(f"{interval_minutes}min", origin="start_day").agg({
         "open": "first", "high": "max", "low": "min", "close": "last",
         "volume": "sum" if "volume" in bars.columns else "first",
@@ -1514,8 +1533,9 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
     """Fetch fetch_interval (15m) history for the CURRENT MONTH FUTURES
     CONTRACT (not the bare underlying name -- CRUDEOIL has no quotable
     spot/index, see module docstring), resample locally to
-    candle_interval_minutes (15m as of 2026-08-14, previously 45m -- see
-    _resample_to_candle_interval, the broker itself rejects 45m directly),
+    candle_interval_minutes (9m as of 2026-08-15, previously 15m, 45m
+    before that -- see _resample_to_candle_interval, the broker itself
+    rejects both 45m and 9m directly),
     then compute EMA(High,34), EMA(Low,34), RSI(14), ADX(14) off the last
     genuinely CLOSED resampled bars, plus live LTP. Returns None (with a
     logged reason) if anything is unavailable."""
@@ -1544,9 +1564,10 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
     # everywhere else in this codebase. Applies post-resample too, for
     # whatever candle_interval_minutes is currently set to (a bucket built
     # from an incomplete run of fetch_interval bars is exactly as "still
-    # forming" as a raw still-forming bar would be) -- moot now that
-    # candle_interval_minutes == fetch_interval == 15m (1:1 passthrough),
-    # but still correct if they ever diverge again.
+    # forming" as a raw still-forming bar would be) -- genuinely load-
+    # bearing now that candle_interval_minutes (9m) != fetch_interval (3m),
+    # since a 9m bucket built from only 1-2 of its 3 constituent 3m bars is
+    # a real partial candle, not just a technicality.
     if len(bars) >= 2:
         bars = bars.iloc[:-1]
     # +3 (not +2): entry_condition's ADX-rising gate reads adx[-3], so the
