@@ -159,24 +159,42 @@ own comment):
   ordering concern between them.
 
   Trailing stop-loss (added 2026-08-11, three-tier guard/25%/10% shape as
-  of the 2026-08-13 pass), software-monitored -- checked every 10s
-  run_cycle tick using LIVE premium, independent of the candle_interval_minutes
-  candle gating above (a long option's premium can move fast within a candle). OR'd with
-  the EMA/RSI/ADX exit_condition, not a replacement -- either one closes
-  the leg. % is against the OPTION'S OWN premium (current_ltp/entry_px -
-  1), scales with entry price, and RATCHETS on the highest profit % ever
-  reached since entry (never loosens back down on a pullback). Three
-  tiers: below sl_guard_activation_pct (10%) profit ever reached, SL stays
-  at sl_initial_pct (-25%); from 10% up to sl_trail_pct (25%), a single
-  flat guard level locks SL at sl_guard_locked_pct (-10%) -- cuts the
-  worst case roughly in half without yet reaching breakeven; from 25%
-  onward, SL locks one sl_trail_pct (25%) step behind the highest step
-  crossed, until the locked level itself would reach
-  sl_trail_tighten_threshold_pct (100%), at which point the step narrows
-  to sl_trail_step_late (10%) for the rest of the trade:
+  of the 2026-08-13 pass, tier 1 replaced with a structural stop
+  2026-08-18), software-monitored -- checked every 10s run_cycle tick,
+  independent of the candle_interval_minutes candle gating above (a long
+  option's premium can move fast within a candle). OR'd with the EMA/RSI/
+  ADX exit_condition, not a replacement -- either one closes the leg.
+  RATCHETS on the highest profit % ever reached since entry (never
+  loosens back down on a pullback). Three tiers:
+
+  Tier 1 (below sl_guard_activation_pct, 10%, profit ever reached): a
+  STRUCTURAL stop on the FUTURES price, not option premium -- the
+  entry-trigger candle's own low (CE) / high (PE), captured once at entry
+  (LegPosition.structural_stop_futures_px). Replaced the original flat
+  sl_initial_pct (-25%) premium floor 2026-08-18: that floor fired
+  frequently on ordinary premium noise (theta/IV swings) that didn't
+  reflect the underlying futures move actually reversing -- tying the
+  tier-1 stop to the entry setup genuinely failing (a real break of the
+  trigger candle's own level) cuts down exactly that class of stop-out.
+  sl_initial_pct is kept as a fallback only for a leg whose
+  structural_stop_futures_px is unset (0.0 -- e.g. resumed from a
+  state.json written before this field existed).
+
+  Tier 2 (10% up to sl_trail_pct, 25%): unchanged -- a single flat guard
+  level locks SL at sl_guard_locked_pct (-10%) on the option's own
+  premium, cutting the worst case roughly in half without yet reaching
+  breakeven.
+
+  Tier 3 (25% onward): unchanged -- SL locks one sl_trail_pct (25%) step
+  behind the highest step crossed, on the option's own premium, until the
+  locked level itself would reach sl_trail_tighten_threshold_pct (100%),
+  at which point the step narrows to sl_trail_step_late (10%) for the
+  rest of the trade. Tiers 2/3 worked example (entry 259.4, qty 100) --
+  Tier 1's effective SL is now a futures price level, not a fixed % of
+  this table:
 
     Profit reached   Effective SL     Example (entry 259.4, qty 100)
-    (none yet)        -25%             194.55 (-Rs.6,485 worst case)
+    (none yet)        structural       entry-trigger candle's own low(CE)/high(PE), on futures
     +10%              -10% (guard)     233.46 (-Rs.2,594)
     +25%               0% (breakeven)  259.40 (Rs.0)
     +50%              +25%             324.25 (+Rs.6,485)
@@ -414,6 +432,20 @@ INSTRUMENTS = [
 ]
 
 
+def _parse_interval_minutes(interval: str) -> float:
+    """Parses a broker interval string ("3m", "1h") into minutes -- used to
+    derive indicator_refresh_cooldown_sec from fetch_interval (2026-08-18
+    code review fix, porting Nifty_Sensex_VWAP_NoHA_Intraday's identical
+    cooldown mechanism here -- see that file's _get_option_signal for the
+    original)."""
+    interval = interval.strip().lower()
+    if interval.endswith("h"):
+        return float(interval[:-1]) * 60
+    if interval.endswith("m"):
+        return float(interval[:-1])
+    raise ValueError(f"Unrecognized interval string: {interval!r}")
+
+
 @dataclass
 class Config:
     strategy_name: str = "MCX CRUDEOIL EMA34 + RSI + ADX Intraday Option Buyer"
@@ -459,6 +491,17 @@ class Config:
     # proven out-of-sample.
     fetch_interval: str = "3m"
     candle_interval_minutes: int = 9  # the actual signal timeframe -- also drives get_signal's _current_candle_boundary()
+    # Floor between due_for_refresh-triggered background refreshes for the
+    # same instrument, paced to roughly 1/3 of fetch_interval -- ported
+    # 2026-08-18 (code review) from Nifty_Sensex_VWAP_NoHA_Intraday's
+    # identical mechanism, which this file's get_signal() was missing
+    # entirely (it only had due_for_refresh + the pending-set guard, no
+    # time-based throttle), risking the same "hammer the broker every ~10s
+    # tick while genuinely waiting on broker reporting lag" issue that
+    # mechanism was built to fix elsewhere. See __post_init__ for the
+    # actual derivation and _get_option_signal's cooldown_elapsed in the
+    # VWAP file for why it must be boundary-aware, not purely time-based.
+    indicator_refresh_cooldown_sec: float = 0.0  # placeholder -- derived in __post_init__
     # 2026-08-14: trimmed 10 -> 5 calendar days. warmup_needed (see
     # compute_instrument_signal) is max(ema_period, adx_period)+3 = 37 bars
     # -- at candle_interval_minutes=9m that's ~5.55 market hours, well
@@ -517,7 +560,18 @@ class Config:
     # giving back a full 25 points per step forever. See
     # compute_trailing_sl_price() for the exact tier logic and the module
     # docstring for the worked example table.
-    sl_initial_pct: float = -0.25
+    #
+    # 2026-08-18 (fourth pass): tier 1 (pre-profit) no longer uses this
+    # alone -- _check_stop_loss now closes the leg on whichever of the
+    # structural stop (entry-trigger candle's own low/high, on futures) or
+    # this flat premium floor caps the loss to LESS. Tightened -25% -> -15%
+    # to actually act as a worst-case cap alongside the structural stop
+    # (which by itself has no ceiling on how many premium points a futures
+    # move down to the trigger candle's level could represent) rather than
+    # as the primary tier-1 stop it used to be. Tiers 2/3 (sl_guard_locked_pct
+    # onward) are unaffected -- still fully premium-based once real profit
+    # has been reached.
+    sl_initial_pct: float = -0.15
     sl_guard_activation_pct: float = 0.10   # profit level the single flat guard kicks in at
     sl_guard_locked_pct: float = -0.10      # flat SL level the guard locks to (10%-25% profit zone)
     sl_trail_pct: float = 0.25   # main step size AND trailing gap AND breakeven-lock threshold
@@ -642,6 +696,13 @@ class Config:
 
     test_mode: bool = os.getenv("STRATEGY_TEST_MODE", "0") == "1"
 
+    def __post_init__(self):
+        # See indicator_refresh_cooldown_sec's own comment -- roughly 1/3 of
+        # the raw fetch interval, short enough to notice a borderline-late
+        # broker bar within the same candle, long enough to still pace
+        # retries during a genuine reporting lag.
+        self.indicator_refresh_cooldown_sec = _parse_interval_minutes(self.fetch_interval) * 60 / 3
+
 
 config = Config()
 IST = pytz.timezone("Asia/Kolkata")
@@ -719,6 +780,14 @@ class LegPosition:
     # 2026-08-11: trailing stop-loss ratchet -- highest (current_ltp/entry_px - 1)
     # ever observed since entry. Only ever increases; see compute_trailing_sl_price().
     highest_profit_pct: float = 0.0
+    # 2026-08-18: structural stop-loss level, in FUTURES points (not option
+    # premium) -- the entry-trigger candle's own low_prev1 (CE) / high_prev1
+    # (PE), captured once at entry. Replaces sl_initial_pct as the tier-1
+    # (pre-profit) stop -- see compute_trailing_sl_price()'s docstring and
+    # _check_stop_loss for how the two fit together. 0.0 means "not set"
+    # (never expected once entry_filled is True, but guards a state.json
+    # restored from before this field existed).
+    structural_stop_futures_px: float = 0.0
 
 
 @dataclass
@@ -1754,8 +1823,12 @@ def compute_trailing_sl_price(entry_px: float, highest_profit_pct: float) -> flo
     down. Every tier boundary below is strictly increasing so the switch
     itself can never violate that ratchet.
 
-    Tier 1 (below config.sl_guard_activation_pct, 10%): SL stays at
-    config.sl_initial_pct (-25%).
+    Tier 1 (below config.sl_guard_activation_pct, 10%): this function
+    still returns config.sl_initial_pct (-25%), but as of 2026-08-18
+    _check_stop_loss only actually USES this tier-1 value as a fallback
+    when a leg's structural_stop_futures_px is unset (0.0) -- the real
+    tier-1 stop is now the structural futures-price check done directly
+    in _check_stop_loss, not this function. See that method's docstring.
 
     Tier 2 (10% up to config.sl_trail_pct, 25%): a single FLAT guard
     level, config.sl_guard_locked_pct (-10%) -- not a multi-step trail,
@@ -1890,6 +1963,35 @@ def poll_fill(client, orderid: str, strategy: str, symbol: str, exchange: str,
         f"Order {orderid} still unfilled after {config.reprice_max_attempts} reprice "
         f"attempt(s) -- resting at broker, needs manual action.",
     )
+
+
+def _extract_fill_price(fill: dict, leg_key: str, side: str) -> Optional[float]:
+    """Validated fill-price extraction from poll_fill()'s orderstatus
+    response -- shared by both _watch_entry_fill and _watch_exit_fill
+    (2026-08-18 code review, findings on the entry_px-correction fix).
+    Returns None (and logs a WARNING, never raises) if the broker response
+    didn't carry a usable positive price, so callers can keep whatever
+    price estimate they already have instead of either silently accepting
+    a bogus 0/missing value or crashing mid-fill-confirmation on a
+    malformed one -- a raised exception here would incorrectly route an
+    ALREADY-FILLED order into error mode ("resting"/needs manual action)
+    when it isn't."""
+    raw = fill.get("average_price") or fill.get("price")
+    if not raw:
+        Log.warning(f"[{leg_key}] {side} fill response carried no usable average_price/price "
+                    f"({fill!r}) -- keeping the pre-order price estimate.")
+        return None
+    try:
+        price = float(raw)
+    except (TypeError, ValueError):
+        Log.warning(f"[{leg_key}] {side} fill response had a non-numeric price ({raw!r}) -- "
+                    f"keeping the pre-order price estimate.")
+        return None
+    if price <= 0:
+        Log.warning(f"[{leg_key}] {side} fill response reported a non-positive price ({price}) -- "
+                    f"keeping the pre-order price estimate.")
+        return None
+    return price
 
 
 def place(client, strategy: str, symbol: str, exchange: str, action: str, quantity: int) -> str:
@@ -2229,6 +2331,10 @@ class StrategyEngine:
         self.execution_id = execution_id  # this process run's number -- see main()
         self._signal_cache: dict[str, InstrumentSignal] = {}
         self._last_indicator_refresh: dict[str, datetime] = {}
+        # Which last_closed_boundary each instrument's cooldown timer
+        # currently covers -- see get_signal's cooldown_elapsed computation
+        # (2026-08-18 code review, ported from VWAP_NoHA).
+        self._indicator_cooldown_boundary: dict[str, datetime] = {}
         self._ws_fallback_logged: dict[str, bool] = {}
         # poll_fill() can block for up to fill_poll_timeout * (1 + reprice_max_attempts)
         # seconds (a stale/stuck order re-pricing against a moving market) -- doing that
@@ -2455,13 +2561,32 @@ class StrategyEngine:
         )
         have_current_candle = cached_boundary is not None and cached_boundary >= last_closed_boundary
         due_for_refresh = last is None or not have_current_candle
-        if due_for_refresh and inst.name not in self._signal_refresh_pending:
+        # Cooldown floor, separate from due_for_refresh -- ported 2026-08-18
+        # (code review) from Nifty_Sensex_VWAP_NoHA_Intraday's identical
+        # mechanism, which this function was missing entirely (previously
+        # only due_for_refresh + the pending-set guard gated the dispatch
+        # below, so a broker reporting lag that leaves the just-closed
+        # candle sitting as the still-forming tail would retry every ~10s
+        # scheduler tick with nothing new to fetch). Boundary-aware, not
+        # purely time-based: tracking which last_closed_boundary the
+        # cooldown timer covers means a genuine boundary transition always
+        # bypasses the cooldown for its first attempt, and only repeated
+        # retries against that SAME boundary get paced -- see the VWAP
+        # file's _get_option_signal for the full rationale.
+        cooldown_boundary = self._indicator_cooldown_boundary.get(inst.name)
+        cooldown_elapsed = (
+            last is None
+            or cooldown_boundary != last_closed_boundary
+            or (now - last).total_seconds() >= config.indicator_refresh_cooldown_sec
+        )
+        if due_for_refresh and cooldown_elapsed and inst.name not in self._signal_refresh_pending:
             # Only worth the background broker traffic when a new leg could actually
             # still be entered this cycle (within the entry window, at least one side
             # still flat) -- refreshing all day regardless (incl. after both legs are
             # already filled, or outside the entry window entirely) would just add
             # constant option-quote load on the broker for no reachable benefit.
             self._signal_refresh_pending.add(inst.name)
+            self._indicator_cooldown_boundary[inst.name] = last_closed_boundary
             self._refresh_executor.submit(
                 self._refresh_signal_and_chain_bg, inst, futures_symbol, ltp, refresh_chain
             )
@@ -2696,7 +2821,7 @@ class StrategyEngine:
 
     # ---- entry / exit (independent long leg, resumable) ---------------------
     def _enter_leg(self, leg_key: str, inst: InstrumentConfig, option_type: str, spot: float,
-                    futures_symbol: str, condition_desc: str = ""):
+                    futures_symbol: str, structural_stop_futures_px: float, condition_desc: str = ""):
         leg = self.store.state.legs[leg_key]
         strategy_tag = self.env.strategy_tag
         pos = leg.position
@@ -2752,6 +2877,7 @@ class StrategyEngine:
                 entry_time=datetime.now(IST).isoformat(),
                 entry_px=float(atm1_leg["ltp"]),
                 execution_id=self.execution_id,
+                structural_stop_futures_px=structural_stop_futures_px,
             )
             leg.position = pos
             self._save_state()
@@ -2796,18 +2922,22 @@ class StrategyEngine:
             leg = self.store.state.legs[leg_key]
             pos = leg.position
             if pos.entry_order_id == order_id:  # guard vs. a superseded/stale order
-                pos.entry_filled = True
                 # entry_px was set at position-creation time from a cached
                 # option-chain quote read BEFORE the order was even placed
                 # (see _enter_leg) -- correct it here to the broker-
                 # confirmed average fill price now that poll_fill has one,
                 # same pattern _do_retry_resolution's "manual" branch
-                # already uses for a manually-resolved fill. Falls back to
-                # the pre-order estimate only if the broker response is
-                # missing both fields (never expected in practice).
-                fill_price = fill.get("average_price") or fill.get("price")
-                if fill_price:
-                    pos.entry_px = float(fill_price)
+                # already uses for a manually-resolved fill. Computed and
+                # applied BEFORE entry_filled is set (2026-08-18 code
+                # review): _check_stop_loss reads entry_px as soon as
+                # entry_filled is True, with no lock between the two --
+                # doing the price correction first closes that window
+                # instead of leaving a brief chance to trail off the stale
+                # pre-order estimate.
+                fill_price = _extract_fill_price(fill, leg_key, "Entry")
+                if fill_price is not None:
+                    pos.entry_px = fill_price
+                pos.entry_filled = True
                 leg.trade_count += 1
                 self._save_state()
                 Log.info(f"[{leg_key}] Entry filled: {symbol}@{pos.entry_px}")
@@ -2942,7 +3072,8 @@ class StrategyEngine:
         twice."""
         return self._pending_action_cache.pop(leg_key, None)
 
-    def _check_stop_loss(self, leg_key: str, pos: LegPosition, inst: InstrumentConfig) -> tuple[bool, Optional[float]]:
+    def _check_stop_loss(self, leg_key: str, pos: LegPosition, inst: InstrumentConfig,
+                          option_type: str) -> tuple[bool, Optional[float]]:
         """Trailing stop-loss check -- see compute_trailing_sl_price() and
         Config.sl_trail_pct/sl_initial_pct for the spec. Checked every run_cycle tick
         (10s), independent of the candle_interval_minutes candle gating that
@@ -2956,6 +3087,22 @@ class StrategyEngine:
         liquidity guard on the REST fallback. Returns (False, None) if no
         trustworthy price is available this cycle -- never acts on a
         missing/stale quote, same philosophy as the rest of this file.
+
+        2026-08-18: tier 1 (below sl_guard_activation_pct profit -- i.e.
+        before this leg has ever been meaningfully in profit) now closes
+        the leg on whichever of TWO independent checks caps the loss to
+        LESS: a STRUCTURAL stop (futures crossing the entry-trigger
+        candle's own low (CE) / high (PE) -- see LegPosition.
+        structural_stop_futures_px) or a flat sl_initial_pct (15%) premium
+        floor. Pure premium-%-based alone was firing frequently on
+        ordinary premium noise (theta/IV swings that don't reflect the
+        underlying move actually reversing); pure structural alone has no
+        ceiling on how many premium points a futures move down to the
+        trigger candle's level could represent. Whichever fires first wins
+        -- this is a floor/cap, not a preference. Tiers 2/3 (once real
+        profit has been reached) are unchanged -- still trail off the
+        option's own premium only, since by then there's real ratcheted
+        profit to protect regardless of where the futures price sits.
 
         Updates pos.highest_profit_pct (the ratchet) and persists it via
         _save_state() whenever it advances, so a restart mid-trade resumes
@@ -2971,16 +3118,54 @@ class StrategyEngine:
             return False, None
 
         current_profit_pct = (ltp / pos.entry_px) - 1
-        sl_price = compute_trailing_sl_price(pos.entry_px, pos.highest_profit_pct)
+        old_sl_price = compute_trailing_sl_price(pos.entry_px, pos.highest_profit_pct)
         if current_profit_pct > pos.highest_profit_pct:
             pos.highest_profit_pct = current_profit_pct
             new_sl_price = compute_trailing_sl_price(pos.entry_px, pos.highest_profit_pct)
-            if new_sl_price != sl_price:
+            if new_sl_price != old_sl_price:
                 Log.info(f"[{leg_key}] Trailing SL advanced: profit={pos.highest_profit_pct:.2%} "
-                          f"-> sl_price={new_sl_price:.2f} (was {sl_price:.2f}), ltp={ltp:.2f}")
-            sl_price = new_sl_price
+                          f"-> sl_price={new_sl_price:.2f} (was {old_sl_price:.2f}), ltp={ltp:.2f}")
             self._save_state()
 
+        if pos.highest_profit_pct < config.sl_guard_activation_pct:
+            # Tier 1: whichever of the two caps the loss to LESS fires --
+            # the structural break (futures crossing the entry-trigger
+            # candle's own low/high) or a flat sl_initial_pct (15%) premium
+            # floor. The structural stop alone has no ceiling on how much
+            # premium it could give up before the futures level is
+            # actually reached (strike distance/IV/theta all affect how
+            # many premium points that futures move corresponds to) --
+            # the premium floor caps that worst case, while the structural
+            # stop still closes out earlier than the floor whenever the
+            # setup fails on a smaller futures move than 15% of premium
+            # would represent.
+            premium_floor = pos.entry_px * (1 + config.sl_initial_pct)
+            premium_hit = ltp <= premium_floor
+
+            structural_hit = False
+            if pos.structural_stop_futures_px > 0:
+                futures_symbol = self.store.state.futures_symbol
+                futures_ltp = None
+                if futures_symbol:
+                    futures_ltp = self.price_stream.get_ltp(futures_symbol, inst.options_exchange,
+                                                              max_age=config.ws_stale_seconds)
+                    if futures_ltp is None:
+                        futures_ltp = fetch_symbol_ltp(self.ltp_client, futures_symbol, inst.options_exchange)
+                if futures_ltp is not None:
+                    structural_hit = (futures_ltp <= pos.structural_stop_futures_px if option_type == "CE"
+                                       else futures_ltp >= pos.structural_stop_futures_px)
+
+            if structural_hit or premium_hit:
+                # Report whichever level actually triggered -- if both did
+                # (checked the same cycle), the premium floor is reported
+                # since that's the one _exit_leg's caller can display in
+                # the same units as ltp for a sanity check.
+                return True, (premium_floor if premium_hit else pos.structural_stop_futures_px)
+            return False, None
+
+        # Tier 2/3 (already meaningfully profitable at some point) -- the
+        # original premium-based trail, unchanged.
+        sl_price = compute_trailing_sl_price(pos.entry_px, pos.highest_profit_pct)
         return ltp <= sl_price, sl_price
 
     def _exit_leg(self, leg_key: str, inst: InstrumentConfig, reason: str = "unknown"):
@@ -3025,10 +3210,14 @@ class StrategyEngine:
             leg = self.store.state.legs[leg_key]
             pos = leg.position
             if pos.exit_order_id == order_id:  # guard vs. a superseded/stale order
+                # Same ordering rationale as _watch_entry_fill: resolve the
+                # real fill price before exit_filled is set, so a
+                # _finalize_exit called the instant exit_filled flips never
+                # observes it paired with an unset exit_fill_px.
+                fill_price = _extract_fill_price(fill, leg_key, "Exit")
+                if fill_price is not None:
+                    pos.exit_fill_px = fill_price
                 pos.exit_filled = True
-                fill_price = fill.get("average_price") or fill.get("price")
-                if fill_price:
-                    pos.exit_fill_px = float(fill_price)
                 self._save_state()
         except OrderNeedsAttention as exc:
             self._enter_error_mode(leg_key, "exit_failed", "resting", exc.order_id, str(exc))
@@ -3617,12 +3806,22 @@ class StrategyEngine:
                         # Trailing stop-loss -- checked every cycle using LIVE price,
                         # independent of the candle_interval_minutes candle gating that
                         # governs exit_condition above (see _check_stop_loss's own docstring).
-                        sl_hit, sl_price = self._check_stop_loss(leg_key, leg.position, inst)
+                        sl_hit, sl_price = self._check_stop_loss(leg_key, leg.position, inst, option_type)
                         if exit_condition or sl_hit or exit_already_committed:
                             if not exit_already_committed:
                                 if sl_hit and not exit_condition:
+                                    # Which price sl_price is measured in depends on which
+                                    # of tier 1's two checks fired -- FUTURES points if it
+                                    # matches structural_stop_futures_px, option premium
+                                    # otherwise (the 15% floor, or tier 2/3). See
+                                    # _check_stop_loss's own docstring.
+                                    is_structural = (
+                                        leg.position.structural_stop_futures_px > 0
+                                        and sl_price == leg.position.structural_stop_futures_px
+                                    )
+                                    sl_label = "futures-level breach" if is_structural else "ltp<=sl_price"
                                     Log.info(f"[{leg_key}] Stop-loss hit -> closing. "
-                                              f"ltp<=sl_price={sl_price:.2f} (highest_profit_pct="
+                                              f"{sl_label}={sl_price:.2f} (highest_profit_pct="
                                               f"{leg.position.highest_profit_pct:.2%})")
                                 elif exit_condition:
                                     Log.info(f"[{leg_key}] Exit condition met -> closing.")
@@ -3675,8 +3874,13 @@ class StrategyEngine:
                             f"ltp={signal.ltp:.2f} < vwap_prev1={signal.vwap_prev1:.2f}, "
                             f"ltp={signal.ltp:.2f} < low_prev1={signal.low_prev1:.2f}"
                         )
+                    # Structural (tier-1) stop level -- the entry-trigger
+                    # candle's own low (CE) / high (PE), see LegPosition.
+                    # structural_stop_futures_px's own comment and
+                    # _check_stop_loss for how it's used.
+                    structural_stop = signal.low_prev1 if option_type == "CE" else signal.high_prev1
                     self._enter_leg(leg_key, inst, option_type, spot=signal.ltp, futures_symbol=futures_symbol,
-                                     condition_desc=condition_desc)
+                                     structural_stop_futures_px=structural_stop, condition_desc=condition_desc)
 
         except Exception as exc:
             Log.exception(f"Cycle failed: {exc}")
@@ -3715,9 +3919,9 @@ def print_banner():
     print(f"Max trades/leg/day   : {config.max_trades_per_leg_per_day}")
     print(f"Product              : {config.product}")
     print("Order pricing        : LIMIT crossing spread (MARKET rejected by broker)")
-    print(f"Stop-loss            : initial {config.sl_initial_pct:.0%}, guard "
-          f"{config.sl_guard_locked_pct:.0%} from {config.sl_guard_activation_pct:.0%}, "
-          f"then {config.sl_trail_pct:.0%} steps from {config.sl_trail_pct:.0%} narrowing to "
+    print(f"Stop-loss            : tier 1 structural (entry-trigger candle's own low/high, "
+          f"futures) until {config.sl_guard_activation_pct:.0%} profit, then guard "
+          f"{config.sl_guard_locked_pct:.0%}, then {config.sl_trail_pct:.0%} steps narrowing to "
           f"{config.sl_trail_step_late:.0%} past {config.sl_trail_tighten_threshold_pct:.0%} "
           f"locked (see module docstring)")
     print(f"Strike selection     : ATM+1, round-{config.strike_round} only")

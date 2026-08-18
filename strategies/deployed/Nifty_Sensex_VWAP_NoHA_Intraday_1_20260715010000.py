@@ -259,6 +259,19 @@ INSTRUMENTS = [
 ]
 
 
+def _parse_interval_minutes(interval: str) -> float:
+    """Parses a broker interval string ("1m", "5m", "1h") into minutes --
+    used to derive option_signal_refresh_cooldown_sec from
+    candle_interval_fetch (2026-08-18 code review fix) instead of a bare
+    unrelated literal."""
+    interval = interval.strip().lower()
+    if interval.endswith("h"):
+        return float(interval[:-1]) * 60
+    if interval.endswith("m"):
+        return float(interval[:-1])
+    raise ValueError(f"Unrecognized interval string: {interval!r}")
+
+
 @dataclass
 class Config:
     strategy_name: str = "Nifty & Sensex VWAP Intraday Seller (No-HA-Bias Variant)"
@@ -276,8 +289,10 @@ class Config:
     # comparison correctly stay True with nothing to catch up to yet -- not a
     # bug in the comparison itself, but retrying every 5s scheduler tick
     # while waiting serves no purpose but hammering the broker. This cooldown
-    # paces retries to roughly the real 1m-bar cadence instead.
-    option_signal_refresh_cooldown_sec: float = 20.0
+    # paces retries to roughly the real 1m-bar cadence instead. Placeholder
+    # default -- __post_init__ derives the real value from
+    # candle_interval_fetch (2026-08-18 code review fix).
+    option_signal_refresh_cooldown_sec: float = 0.0
 
     lot_multiplier: int = 1
     max_trades_per_leg_per_day: int = 3
@@ -376,6 +391,18 @@ class Config:
     log_level: int = logging.INFO
 
     test_mode: bool = os.getenv("STRATEGY_TEST_MODE", "0") == "1"
+
+    def __post_init__(self):
+        # 2026-08-18 code review fix: option_signal_refresh_cooldown_sec
+        # used to be a bare literal (20.0) with no formula tying it to
+        # candle_interval_fetch, even though its own docstring already
+        # explained it was meant to roughly match the broker's real 1m-bar
+        # reporting cadence -- a future retune of candle_interval_fetch
+        # would silently leave the cooldown un-rescaled. Derived here
+        # instead: roughly 1/3 of the raw fetch interval, short enough to
+        # notice a borderline-late broker bar within the same candle,
+        # long enough to still pace retries during a genuine reporting lag.
+        self.option_signal_refresh_cooldown_sec = _parse_interval_minutes(self.candle_interval_fetch) * 60 / 3
 
 
 config = Config()
@@ -1631,6 +1658,10 @@ class StrategyEngine:
         self.execution_id = execution_id  # this process run's number -- see main()
         self._option_signal_cache: dict[str, OptionSignal] = {}
         self._option_signal_refresh: dict[str, datetime] = {}
+        # Which last_closed_boundary each leg's cooldown timer currently
+        # covers -- see _get_option_signal's cooldown_elapsed computation
+        # (2026-08-18 code review fix).
+        self._option_signal_cooldown_boundary: dict[str, datetime] = {}
         # report_pnl_tick()'s throttled REST fallback -- see
         # config.pnl_rest_fallback_interval_sec's docstring. Keyed by
         # leg_key; cleared on leg close alongside the leg's other
@@ -1989,12 +2020,29 @@ class StrategyEngine:
         # untouched on a None/failed result), so this paces retries during
         # the "fetched fine, just still stale" case this fix targets --
         # a genuine fetch failure still retries every tick, same as before.
+        #
+        # 2026-08-18 code review fix: the cooldown must NOT apply across a
+        # real boundary transition, only to repeated retries WITHIN the
+        # same last_closed_boundary. Without the boundary check below, a
+        # success that happens to land just before a candle closes (broker
+        # reporting lag can put it within cooldown_elapsed's own window of
+        # the next boundary flip) would suppress the very next cycle's
+        # genuinely-new fetch for up to cooldown_elapsed's own window --
+        # trading on a stale signal for a real fraction of the new candle,
+        # on a strategy whose entries/exits are decided from it. Tracking
+        # which boundary the cooldown timer covers (updated at dispatch
+        # time, not on success) means a fresh boundary always bypasses the
+        # cooldown for its first attempt, and only subsequent retries
+        # against that SAME boundary get paced.
+        cooldown_boundary = self._option_signal_cooldown_boundary.get(leg_key)
         cooldown_elapsed = (
             last is None
+            or cooldown_boundary != last_closed_boundary
             or (now - last).total_seconds() >= config.option_signal_refresh_cooldown_sec
         )
         if due and cooldown_elapsed and leg_key not in self._option_signal_refresh_pending:
             self._option_signal_refresh_pending.add(leg_key)
+            self._option_signal_cooldown_boundary[leg_key] = last_closed_boundary
             self._fill_executor.submit(
                 self._refresh_option_signal_bg, leg_key, symbol, exchange, ltp
             )
