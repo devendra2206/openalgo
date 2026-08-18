@@ -338,6 +338,12 @@ class LegPosition:
     error_message: str = ""
     error_since: str = ""
     manual_exit_px: Optional[float] = None
+    # Broker-confirmed average fill price from poll_fill()'s own orderstatus
+    # read, captured by _watch_exit_fill once the exit order actually fills
+    # -- _finalize_exit prefers this over a fresh live-quote read (2026-08-18:
+    # found entry_px/exit price here were never corrected from poll_fill's
+    # real fill at all -- see docs/CUSTOMIZATIONS.md's "recurring gotcha").
+    exit_fill_px: Optional[float] = None
 
 
 # Single conceptual leg -- unlike the reference script's LEG_KEYS-keyed dict
@@ -1705,14 +1711,22 @@ class StrategyEngine:
 
     def _watch_entry_fill(self, inst: InstrumentConfig, order_id: str, symbol: str, quantity: int):
         try:
-            poll_fill(self.client, order_id, self.env.strategy_tag, symbol, inst.options_exchange,
-                      "BUY", quantity)
+            fill = poll_fill(self.client, order_id, self.env.strategy_tag, symbol, inst.options_exchange,
+                              "BUY", quantity)
             pos = self.store.state.position
             if pos.entry_order_id == order_id:
                 pos.entry_filled = True
+                # entry_px was set at position-creation time from a pre-
+                # order LTP/quote estimate -- correct it here to the
+                # broker-confirmed average fill price now that poll_fill
+                # has one (2026-08-18: this was previously never done at
+                # all -- see docs/CUSTOMIZATIONS.md's "recurring gotcha").
+                fill_price = fill.get("average_price") or fill.get("price")
+                if fill_price:
+                    pos.entry_px = float(fill_price)
                 self.store.state.trade_count += 1
                 self._save_state()
-                Log.info(f"[{LEG_KEY}] Entry filled: {symbol}")
+                Log.info(f"[{LEG_KEY}] Entry filled: {symbol}@{pos.entry_px}")
         except OrderNeedsAttention as exc:
             self._enter_error_mode("entry_failed", "resting", exc.order_id, str(exc))
         except (RuntimeError, TimeoutError) as exc:
@@ -1828,11 +1842,14 @@ class StrategyEngine:
 
     def _watch_exit_fill(self, inst: InstrumentConfig, order_id: str, symbol: str, quantity: int):
         try:
-            poll_fill(self.client, order_id, self.env.strategy_tag, symbol, inst.options_exchange,
-                      "SELL", quantity)
+            fill = poll_fill(self.client, order_id, self.env.strategy_tag, symbol, inst.options_exchange,
+                              "SELL", quantity)
             pos = self.store.state.position
             if pos.exit_order_id == order_id:
                 pos.exit_filled = True
+                fill_price = fill.get("average_price") or fill.get("price")
+                if fill_price:
+                    pos.exit_fill_px = float(fill_price)
                 self._save_state()
         except OrderNeedsAttention as exc:
             self._enter_error_mode("exit_failed", "resting", exc.order_id, str(exc))
@@ -1850,6 +1867,8 @@ class StrategyEngine:
         Log.info(f"[{LEG_KEY}] Position closed: {pos.symbol} reason={reason}")
 
         exit_px = pos.manual_exit_px
+        if exit_px is None:
+            exit_px = pos.exit_fill_px
         if exit_px is None:
             exit_px = self.price_stream.get_ltp(pos.symbol, inst.options_exchange,
                                                  max_age=config.ws_stale_seconds)

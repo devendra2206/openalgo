@@ -1199,6 +1199,45 @@ Shoonya: `Nifty_OI_WeeklyBuy_MonthlySell_1`, `Nifty_Sensex_VWAP_NoHA_Intraday_1`
 rigor as any other live-money change — see the entries below for the process
 followed (mock-tested offline before deploy, parity-verified live after).
 
+**IMPORTANT — recurring gotcha for any new/copied strategy script: always
+capture `poll_fill()`'s return value and correct `entry_px`/set an
+`exit_fill_px` field from its real `average_price`/`price` once a fill
+confirms.** `entry_px` is initially set at position-creation time (in
+`_enter_leg`, before the order is even placed) from a cached option-chain
+quote or pre-trade LTP snapshot — an ESTIMATE, not what was actually paid.
+
+**2026-08-18 audit — swept every deployed script's `_watch_entry_fill`/
+`_watch_exit_fill` for this exact bug** (discarding `poll_fill()`'s return
+value instead of reading `average_price`/`price` from it), triggered by a
+live discrepancy caught on `MCX_CrudeOil_EMA34_RSI_ADX_Intraday_1`: platform
+showed entry `450` (the pre-order estimate), Shoonya's real fill was
+`453.10` — a ~0.7%/₹310 error baked into that leg's PnL, the trade-log CSV,
+and `strategy_state*.json` for the leg's entire lifetime. Result:
+
+- **Already correct** (no change needed): `Nifty_Sensex_VWAP_NoHA_Intraday_1`,
+  `Nifty_Sensex_Pivot_EMA_Combined_Intraday_1`, `Nifty_Sensex_Expiry_Batman_1`
+  (fixed 2026-07-26, see below), `Nifty_OI_WeeklyBuy_MonthlySell_1`,
+  `Nifty_Weekly_Intraday_GapSeller_1`, `Nifty_TrendFollow_DualTF1D_1hr_1`,
+  `Nifty_TrendFollow_DualTF45_15_1` (correct since their own authoring).
+- **Had the bug, fixed in this pass**: `MCX_CrudeOil_EMA34_RSI_ADX_Intraday_1`
+  (the one caught live), `MCX_CrudeOil_EMA9_RSI_Intraday_1` (the "hardened
+  reference" template several newer scripts copied structure from — had the
+  bug this whole time), `MCX_CrudeOil_HMRSI_SMA50_Intraday_1`,
+  `CRUDEOIL_VWAP_EMA20_Positional_1` (inherited it from EMA9_RSI when built
+  this session), `Nifty_Sensex_EMA34_RSI_Intraday_1`,
+  `Nifty_Sensex_Pivot_Supertrend_Intraday_1`. Every one of these six now
+  captures `fill = poll_fill(...)` and sets `pos.entry_px` (entry side) /
+  a new `pos.exit_fill_px` field (exit side, consumed by `_finalize_exit`
+  ahead of a fresh WS/REST quote but behind an explicit `manual_exit_px`
+  override) — the same pattern `Nifty_OI_WeeklyBuy_MonthlySell`/`GapSeller`
+  already used. `py_compile`-verified on all six; not yet re-deployed live
+  as of this entry.
+
+**Takeaway: check any NEW or copy-paste-derived strategy script for this
+exact bug before trusting its PnL numbers** — it's silent (no error, no
+warning, just a systematically wrong `entry_px`/`exit_px` baked into every
+downstream number for that leg) and was clearly not confined to one script.
+
 **2026-08-10 additions:**
 - **`with_quotes=False` added to `optionchain()` calls** in the two
   strikes-only-consumer strategies live at the time (`Nifty_Sensex_VWAP_NoHA_Intraday_1`,

@@ -507,6 +507,12 @@ class LegPosition:
     error_message: str = ""         # last exception text, for display
     error_since: str = ""           # ISO timestamp this error (or its latest re-entry) began
     manual_exit_px: Optional[float] = None  # set only by a "manual" resolution on an exit
+    # Broker-confirmed average fill price from poll_fill()'s own orderstatus
+    # read, captured by _watch_exit_fill once the exit order actually fills
+    # -- _finalize_exit prefers this over a fresh live-quote read (2026-08-18:
+    # found entry_px/exit price here were never corrected from poll_fill's
+    # real fill at all -- see docs/CUSTOMIZATIONS.md's "recurring gotcha").
+    exit_fill_px: Optional[float] = None
 
 
 @dataclass
@@ -2020,15 +2026,23 @@ class StrategyEngine:
                            symbol: str, quantity: int):
         strategy_tag = self.env.strategy_tag
         try:
-            poll_fill(self.client, order_id, strategy_tag, symbol, inst.options_exchange,
-                      "SELL", quantity)
+            fill = poll_fill(self.client, order_id, strategy_tag, symbol, inst.options_exchange,
+                              "SELL", quantity)
             leg = self.store.state.legs[leg_key]
             pos = leg.position
             if pos.entry_order_id == order_id:  # guard vs. a superseded/stale order
                 pos.entry_filled = True
+                # entry_px was set at position-creation time from a pre-
+                # order LTP/quote estimate -- correct it here to the
+                # broker-confirmed average fill price now that poll_fill
+                # has one (2026-08-18: this was previously never done at
+                # all -- see docs/CUSTOMIZATIONS.md's "recurring gotcha").
+                fill_price = fill.get("average_price") or fill.get("price")
+                if fill_price:
+                    pos.entry_px = float(fill_price)
                 leg.trade_count += 1
                 self._save_state()
-                Log.info(f"[{leg_key}] Entry filled: {symbol}")
+                Log.info(f"[{leg_key}] Entry filled: {symbol}@{pos.entry_px}")
         except OrderNeedsAttention as exc:
             self._enter_error_mode(leg_key, "entry_failed", "resting", exc.order_id, str(exc))
         except (RuntimeError, TimeoutError) as exc:
@@ -2196,12 +2210,15 @@ class StrategyEngine:
                           symbol: str, quantity: int):
         strategy_tag = self.env.strategy_tag
         try:
-            poll_fill(self.client, order_id, strategy_tag, symbol, inst.options_exchange,
-                      "BUY", quantity)
+            fill = poll_fill(self.client, order_id, strategy_tag, symbol, inst.options_exchange,
+                              "BUY", quantity)
             leg = self.store.state.legs[leg_key]
             pos = leg.position
             if pos.exit_order_id == order_id:  # guard vs. a superseded/stale order
                 pos.exit_filled = True
+                fill_price = fill.get("average_price") or fill.get("price")
+                if fill_price:
+                    pos.exit_fill_px = float(fill_price)
                 self._save_state()
         except OrderNeedsAttention as exc:
             self._enter_error_mode(leg_key, "exit_failed", "resting", exc.order_id, str(exc))
@@ -2226,15 +2243,20 @@ class StrategyEngine:
 
         # Trade log (separate from state.json, which resets leg.position to
         # blank right below and would otherwise lose this trade's record
-        # entirely). exit_px is an LTP-based estimate, same basis entry_px
-        # already uses -- best-effort only, doesn't block the exit if quotes
-        # are briefly unavailable. A "Manually Completed" exit resolution
-        # sets manual_exit_px -- the user's real fill price is authoritative
+        # entirely). A "Manually Completed" exit resolution sets
+        # manual_exit_px -- the user's real fill price is authoritative
         # there, not a fresh quote (see
-        # docs/prd/python-strategies-order-error-recovery.md). Otherwise
-        # WS-cache-first, REST fallback -- same pattern used everywhere else
-        # price is read, instead of an unconditional REST round-trip here.
+        # docs/prd/python-strategies-order-error-recovery.md). Next,
+        # exit_fill_px -- the broker-confirmed average fill price
+        # _watch_exit_fill's poll_fill() actually got back -- is preferred
+        # over a fresh quote (2026-08-18: this priority tier didn't exist
+        # before -- see docs/CUSTOMIZATIONS.md's "recurring gotcha" note).
+        # WS-cache/REST-quote fallback only applies to the "manual"
+        # resolution path or the rare case poll_fill's response carried
+        # neither average_price nor price.
         exit_px = pos.manual_exit_px
+        if exit_px is None:
+            exit_px = pos.exit_fill_px
         if exit_px is None:
             exit_px = self.price_stream.get_ltp(pos.symbol, inst.options_exchange,
                                                  max_age=config.ws_stale_seconds)
