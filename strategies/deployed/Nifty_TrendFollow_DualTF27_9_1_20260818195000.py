@@ -273,7 +273,17 @@ class Config:
     sl_pct: float = 0.01                # 1% of entry futures price
 
     # --- Rollover ---------------------------------------------------------
-    rollover_days_after_start: int = 21  # calendar days since contract became front-month
+    # Calendar day-OF-MONTH threshold (NOT a days-since-start duration --
+    # confirmed explicitly 2026-08-19): once today.day >= this value, roll
+    # to next month's contract, regardless of which day the current
+    # contract itself expires or when it was first listed.
+    rollover_days_after_start: int = 21
+    # Rollover force-close-and-reopen never fires before this time each day
+    # (user-confirmed 2026-08-19) -- 09:15-09:30 is often thin/volatile
+    # right at market open, so wait a few minutes before force-closing and
+    # reopening a position on rollover. Bypassed when config.test_mode is
+    # True, same as every other timing gate in this file.
+    rollover_earliest_time: time = time(9, 30)
 
     product: str = "NRML"               # can carry the synthetic combo overnight (unlike MIS)
     price_type: str = "LIMIT"
@@ -729,14 +739,21 @@ class PriceStream:
             now = datetime.now(IST)
             stale_threshold = _current_ws_stale_threshold()
             stale_instruments = []
+            # Both reads under ONE lock acquisition -- previously two separate
+            # with self._lock: blocks let remove_instruments() run in the gap
+            # between them (e.g. a position closing mid-watchdog-pass), so
+            # all_keys could miss a symbol that stale_instruments still
+            # referenced from the earlier snapshot -- causing a spurious
+            # resubscribe of a symbol the strategy no longer holds (found via
+            # code review, 2026-08-19; harmless correctness-wise since
+            # nothing reads get_ltp() for a symbol outside the current
+            # position, but a real race nonetheless).
             with self._lock:
+                all_keys = set(self._instruments.keys())
                 for key, inst in self._instruments.items():
                     entry = self._cache.get(key)
                     if entry is None or (now - entry[1]).total_seconds() > stale_threshold:
                         stale_instruments.append(inst)
-
-            with self._lock:
-                all_keys = set(self._instruments.keys())
             stale_keys = {(i["symbol"], i["exchange"]) for i in stale_instruments}
             for key in all_keys:
                 if key in stale_keys:
@@ -1633,6 +1650,25 @@ class StrategyEngine:
         self._lock = threading.RLock()
         self._big_last_boundary: Optional[str] = None
         self._small_last_boundary: Optional[str] = None
+        # Day-boundary cache for _handle_rollover -- without this it re-calls
+        # client.expiry() (options + futures, 2 real broker calls) on EVERY
+        # run_cycle (every config.scheduler_interval=10s, unthrottled),
+        # unlike _refresh_signals' candle-boundary-aware pattern. Set only on
+        # a SUCCESSFUL resolution so a transient API failure retries on the
+        # very next cycle rather than being silently deferred a full day.
+        self._rollover_last_checked_day: Optional[str] = None
+        # Reentrancy guard for backgrounded _open_position -- same shape as
+        # Nifty_OI_WeeklyBuy_MonthlySell's _eval_pending/_dispatch_eval_bg
+        # (that file's own comment documents the real production problem
+        # this pattern fixes: _open_position's multi-round-trip optionchain()/
+        # quotes()/placeorder() sequence running inline on run_cycle's own
+        # thread can outlast scheduler_interval, and APScheduler
+        # (max_instances=1) then silently SKIPS the next tick rather than
+        # overlapping -- delaying SL/handoff/signal-exit monitoring of the
+        # position that's mid-open by up to that overrun). Only one position
+        # can ever exist at a time here, so a bool suffices (no per-leg-key
+        # set needed like the multi-leg OI strategy).
+        self._entry_pending: bool = False
         self._last_signal_big: Optional[TimeframeSignal] = None
         self._last_signal_small: Optional[TimeframeSignal] = None
         self._last_error_repush = 0.0
@@ -1678,17 +1714,61 @@ class StrategyEngine:
         contract to actually roll (see resolve_current_month_context).
         Force-close BLOCKS (wait_for_fills=True) until every leg is
         genuinely confirmed closed before a fresh position is opened --
-        never races an async fill-watcher against a fresh entry."""
+        never races an async fill-watcher against a fresh entry.
+
+        Gated to run at most once per calendar day (day-boundary cache,
+        _rollover_last_checked_day) -- run_cycle calls this unconditionally
+        every cycle (every config.scheduler_interval=10s), and without this
+        gate it would call client.expiry() (2 real broker calls: options +
+        futures) every single cycle, unthrottled, all day -- unlike
+        _refresh_signals' candle-boundary-aware pattern. Cache is set only
+        on a SUCCESSFUL resolution, so a transient API failure retries on
+        the very next cycle rather than being silently deferred a full day."""
+        if self._entry_pending:
+            # An entry is currently being opened on a background thread --
+            # self.state.instance.position.direction is still empty until
+            # that finishes, so we cannot yet tell whether there's about to
+            # be a position on the OUTGOING contract that rollover needs to
+            # force-close. Defer this cycle entirely (found via code review,
+            # 2026-08-19: proceeding here on a stale "flat" reading would
+            # skip force-closing a position the bg thread is about to write,
+            # leaving it open on the old contract past rollover). Harmless
+            # to defer -- rollover doesn't need split-second timing, only
+            # to happen once the entry has actually resolved one way or the
+            # other, which the very next cycle will see.
+            return
+        if not config.test_mode and datetime.now(IST).time() < config.rollover_earliest_time:
+            return  # 09:15-09:30 is often thin/volatile -- wait before force-closing/reopening
+        today_str = datetime.now(IST).strftime("%Y-%m-%d")
+        if self._rollover_last_checked_day == today_str:
+            return
         try:
             ctx = resolve_current_month_context(self.client, self.inst, self.state.contract_start_date)
         except Exception as exc:
             Log.warning(f"resolve_current_month_context failed -- keeping last-known contract "
                         f"({self.state.futures_symbol or 'none'}): {exc}")
             return
+        self._rollover_last_checked_day = today_str
         prior_expiry = self.state.expiry_compact
+        prior_futures_symbol = self.state.futures_symbol
         self.state.expiry_compact = ctx["expiry_compact"]
         self.state.futures_symbol = ctx["futures_symbol"]
         self.state.contract_start_date = ctx["contract_start_date"]
+        if ctx["futures_symbol"] != prior_futures_symbol:
+            # WS subscription for the futures symbol -- covers both the
+            # cold-start resolution (prior_futures_symbol == "") and a
+            # genuine month-to-month rollover (unsubscribe the old symbol,
+            # subscribe the new one). Without this, run_cycle's
+            # price_stream.get_ltp() for the futures price would ALWAYS
+            # return None (never-subscribed cache), silently falling
+            # through to a REST fetch_symbol_ltp() call on every single
+            # cycle forever -- the WS-first design was never actually wired
+            # up for this symbol.
+            if prior_futures_symbol:
+                self.price_stream.remove_instruments(
+                    [{"symbol": prior_futures_symbol, "exchange": self.inst.futures_exchange}])
+            self.price_stream.add_instruments(
+                [{"symbol": ctx["futures_symbol"], "exchange": self.inst.futures_exchange}])
         if not ctx["rolled_today"] or prior_expiry == ctx["expiry_compact"]:
             self._save_state()
             return
@@ -1963,9 +2043,9 @@ class StrategyEngine:
             self._save_state()
         big_key_at_entry = (self._last_signal_big.candle_key
                             if (tf_label == "SMALL" and self._last_signal_big is not None) else "")
-        self._open_position(direction=direction, timeframe=tf_label, futures_px=futures_px,
-                             sl_high=sig.high_prev1, sl_low=sig.low_prev1,
-                             big_candle_key_at_entry=big_key_at_entry)
+        self._dispatch_open_position_bg(direction=direction, timeframe=tf_label, futures_px=futures_px,
+                                        sl_high=sig.high_prev1, sl_low=sig.low_prev1,
+                                        big_candle_key_at_entry=big_key_at_entry)
         return True
 
     # -------------------------------------------------------------------
@@ -1977,12 +2057,50 @@ class StrategyEngine:
     # never wiped from state before that, so a stuck leg still has a home
     # for Retry/Cancel/Manual to act on.
     # -------------------------------------------------------------------
+    def _dispatch_open_position_bg(self, direction: str, timeframe: str, futures_px: float,
+                                    sl_high: float, sl_low: float, big_candle_key_at_entry: str = ""):
+        """Dispatches _open_position to _bg_executor instead of running it
+        inline on run_cycle's own thread -- see _entry_pending's own comment
+        (in __init__) for the specific production problem this fixes,
+        matching Nifty_OI_WeeklyBuy_MonthlySell's _dispatch_eval_bg pattern.
+        Reentrancy-guarded via _entry_pending; run_cycle's own flat-branch
+        also checks _entry_pending before reaching either call site that
+        leads here, so a duplicate dispatch should never actually happen --
+        this check is a second, defensive layer, not the only one."""
+        if self._entry_pending:
+            Log.warning("_dispatch_open_position_bg called while an entry was already pending "
+                        "-- skipping duplicate dispatch.")
+            return
+        self._entry_pending = True
+
+        def _run():
+            try:
+                self._open_position(direction=direction, timeframe=timeframe, futures_px=futures_px,
+                                    sl_high=sl_high, sl_low=sl_low,
+                                    big_candle_key_at_entry=big_candle_key_at_entry)
+            except Exception as exc:
+                Log.exception(f"Backgrounded _open_position failed: {exc}")
+            finally:
+                self._entry_pending = False
+
+        self._bg_executor.submit(_run)
+
     def _open_position(self, direction: str, timeframe: str, futures_px: float,
                         sl_high: float, sl_low: float, big_candle_key_at_entry: str = ""):
         atm_strike = resolve_atm_strike(futures_px)
         chain_strikes = fetch_chain_strikes(self.client, self.inst, self.state.expiry_compact)
         hedge_strike = resolve_hedge_strike(futures_px, direction, chain_strikes)
         legs = build_combo_legs(self.inst, self.state.expiry_compact, direction, atm_strike, hedge_strike)
+
+        # WS subscription for every resolved leg -- without this, report_pnl_tick
+        # (every config.pnl_tick_interval=0.8s while a position is open) and any
+        # other LTP read against these symbols would ALWAYS miss the price_stream
+        # cache and fall back to a REST quotes() call every single time, since
+        # nothing else in this file ever subscribes option-leg symbols.
+        self.price_stream.add_instruments([
+            {"symbol": leg.symbol, "exchange": self.inst.options_exchange}
+            for leg in legs.values() if leg.symbol
+        ])
 
         self.execution_id += 1
         entry_time = datetime.now(IST).isoformat()
@@ -1992,7 +2110,17 @@ class StrategyEngine:
                 Log.warning(f"OPEN {direction}: leg '{role}' has no resolved symbol (hedge strike "
                             f"unavailable?) -- skipping this leg only, other legs still placed.")
                 continue
-            ltp = fetch_symbol_ltp(self.client, leg.symbol, self.inst.options_exchange) or 0.0
+            # WS-first, REST fallback -- same pattern as everywhere else in this
+            # file. In practice this specific read usually still falls to REST
+            # (the leg was JUST subscribed above, so the WS feed hasn't had time
+            # to push a tick yet) -- but a re-entry onto a symbol still
+            # subscribed from moments ago can genuinely hit the WS cache, and
+            # it's never wrong to check first.
+            ltp = self.price_stream.get_ltp(leg.symbol, self.inst.options_exchange,
+                                            _current_ws_stale_threshold())
+            if ltp is None:
+                ltp = fetch_symbol_ltp(self.client, leg.symbol, self.inst.options_exchange)
+            ltp = ltp or 0.0
             try:
                 orderid, is_dry = place(self.client, self.env.strategy_tag, leg.symbol,
                                          self.inst.options_exchange, leg.action, leg.quantity,
@@ -2081,7 +2209,14 @@ class StrategyEngine:
             if not leg.symbol or not leg.entry_filled or leg.exit_filled or leg.error_state:
                 continue
             close_action = "SELL" if leg.action == "BUY" else "BUY"
-            ltp = fetch_symbol_ltp(self.client, leg.symbol, self.inst.options_exchange) or leg.entry_px
+            # WS-first -- unlike the entry-price read, this leg has been
+            # subscribed since entry (some time ago), so the WS cache is
+            # genuinely likely to be populated here.
+            ltp = self.price_stream.get_ltp(leg.symbol, self.inst.options_exchange,
+                                            _current_ws_stale_threshold())
+            if ltp is None:
+                ltp = fetch_symbol_ltp(self.client, leg.symbol, self.inst.options_exchange)
+            ltp = ltp or leg.entry_px
             try:
                 orderid, is_dry = place(self.client, self.env.strategy_tag, leg.symbol,
                                          self.inst.options_exchange, close_action, leg.quantity,
@@ -2129,6 +2264,15 @@ class StrategyEngine:
                 return False
             if leg.entry_filled and not leg.exit_filled:
                 return False
+        # Unsubscribe every leg's WS feed now that the position is fully flat --
+        # matches add_instruments() in _open_position; without this, closed
+        # legs would sit in price_stream's subscription set forever (never
+        # unbounded in practice since only ~3 symbols are tracked per trade,
+        # but a stale/leaked subscription regardless).
+        self.price_stream.remove_instruments([
+            {"symbol": getattr(pos, role).symbol, "exchange": self.inst.options_exchange}
+            for role in _LEG_ROLES if getattr(pos, role).symbol
+        ])
         with self._lock:
             Log.info(f"CLOSE {pos.direction} #{pos.execution_id} fully finalized "
                      f"(reason={reason}) dry_run={config.dry_run}")
@@ -2186,7 +2330,16 @@ class StrategyEngine:
             for role in _LEG_ROLES:
                 leg = getattr(pos, role)
                 if leg.symbol and leg.entry_filled and not leg.exit_filled:
-                    ltp = fetch_symbol_ltp(self.client, leg.symbol, self.inst.options_exchange)
+                    # WS-first, REST only as fallback -- same pattern as the
+                    # futures LTP read in run_cycle. Previously called
+                    # fetch_symbol_ltp() (REST) unconditionally here, every
+                    # config.pnl_tick_interval=0.8s per open leg -- exactly
+                    # the "per-tick REST poll" the plan's API-efficiency
+                    # section says never to do.
+                    ltp = self.price_stream.get_ltp(leg.symbol, self.inst.options_exchange,
+                                                    _current_ws_stale_threshold())
+                    if ltp is None:
+                        ltp = fetch_symbol_ltp(self.client, leg.symbol, self.inst.options_exchange)
                     unreal = 0.0
                     if ltp is not None:
                         unreal = ((ltp - leg.entry_px) if leg.action == "BUY"
@@ -2232,6 +2385,20 @@ class StrategyEngine:
         self._refresh_force_exit_check_bg()
         if not self._force_exit_cache:
             return False
+        if self._entry_pending:
+            # An entry is currently being opened on a background thread --
+            # pos.direction is still empty until that finishes, so we can't
+            # yet tell whether there's about to be a position that needs
+            # force-closing. Do NOT consume _force_exit_cache or ack here --
+            # leaving it True means _refresh_force_exit_check_bg() re-arms
+            # this same check on the very next cycle, once the entry has
+            # actually resolved (found via code review, 2026-08-19: acking
+            # "no position" here while an entry was moments from landing
+            # would silently leave a real position open despite the
+            # platform believing force-exit succeeded).
+            Log.warning("FORCE EXIT requested while an entry is still being opened in the "
+                        "background -- deferring until it resolves.")
+            return True
         self._force_exit_cache = False  # consume -- avoid re-triggering before the ack lands
         if not pos.direction:
             try:
@@ -2634,6 +2801,9 @@ class StrategyEngine:
             if not entry_cutoff_active:
                 return  # no re-entry recheck / fresh search past the daily cutoff
 
+            if self._entry_pending:
+                return  # a backgrounded _open_position from an earlier cycle hasn't finished yet
+
             if self._check_sl_reentry(futures_px):
                 return
 
@@ -2645,9 +2815,9 @@ class StrategyEngine:
             direction, tf_label, sig = found
             big_key_at_entry = (self._last_signal_big.candle_key
                                 if (tf_label == "SMALL" and self._last_signal_big is not None) else "")
-            self._open_position(direction=direction, timeframe=tf_label, futures_px=futures_px,
-                                sl_high=sig.high_prev1, sl_low=sig.low_prev1,
-                                big_candle_key_at_entry=big_key_at_entry)
+            self._dispatch_open_position_bg(direction=direction, timeframe=tf_label, futures_px=futures_px,
+                                            sl_high=sig.high_prev1, sl_low=sig.low_prev1,
+                                            big_candle_key_at_entry=big_key_at_entry)
         except Exception as exc:
             Log.exception(f"run_cycle failed: {exc}")
             self._bg_executor.submit(notify_telegram_error, self.env,
