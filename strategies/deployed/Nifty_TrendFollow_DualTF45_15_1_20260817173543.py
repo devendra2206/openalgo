@@ -2307,7 +2307,23 @@ class StrategyEngine:
                     if ltp is not None:
                         unreal = ((ltp - leg.entry_px) if leg.action == "BUY"
                                   else (leg.entry_px - ltp)) * leg.quantity
-                    open_positions.append({"symbol": leg.symbol, "role": role, "pnl": unreal})
+                    # Full field set matching the platform's expected shape
+                    # (confirmed against MCX_CrudeOil_EMA34_RSI_ADX_Intraday's
+                    # and Nifty_OI_WeeklyBuy_MonthlySell's report_pnl_tick) --
+                    # this previously only sent symbol/role/pnl, leaving
+                    # Qty/Entry/Direction/Entry Time/LTP-Exit blank
+                    # ("undefined") on both the strategy card's "Today's
+                    # Trades" panel and the Trades detail page (confirmed
+                    # live via screenshots, 2026-08-20, on the 27m/9m sibling
+                    # instance). "role" -> "leg_key" to match the field name
+                    # the UI actually reads.
+                    open_positions.append({
+                        "leg_key": role, "symbol": leg.symbol,
+                        "direction": "LONG" if leg.action == "BUY" else "SHORT",
+                        "quantity": leg.quantity if leg.action == "BUY" else -leg.quantity,
+                        "entry_price": leg.entry_px, "current_price": ltp, "pnl": unreal,
+                        "entry_time": pos.entry_time, "execution_id": pos.execution_id,
+                    })
         try:
             report_pnl_to_platform(self.env, self.state.today_realized_pnl, open_positions)
         except Exception as exc:
