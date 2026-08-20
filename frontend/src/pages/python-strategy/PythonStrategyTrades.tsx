@@ -333,6 +333,14 @@ export default function PythonStrategyTrades() {
                   <TableHead>PnL (pts)</TableHead>
                   <TableHead>PnL (₹)</TableHead>
                   <TableHead>Reason</TableHead>
+                  {trades[0]?.entry_timeframe !== undefined && <TableHead>Entry TF</TableHead>}
+                  {trades[0]?.controlling_timeframe_at_exit !== undefined && (
+                    <TableHead>Exit TF</TableHead>
+                  )}
+                  {trades[0]?.handoff_occurred !== undefined && <TableHead>Handoff</TableHead>}
+                  {trades[0]?.sl_candle_reference_high !== undefined && (
+                    <TableHead>SL Levels</TableHead>
+                  )}
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -378,6 +386,28 @@ export default function PythonStrategyTrades() {
                       <TableCell className="text-xs text-muted-foreground">
                         {isOpen ? 'still open' : trade.exit_reason}
                       </TableCell>
+                      {trades[0]?.entry_timeframe !== undefined && (
+                        <TableCell className="text-xs">{trade.entry_timeframe ?? '--'}</TableCell>
+                      )}
+                      {trades[0]?.controlling_timeframe_at_exit !== undefined && (
+                        <TableCell className="text-xs">
+                          {isOpen ? '--' : (trade.controlling_timeframe_at_exit ?? '--')}
+                        </TableCell>
+                      )}
+                      {trades[0]?.handoff_occurred !== undefined && (
+                        <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
+                          {trade.handoff_occurred === 'True'
+                            ? formatTradeTime(trade.handoff_ts)
+                            : '--'}
+                        </TableCell>
+                      )}
+                      {trades[0]?.sl_candle_reference_high !== undefined && (
+                        <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
+                          {trade.sl_candle_reference_high === undefined
+                            ? '--'
+                            : `${trade.sl_pct_amount}@${trade.sl_pct_level} / H${trade.sl_candle_reference_high}-L${trade.sl_candle_reference_low}`}
+                        </TableCell>
+                      )}
                     </TableRow>
                   )
                 })}

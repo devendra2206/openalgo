@@ -82,6 +82,17 @@ export interface Trade {
   exit_reason: string
   execution_id: string
   status?: 'OPEN' | 'CLOSED'
+  // Dual-timeframe strategies only (e.g. TFTT) -- present when the CSV
+  // trade log carries these columns, absent (undefined) for every other
+  // strategy's rows. See PythonStrategyTrades.tsx's conditional TableHead.
+  entry_timeframe?: string
+  controlling_timeframe_at_exit?: string
+  handoff_occurred?: string
+  handoff_ts?: string
+  sl_pct_amount?: string
+  sl_pct_level?: string
+  sl_candle_reference_high?: string
+  sl_candle_reference_low?: string
   [key: string]: string | undefined
 }
 

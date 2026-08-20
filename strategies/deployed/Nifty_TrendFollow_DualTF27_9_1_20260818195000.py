@@ -1491,7 +1491,7 @@ _trade_log_queue: "queue.Queue" = queue.Queue()
 _trade_log_thread: Optional[threading.Thread] = None
 _trade_log_thread_lock = threading.Lock()
 
-_TRADE_LOG_HEADER = ["execution_id", "direction", "role", "symbol", "action", "quantity",
+_TRADE_LOG_HEADER = ["execution_id", "direction", "leg", "symbol", "action", "quantity",
                      "entry_time", "entry_px", "exit_time", "exit_px", "pnl_points",
                      "pnl_rupees", "exit_reason", "is_dry_run",
                      "entry_timeframe", "controlling_timeframe_at_exit", "handoff_occurred", "handoff_ts",
@@ -2417,6 +2417,16 @@ class StrategyEngine:
                         "quantity": leg.quantity if leg.action == "BUY" else -leg.quantity,
                         "entry_price": leg.entry_px, "current_price": ltp, "pnl": unreal,
                         "entry_time": pos.entry_time, "execution_id": pos.execution_id,
+                        # Live counterparts of the CSV trade log's dual-TF
+                        # audit columns -- lets the Trades UI show these
+                        # while a position is still OPEN, not only after it
+                        # closes. controlling_timeframe/SL levels are
+                        # intentionally NOT sent live: they can still change
+                        # before close (handoff/ratchet), so only the CSV's
+                        # frozen-at-close values are trustworthy for those.
+                        "entry_timeframe": pos.entry_timeframe,
+                        "handoff_occurred": "True" if pos.handoff_ts else "False",
+                        "handoff_ts": pos.handoff_ts,
                     })
         try:
             report_pnl_to_platform(self.env, self.state.today_realized_pnl, open_positions)

@@ -891,7 +891,7 @@ def api_get_trades(strategy_id):
         elif execution_id is not None and pos_exec_id != execution_id:
             continue
         pnl = float(pos.get("pnl", 0) or 0)
-        trades.append({
+        trade = {
             "leg": pos.get("leg_key", ""),
             "symbol": pos.get("symbol", ""),
             "quantity": pos.get("quantity", ""),
@@ -905,7 +905,16 @@ def api_get_trades(strategy_id):
             "exit_reason": "",
             "execution_id": pos_exec_id,
             "status": "OPEN",
-        })
+        }
+        # Optional dual-TF audit fields (TFTT-family strategies only) --
+        # included ONLY when the strategy actually sends them, so other
+        # strategies' rows keep these keys genuinely absent (JS
+        # `undefined`, not a present-but-null value) -- the Trades UI's
+        # column-visibility check relies on that distinction.
+        for optional_field in ("entry_timeframe", "handoff_occurred", "handoff_ts"):
+            if optional_field in pos:
+                trade[optional_field] = pos[optional_field]
+        trades.append(trade)
         total_pnl += pnl
 
     return jsonify({"trades": trades, "total_pnl": round(total_pnl, 2)})
