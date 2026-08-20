@@ -211,6 +211,7 @@ def engine(script_module):
     eng = script_module.StrategyEngine.__new__(script_module.StrategyEngine)
     eng.store = _FakeStore()
     eng.ltp_client = None  # never reached: price_stream always supplies a price in these tests
+    eng._signal_cache = {}  # empty by default -- the 4-candle-break check no-ops with no cached signal
     return eng
 
 
@@ -226,7 +227,7 @@ def test_tier1_no_exit_when_neither_check_breached(script_module, engine):
     inst = script_module.INSTRUMENTS[0]
     engine.price_stream = _FakePriceStream({"TESTOPT": 95.0, FUTURES_SYMBOL: 7960.0})
     pos = _pos(script_module, entry_px=100.0, structural_stop_futures_px=7900.0)
-    hit, price = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
+    hit, price, _label = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
     assert hit is False
     print("Tier 1, neither structural nor 15% floor breached -> no exit PASS")
 
@@ -238,7 +239,7 @@ def test_tier1_structural_fires_before_15pct_floor_ce(script_module, engine):
     inst = script_module.INSTRUMENTS[0]
     engine.price_stream = _FakePriceStream({"TESTOPT": 90.0, FUTURES_SYMBOL: 7895.0})
     pos = _pos(script_module, entry_px=100.0, structural_stop_futures_px=7900.0)
-    hit, price = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
+    hit, price, _label = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
     assert hit is True
     assert price == pytest.approx(7900.0), "FAIL: expected the structural level, not the premium floor"
     print("Tier 1 CE, structural fires ahead of the 15% floor PASS")
@@ -251,7 +252,7 @@ def test_tier1_15pct_floor_fires_before_structural_ce(script_module, engine):
     inst = script_module.INSTRUMENTS[0]
     engine.price_stream = _FakePriceStream({"TESTOPT": 84.0, FUTURES_SYMBOL: 7960.0})
     pos = _pos(script_module, entry_px=100.0, structural_stop_futures_px=7800.0)
-    hit, price = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
+    hit, price, _label = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
     assert hit is True
     assert price == pytest.approx(85.0), "FAIL: expected the 15% premium floor (entry_px * 0.85)"
     print("Tier 1 CE, 15% premium floor fires ahead of structural PASS")
@@ -263,7 +264,7 @@ def test_tier1_structural_fires_pe_mirror(script_module, engine):
     inst = script_module.INSTRUMENTS[0]
     engine.price_stream = _FakePriceStream({"TESTOPT": 90.0, FUTURES_SYMBOL: 8020.0})
     pos = _pos(script_module, entry_px=100.0, structural_stop_futures_px=8013.0)
-    hit, price = engine._check_stop_loss("CRUDEOIL_PE", pos, inst, "PE")
+    hit, price, _label = engine._check_stop_loss("CRUDEOIL_PE", pos, inst, "PE")
     assert hit is True
     assert price == pytest.approx(8013.0)
     print("Tier 1 PE, structural (futures above trigger candle's high) fires PASS")
@@ -276,7 +277,7 @@ def test_tier1_pe_not_triggered_by_futures_still_below_high(script_module, engin
     inst = script_module.INSTRUMENTS[0]
     engine.price_stream = _FakePriceStream({"TESTOPT": 95.0, FUTURES_SYMBOL: 7990.0})
     pos = _pos(script_module, entry_px=100.0, structural_stop_futures_px=8013.0)
-    hit, price = engine._check_stop_loss("CRUDEOIL_PE", pos, inst, "PE")
+    hit, price, _label = engine._check_stop_loss("CRUDEOIL_PE", pos, inst, "PE")
     assert hit is False
     print("Tier 1 PE, futures below trigger high (not yet failed) -> no false trigger PASS")
 
@@ -289,7 +290,7 @@ def test_tier1_falls_back_to_flat_floor_when_structural_unset(script_module, eng
     inst = script_module.INSTRUMENTS[0]
     engine.price_stream = _FakePriceStream({"TESTOPT": 84.0, FUTURES_SYMBOL: 7000.0})
     pos = _pos(script_module, entry_px=100.0, structural_stop_futures_px=0.0)
-    hit, price = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
+    hit, price, _label = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
     assert hit is True
     assert price == pytest.approx(85.0)
     print("Tier 1, structural unset (0.0) -> flat 15% floor fallback only PASS")
@@ -303,7 +304,7 @@ def test_tier2_ignores_tier1_checks_once_profit_reaches_guard_activation(script_
     inst = script_module.INSTRUMENTS[0]
     engine.price_stream = _FakePriceStream({"TESTOPT": 111.0, FUTURES_SYMBOL: 7000.0})
     pos = _pos(script_module, entry_px=100.0, structural_stop_futures_px=7939.0, highest_profit_pct=0.12)
-    hit, price = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
+    hit, price, _label = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
     assert hit is False
     assert price == pytest.approx(90.0), "FAIL: expected the flat -10% guard level"
     print("Tier 2 (>=10% profit) ignores tier-1 structural/15% checks PASS")
@@ -313,7 +314,7 @@ def test_tier2_guard_still_fires_on_premium_alone(script_module, engine):
     inst = script_module.INSTRUMENTS[0]
     engine.price_stream = _FakePriceStream({"TESTOPT": 89.0, FUTURES_SYMBOL: 8000.0})
     pos = _pos(script_module, entry_px=100.0, structural_stop_futures_px=7939.0, highest_profit_pct=0.12)
-    hit, price = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
+    hit, price, _label = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
     assert hit is True
     assert price == pytest.approx(90.0)
     print("Tier 2 flat -10% guard still fires correctly on premium alone PASS")
@@ -330,8 +331,107 @@ def test_check_stop_loss_returns_false_when_no_ltp_available(script_module, engi
     original = script_module.fetch_symbol_ltp
     script_module.fetch_symbol_ltp = lambda *a, **k: None
     try:
-        hit, price = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
+        hit, price, _label = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
     finally:
         script_module.fetch_symbol_ltp = original
     assert hit is False and price is None
     print("No LTP available -> (False, None), never acts on a missing quote PASS")
+
+
+# --------------------------------------------------------------------------
+# 2026-08-20: always-on 4-candle-break hard structural floor -- fires
+# BEFORE any tier logic, regardless of highest_profit_pct, driven by
+# InstrumentSignal.four_candle_low/high (the rolling low/high of the last 4
+# fully-closed candle_interval_minutes candles).
+# --------------------------------------------------------------------------
+
+def _signal(script_module, four_candle_low=0.0, four_candle_high=0.0):
+    """Minimal InstrumentSignal -- only four_candle_low/high matter for
+    these tests; every other field is a placeholder value never read by
+    _check_stop_loss."""
+    return script_module.InstrumentSignal(
+        close_prev1=100.0, high_prev1=105.0, low_prev1=95.0,
+        ema_high_prev1=104.0, ema_low_prev1=96.0,
+        rsi_prev1=50.0, adx_prev1=25.0, adx_prev2=24.0, adx_prev3=23.0,
+        vwap_prev1=100.0, ltp=100.0, candle_key="dummy",
+        four_candle_low=four_candle_low, four_candle_high=four_candle_high,
+    )
+
+
+def test_four_candle_break_fires_ce_even_when_tier1_checks_are_not_breached(script_module, engine):
+    """CE: futures breaks the 4-candle low while premium is barely off
+    entry and futures is nowhere near the (single-candle) structural stop
+    or the 15% premium floor -- the 4-candle-break check must still fire,
+    since it's checked before any tier logic, not as a fallback."""
+    inst = script_module.INSTRUMENTS[0]
+    engine.price_stream = _FakePriceStream({"TESTOPT": 99.0, FUTURES_SYMBOL: 7940.0})
+    engine._signal_cache = {inst.name: _signal(script_module, four_candle_low=7950.0)}
+    pos = _pos(script_module, entry_px=100.0, structural_stop_futures_px=7800.0)
+    hit, price, label = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
+    assert hit is True
+    assert price == pytest.approx(7950.0)
+    assert label == "4-candle low break"
+    print("CE: 4-candle low break fires ahead of tier-1 checks PASS")
+
+
+def test_four_candle_break_fires_pe_mirror(script_module, engine):
+    """PE mirror: futures breaks ABOVE the 4-candle high."""
+    inst = script_module.INSTRUMENTS[0]
+    engine.price_stream = _FakePriceStream({"TESTOPT": 99.0, FUTURES_SYMBOL: 8060.0})
+    engine._signal_cache = {inst.name: _signal(script_module, four_candle_high=8050.0)}
+    pos = _pos(script_module, entry_px=100.0, structural_stop_futures_px=8200.0)
+    hit, price, label = engine._check_stop_loss("CRUDEOIL_PE", pos, inst, "PE")
+    assert hit is True
+    assert price == pytest.approx(8050.0)
+    assert label == "4-candle high break"
+    print("PE: 4-candle high break fires ahead of tier-1 checks PASS")
+
+
+def test_four_candle_break_not_triggered_when_futures_still_inside_channel(script_module, engine):
+    inst = script_module.INSTRUMENTS[0]
+    engine.price_stream = _FakePriceStream({"TESTOPT": 99.0, FUTURES_SYMBOL: 7960.0})
+    engine._signal_cache = {inst.name: _signal(script_module, four_candle_low=7950.0, four_candle_high=8050.0)}
+    pos = _pos(script_module, entry_px=100.0, structural_stop_futures_px=7800.0)
+    hit, price, label = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
+    assert hit is False
+    print("CE: futures still inside the 4-candle channel -> no false trigger PASS")
+
+
+def test_four_candle_break_fires_even_in_tier2_tier3_profit_zone(script_module, engine):
+    """Always-on: must fire regardless of highest_profit_pct, even deep in
+    the tier-2/3 premium-trail zone where tier-1's own checks no longer
+    apply."""
+    inst = script_module.INSTRUMENTS[0]
+    engine.price_stream = _FakePriceStream({"TESTOPT": 150.0, FUTURES_SYMBOL: 7940.0})
+    engine._signal_cache = {inst.name: _signal(script_module, four_candle_low=7950.0)}
+    pos = _pos(script_module, entry_px=100.0, structural_stop_futures_px=7800.0, highest_profit_pct=0.60)
+    hit, price, label = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
+    assert hit is True
+    assert price == pytest.approx(7950.0)
+    assert label == "4-candle low break"
+    print("4-candle break fires even deep in the tier-2/3 profit zone PASS")
+
+
+def test_four_candle_break_zero_value_treated_as_unset(script_module, engine):
+    """four_candle_low/high default to 0.0 (e.g. no cached signal has ever
+    been computed for this instrument yet) -- must never be treated as a
+    real, trivially-always-breached level."""
+    inst = script_module.INSTRUMENTS[0]
+    engine.price_stream = _FakePriceStream({"TESTOPT": 99.0, FUTURES_SYMBOL: 100.0})
+    engine._signal_cache = {inst.name: _signal(script_module)}  # both default to 0.0
+    pos = _pos(script_module, entry_px=100.0, structural_stop_futures_px=0.0)
+    hit, price, label = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
+    assert hit is False
+    print("4-candle low/high at dataclass default (0.0) -> never treated as a real level PASS")
+
+
+def test_four_candle_break_no_op_when_signal_cache_empty(script_module, engine):
+    """No signal has ever been cached for this instrument (engine._signal_cache
+    stays at the fixture's empty default) -- the check must no-op rather
+    than raising."""
+    inst = script_module.INSTRUMENTS[0]
+    engine.price_stream = _FakePriceStream({"TESTOPT": 99.0, FUTURES_SYMBOL: 7960.0})
+    pos = _pos(script_module, entry_px=100.0, structural_stop_futures_px=7800.0)
+    hit, price, label = engine._check_stop_loss("CRUDEOIL_CE", pos, inst, "CE")
+    assert hit is False
+    print("Empty signal cache -> 4-candle-break check no-ops cleanly PASS")

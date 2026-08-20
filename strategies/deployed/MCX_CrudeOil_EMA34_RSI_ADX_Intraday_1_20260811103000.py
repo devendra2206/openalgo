@@ -1553,6 +1553,14 @@ class InstrumentSignal:
     vwap_prev1: float
     ltp: float
     candle_key: str
+    # Rolling 4-candle channel (last 4 fully-closed candle_interval_minutes
+    # bars as of this signal refresh) -- 2026-08-20 addition, an always-on
+    # hard structural SL independent of structural_stop_futures_px (which
+    # only looks at the single entry-trigger candle). Recomputed on every
+    # signal refresh, so it rolls forward as new candles close -- see
+    # _check_stop_loss's four-candle-break check.
+    four_candle_low: float = 0.0
+    four_candle_high: float = 0.0
     # 2026-08-14: True when `ltp` above is the closed-candle-close fallback
     # (both WS and REST live-price lookups failed), not a genuine live
     # tick -- see compute_instrument_signal's own comment. entry_condition
@@ -1701,6 +1709,10 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
     vwap = _session_vwap(bars)
 
     candle_key = str(bars.index[-1])
+    # Last 4 fully-closed candles (bars has already had any still-forming
+    # row dropped above) -- warmup_needed guarantees len(bars) is well past 4.
+    four_candle_low = float(low[-4:].min())
+    four_candle_high = float(high[-4:].max())
 
     ltp_is_fallback = False
     if ltp is None:
@@ -1727,6 +1739,7 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
         vwap_prev1=float(vwap[-1]),
         ltp=ltp, candle_key=candle_key,
         ltp_is_fallback=ltp_is_fallback,
+        four_candle_low=four_candle_low, four_candle_high=four_candle_high,
     )
 
     if _last_logged_candle.get(inst.name) != candle_key:
@@ -3085,7 +3098,7 @@ class StrategyEngine:
         return self._pending_action_cache.pop(leg_key, None)
 
     def _check_stop_loss(self, leg_key: str, pos: LegPosition, inst: InstrumentConfig,
-                          option_type: str) -> tuple[bool, Optional[float]]:
+                          option_type: str) -> tuple[bool, Optional[float], str]:
         """Trailing stop-loss check -- see compute_trailing_sl_price() and
         Config.sl_trail_pct/sl_initial_pct for the spec. Checked every run_cycle tick
         (10s), independent of the candle_interval_minutes candle gating that
@@ -3096,9 +3109,20 @@ class StrategyEngine:
         WS-cache-first, REST-fallback price read -- same two-tier pattern
         used everywhere else a live price is needed in this file (e.g.
         _finalize_exit's exit_px read), including the two-sided-market
-        liquidity guard on the REST fallback. Returns (False, None) if no
+        liquidity guard on the REST fallback. Returns (False, None, "") if no
         trustworthy price is available this cycle -- never acts on a
         missing/stale quote, same philosophy as the rest of this file.
+
+        2026-08-20: an always-on, hard structural floor checked BEFORE any
+        tier logic below, regardless of highest_profit_pct -- futures LTP
+        breaking the rolling 4-candle channel (low of the last 4 fully-
+        closed candle_interval_minutes candles for CE, high for PE; see
+        InstrumentSignal.four_candle_low/high, recomputed on every signal
+        refresh so it rolls forward as new candles close). Independent of
+        structural_stop_futures_px (which is frozen at entry to just the
+        single entry-trigger candle) -- this one is a live, moving channel
+        that can tighten or widen for the life of the trade. Fires
+        regardless of tier/profit level, same as its name implies.
 
         2026-08-18: tier 1 (below sl_guard_activation_pct profit -- i.e.
         before this leg has ever been meaningfully in profit) now closes
@@ -3127,7 +3151,7 @@ class StrategyEngine:
         if ltp is None:
             ltp = fetch_symbol_ltp(self.ltp_client, pos.symbol, inst.options_exchange, require_two_sided=True)
         if ltp is None or pos.entry_px <= 0:
-            return False, None
+            return False, None, ""
 
         current_profit_pct = (ltp / pos.entry_px) - 1
         old_sl_price = compute_trailing_sl_price(pos.entry_px, pos.highest_profit_pct)
@@ -3138,6 +3162,24 @@ class StrategyEngine:
                 Log.info(f"[{leg_key}] Trailing SL advanced: profit={pos.highest_profit_pct:.2%} "
                           f"-> sl_price={new_sl_price:.2f} (was {old_sl_price:.2f}), ltp={ltp:.2f}")
             self._save_state()
+
+        # Futures LTP -- needed both by the always-on 4-candle-break check
+        # below and by tier 1's structural stop further down.
+        futures_ltp = None
+        futures_symbol = self.store.state.futures_symbol
+        if futures_symbol:
+            futures_ltp = self.price_stream.get_ltp(futures_symbol, inst.options_exchange,
+                                                      max_age=config.ws_stale_seconds)
+            if futures_ltp is None:
+                futures_ltp = fetch_symbol_ltp(self.ltp_client, futures_symbol, inst.options_exchange)
+
+        if futures_ltp is not None:
+            signal = self._signal_cache.get(inst.name)
+            if signal is not None:
+                if option_type == "CE" and signal.four_candle_low > 0 and futures_ltp <= signal.four_candle_low:
+                    return True, signal.four_candle_low, "4-candle low break"
+                if option_type == "PE" and signal.four_candle_high > 0 and futures_ltp >= signal.four_candle_high:
+                    return True, signal.four_candle_high, "4-candle high break"
 
         if pos.highest_profit_pct < config.sl_guard_activation_pct:
             # Tier 1: whichever of the two caps the loss to LESS fires --
@@ -3155,30 +3197,24 @@ class StrategyEngine:
             premium_hit = ltp <= premium_floor
 
             structural_hit = False
-            if pos.structural_stop_futures_px > 0:
-                futures_symbol = self.store.state.futures_symbol
-                futures_ltp = None
-                if futures_symbol:
-                    futures_ltp = self.price_stream.get_ltp(futures_symbol, inst.options_exchange,
-                                                              max_age=config.ws_stale_seconds)
-                    if futures_ltp is None:
-                        futures_ltp = fetch_symbol_ltp(self.ltp_client, futures_symbol, inst.options_exchange)
-                if futures_ltp is not None:
-                    structural_hit = (futures_ltp <= pos.structural_stop_futures_px if option_type == "CE"
-                                       else futures_ltp >= pos.structural_stop_futures_px)
+            if pos.structural_stop_futures_px > 0 and futures_ltp is not None:
+                structural_hit = (futures_ltp <= pos.structural_stop_futures_px if option_type == "CE"
+                                   else futures_ltp >= pos.structural_stop_futures_px)
 
             if structural_hit or premium_hit:
                 # Report whichever level actually triggered -- if both did
                 # (checked the same cycle), the premium floor is reported
                 # since that's the one _exit_leg's caller can display in
                 # the same units as ltp for a sanity check.
-                return True, (premium_floor if premium_hit else pos.structural_stop_futures_px)
-            return False, None
+                if premium_hit:
+                    return True, premium_floor, "ltp<=sl_price"
+                return True, pos.structural_stop_futures_px, "futures-level breach"
+            return False, None, ""
 
         # Tier 2/3 (already meaningfully profitable at some point) -- the
         # original premium-based trail, unchanged.
         sl_price = compute_trailing_sl_price(pos.entry_px, pos.highest_profit_pct)
-        return ltp <= sl_price, sl_price
+        return ltp <= sl_price, sl_price, "ltp<=sl_price"
 
     def _exit_leg(self, leg_key: str, inst: InstrumentConfig, reason: str = "unknown"):
         leg = self.store.state.legs[leg_key]
@@ -3818,20 +3854,14 @@ class StrategyEngine:
                         # Trailing stop-loss -- checked every cycle using LIVE price,
                         # independent of the candle_interval_minutes candle gating that
                         # governs exit_condition above (see _check_stop_loss's own docstring).
-                        sl_hit, sl_price = self._check_stop_loss(leg_key, leg.position, inst, option_type)
+                        sl_hit, sl_price, sl_label = self._check_stop_loss(leg_key, leg.position, inst, option_type)
                         if exit_condition or sl_hit or exit_already_committed:
                             if not exit_already_committed:
                                 if sl_hit and not exit_condition:
-                                    # Which price sl_price is measured in depends on which
-                                    # of tier 1's two checks fired -- FUTURES points if it
-                                    # matches structural_stop_futures_px, option premium
-                                    # otherwise (the 15% floor, or tier 2/3). See
+                                    # sl_label identifies which of the checks fired --
+                                    # 4-candle break, structural (entry-trigger candle),
+                                    # or premium-based (15% floor / tier 2/3 trail). See
                                     # _check_stop_loss's own docstring.
-                                    is_structural = (
-                                        leg.position.structural_stop_futures_px > 0
-                                        and sl_price == leg.position.structural_stop_futures_px
-                                    )
-                                    sl_label = "futures-level breach" if is_structural else "ltp<=sl_price"
                                     Log.info(f"[{leg_key}] Stop-loss hit -> closing. "
                                               f"{sl_label}={sl_price:.2f} (highest_profit_pct="
                                               f"{leg.position.highest_profit_pct:.2%})")
