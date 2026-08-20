@@ -302,6 +302,13 @@ class Config:
     hedge_otm_pct_low: float = 0.02     # 2%
     hedge_otm_pct_high: float = 0.03    # 3% -- midpoint used for hedge strike selection
     lot_multiplier: int = 1             # 1 lot per instance, per explicit instruction
+    # strikes-each-side-of-ATM bound for optionchain() -- unbounded (the old
+    # default) fans the broker out to a live quote per listed strike (this
+    # SDK's optionchain() always returns quotes, no with_quotes toggle) and
+    # measured 30+s in production 2026-08-20 (vs MCX_CrudeOil's strike_count=1,
+    # which needs only the ATM strike). Hedge band tops out at 3% OTM, which
+    # at 50pt NIFTY strike spacing is ~15 strikes out -- 20 leaves headroom.
+    chain_strike_count: int = 20
 
     # --- Stop-loss ------------------------------------------------------
     sl_pct: float = 0.01                # 1% of entry futures price
@@ -1324,12 +1331,21 @@ def fetch_chain_strikes(client, inst: InstrumentConfig, expiry_compact: str) -> 
     optionchain() signature -- confirmed 2026-08-17 via `help(api.
     optionchain)`: keyword-only `underlying=`/`exchange=`/`expiry_date=`/
     `strike_count=`, response shape `{"chain": [{"strike":..., "ce":{...},
-    "pe":{...}}, ...]}`. An earlier draft assumed a `symbol=`/`expiry=`/
-    `with_quotes=` shape that does not exist on this SDK version and would
-    have raised TypeError on the very first call -- there is no
-    with_quotes toggle; optionchain() always returns live quotes, which is
-    harmless here since only `strike` is read, never a premium."""
-    resp = client.optionchain(underlying=inst.name, exchange=inst.options_exchange, expiry_date=expiry_compact)
+    "pe":{...}}, ...]}`.
+
+    strike_count=config.chain_strike_count + with_quotes=False -- confirmed
+    2026-08-20 by tracing the full path (openalgo/options.py forwards
+    with_quotes via **kwargs -> restx_api/option_chain.py's OptionChainSchema
+    -> services/option_chain_service.py Step 8), unlike an earlier, WRONG
+    conclusion this week that with_quotes didn't exist on the installed SDK.
+    with_quotes=False skips the broker multiquote fan-out entirely (strikes/
+    symbols/lotsize come straight from cache/DB, prices left at 0) -- safe
+    here since only `strike` is ever read, never a premium. Unbounded +
+    with_quotes=True (the old code) measured 32.53s live 2026-08-20 (244
+    rows, fanning a quote call per strike) vs 5.80s at strike_count=20 alone;
+    adding with_quotes=False removes the quote fan-out altogether."""
+    resp = client.optionchain(underlying=inst.name, exchange=inst.options_exchange, expiry_date=expiry_compact,
+                               strike_count=config.chain_strike_count, with_quotes=False)
     if _is_error_response(resp) and resp.get("status") != "success":
         Log.warning(f"optionchain() error for {inst.name} {expiry_compact}: {resp}")
         return []
@@ -1773,7 +1789,13 @@ class StrategyEngine:
             # 2026-08-19). Harmless to defer -- rollover doesn't need
             # split-second timing.
             return
-        if not config.test_mode and datetime.now(IST).time() < config.rollover_earliest_time:
+        # The 09:30 gate below must NEVER block the cold-start resolution of
+        # self.state.futures_symbol -- run_cycle's own guard means the WHOLE
+        # strategy does nothing at all, every cycle, until futures_symbol is
+        # set. Confirmed live, 2026-08-20: gating the entire function blocked
+        # everything from market open until 09:30 on a fresh deployment.
+        cold_start = not self.state.futures_symbol
+        if not cold_start and not config.test_mode and datetime.now(IST).time() < config.rollover_earliest_time:
             return  # 09:15-09:30 is often thin/volatile -- wait before force-closing/reopening
         today_str = datetime.now(IST).strftime("%Y-%m-%d")
         if self._rollover_last_checked_day == today_str:
