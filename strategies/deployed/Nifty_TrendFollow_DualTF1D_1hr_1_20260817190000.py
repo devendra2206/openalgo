@@ -1266,8 +1266,21 @@ def compute_timeframe_signal(client, inst: InstrumentConfig, futures_symbol: str
     if bars.empty:
         Log.warning(f"[{label}] resample to {interval_minutes}m produced no bars.")
         return None
-    if len(bars) >= 2:
-        bars = bars.iloc[:-1]   # drop the still-forming last candle
+    # Drop the last row ONLY if it's genuinely still forming (its own
+    # implied close time is still in the future) -- NOT unconditionally by
+    # position. Confirmed live, 2026-08-20 (27m/9m sibling instance) via
+    # server logs: when a refresh fetch lands right at a candle boundary
+    # before the broker has published even the first native bar of the NEW
+    # bucket, the resampled last row IS the fully-CLOSED previous bucket --
+    # blindly dropping it by position discarded a whole interval of real,
+    # usable data, self-correcting only at the NEXT boundary (a silent,
+    # consistent one-full-interval-late signal). Mirrors the implied-close-
+    # vs-wall-clock check already used correctly in the accelerated replay
+    # harness's _slice_futures_bars.
+    if len(bars):
+        implied_close = bars.index[-1].to_pydatetime() + timedelta(minutes=interval_minutes)
+        if implied_close > datetime.now(IST):
+            bars = bars.iloc[:-1]
 
     warmup_needed = max(config.macd_slow + config.macd_signal, config.supertrend_period) + 3
     if len(bars) < warmup_needed:
