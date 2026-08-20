@@ -232,9 +232,21 @@ INSTRUMENTS = [
 
 @dataclass
 class Config:
-    strategy_name: str = "NIFTY Trend-Follow Dual-TF (27m/9m) Synthetic-Combo"
-    version: str = "1.0.0"
-    instance_id: str = "27m_9m"   # distinguishes Instance C from Instances A/B in logs/state file names
+    strategy_name: str = "NIFTY Trend-Follow Dual-TF (27m/9m) Synthetic-Combo -- SL Frozen"
+    version: str = "2.0.0"
+    # v2, 2026-08-20: rollover reopen and post-SL re-entry now carry forward
+    # the ORIGINAL entry_futures_px/sl_reference_high/sl_reference_low from
+    # the very first entry of a logical trade, instead of computing a fresh
+    # SL reference each time. Strikes still re-resolve off the CURRENT
+    # futures price as before (unaffected) -- only the SL anchor/candle
+    # reference is frozen. See _open_position's new sl_anchor_* params and
+    # their two call sites (_handle_rollover, _check_sl_reentry). Built as a
+    # separate file (not editing the deployed v1) specifically to A/B compare
+    # via a 4-year backtest before deciding whether to port this into the
+    # live script.
+    instance_id: str = "27m_9m_v2_slfrozen"   # distinguishes this backtest variant's state/log files
+                                                # from the deployed v1 instance -- never deploy both
+                                                # under the same instance_id, they'd collide on state.json
 
     # --- Dual timeframe -------------------------------------------------
     big_timeframe_minutes: int = 27
@@ -461,6 +473,12 @@ class InstanceState:
     sl_reentry_direction: str = ""     # "long" | "short" -- direction to re-enter if signal is unchanged
     sl_reentry_timeframe: str = ""     # which TF to re-enter on
     sl_reentry_futures_px: float = 0.0  # original entry price to wait for recovery to
+    # v2 SL-frozen: the ORIGINAL candle-break reference (from the very first
+    # entry of this logical trade), captured alongside sl_reentry_futures_px
+    # the moment SL/signal-exit fires -- carried forward into a post-SL
+    # re-entry unchanged, instead of v1's fresh recovery-candle reference.
+    sl_reentry_sl_high: float = 0.0
+    sl_reentry_sl_low: float = 0.0
     last_sl_exit_candle_boundary: str = ""  # same-candle whipsaw guard, see reference scripts
 
 
@@ -885,6 +903,8 @@ class StateStore:
         inst.sl_reentry_direction = inst_raw.get("sl_reentry_direction", "")
         inst.sl_reentry_timeframe = inst_raw.get("sl_reentry_timeframe", "")
         inst.sl_reentry_futures_px = inst_raw.get("sl_reentry_futures_px", 0.0)
+        inst.sl_reentry_sl_high = inst_raw.get("sl_reentry_sl_high", 0.0)
+        inst.sl_reentry_sl_low = inst_raw.get("sl_reentry_sl_low", 0.0)
         inst.last_sl_exit_candle_boundary = inst_raw.get("last_sl_exit_candle_boundary", "")
 
         pos_raw = inst_raw.get("position", {})
@@ -920,6 +940,8 @@ class StateStore:
                 "sl_reentry_direction": inst.sl_reentry_direction,
                 "sl_reentry_timeframe": inst.sl_reentry_timeframe,
                 "sl_reentry_futures_px": inst.sl_reentry_futures_px,
+                "sl_reentry_sl_high": inst.sl_reentry_sl_high,
+                "sl_reentry_sl_low": inst.sl_reentry_sl_low,
                 "last_sl_exit_candle_boundary": inst.last_sl_exit_candle_boundary,
                 "position": asdict(inst.position),
             },
@@ -1883,6 +1905,15 @@ class StrategyEngine:
             Log.info(f"ROLLOVER: an open {pos.direction} position exists on the outgoing contract -- "
                      f"force-closing (all legs) before reopening on the new month.")
             direction = pos.direction
+            # v2 SL-frozen: capture the ORIGINAL SL anchor/candle reference
+            # before _close_position() wipes pos back to flat -- carried
+            # forward into the reopened position unchanged, per explicit
+            # instruction (2026-08-20): "rollover reopen -- old SL stays as
+            # is." Strikes still re-resolve off the current futures price
+            # below (unaffected).
+            frozen_sl_anchor_px = pos.entry_futures_px
+            frozen_sl_high = pos.sl_reference_high
+            frozen_sl_low = pos.sl_reference_low
             fully_closed = self._close_position(reason="rollover", wait_for_fills=True)
             if not fully_closed:
                 Log.warning("ROLLOVER: not every leg confirmed closed (one or more needs Retry/"
@@ -1896,22 +1927,27 @@ class StrategyEngine:
                             "this cycle, will retry entry search normally on the next cycle.")
                 self._save_state()
                 return
-            # Fresh reference candle on the NEW month's futures for the SL
-            # reference -- reopening with sl_high==sl_low==futures_px would
-            # trip the candle-break SL on the very next unfavorable tick.
-            # Reopen always monitors on BIG by default (matches the
-            # entry-search convention of always starting on Big; there's no
-            # real "entry candle" for a rollover-triggered reopen the way
-            # there is for a genuine Big/Small entry search).
-            ref_sig = compute_timeframe_signal(self.client, self.inst, ctx["futures_symbol"],
-                                               config.big_timeframe_minutes, "BIG",
-                                               config.big_fetch_interval, config.history_lookback_days)
-            sl_high = ref_sig.high_prev1 if ref_sig is not None else futures_px
-            sl_low = ref_sig.low_prev1 if ref_sig is not None else futures_px
-            # Strikes are re-derived FRESH inside _open_position from
-            # futures_px -- never carried forward from the old contract.
+            # v2 SL-frozen: reopen carries forward the ORIGINAL SL anchor
+            # price and candle reference captured above, NOT a fresh
+            # reference candle on the new month's futures (that was v1's
+            # behavior -- see the sibling deployed file for the original
+            # "fresh reference candle" version). Reopen always monitors on
+            # BIG by default (matches the entry-search convention of always
+            # starting on Big; there's no real "entry candle" for a
+            # rollover-triggered reopen the way there is for a genuine
+            # Big/Small entry search).
+            # Strikes are still re-derived FRESH inside _open_position from
+            # the current futures_px -- only the SL anchor/reference is frozen.
+            # 2026-08-20: apply the same breach-reflect correction here too --
+            # a carried reference from many rollovers/re-entries back can be
+            # stale relative to the (also carried, unchanged) anchor price.
+            # Confirmed via backtest: without this, ~5-15% of carried
+            # references end up on the wrong side of their own anchor.
+            frozen_sl_high, frozen_sl_low = _correct_breached_sl_reference(
+                direction, frozen_sl_anchor_px, frozen_sl_high, frozen_sl_low)
             self._open_position(direction=direction, timeframe="BIG", futures_px=futures_px,
-                                sl_high=sl_high, sl_low=sl_low, big_candle_key_at_entry="")
+                                sl_high=frozen_sl_high, sl_low=frozen_sl_low, big_candle_key_at_entry="",
+                                sl_anchor_futures_px=frozen_sl_anchor_px)
         self._save_state()
 
     # -------------------------------------------------------------------
@@ -2007,8 +2043,16 @@ class StrategyEngine:
                 Log.info(f"HANDOFF: Big timeframe candle closed and agrees with the open {pos.direction} "
                          f"position -- handing monitoring + SL reference to BIG.")
                 pos.controlling_timeframe = "BIG"
-                pos.sl_reference_high = big.high_prev1
-                pos.sl_reference_low = big.low_prev1
+                # 2026-08-20: apply the same breach-reflect correction here
+                # too -- the Big candle just closed covers a much wider
+                # window than the position's own (unchanged) entry price,
+                # so it can easily land on the wrong side of it. Confirmed
+                # via backtest: 170/441 handed-off trades (38.5%) had an
+                # invalid post-handoff reference before this fix.
+                new_high, new_low = _correct_breached_sl_reference(
+                    pos.direction, pos.entry_futures_px, big.high_prev1, big.low_prev1)
+                pos.sl_reference_high = new_high
+                pos.sl_reference_low = new_low
                 pos.handoff_ts = datetime.now(IST).isoformat()
                 just_handed_off = True
             else:
@@ -2063,6 +2107,11 @@ class StrategyEngine:
                 inst_state.sl_reentry_direction = pos.direction
                 inst_state.sl_reentry_timeframe = pos.controlling_timeframe
                 inst_state.sl_reentry_futures_px = pos.entry_futures_px
+                # v2 SL-frozen: capture the original candle reference too --
+                # used by _check_sl_reentry to keep it frozen through the
+                # re-entry, instead of v1's fresh recovery-candle reference.
+                inst_state.sl_reentry_sl_high = pos.sl_reference_high
+                inst_state.sl_reentry_sl_low = pos.sl_reference_low
                 self._save_state()
             self._close_position(reason=reason)
             return True
@@ -2102,6 +2151,8 @@ class StrategyEngine:
             inst_state.sl_reentry_direction = pos.direction
             inst_state.sl_reentry_timeframe = pos.controlling_timeframe
             inst_state.sl_reentry_futures_px = pos.entry_futures_px
+            inst_state.sl_reentry_sl_high = pos.sl_reference_high
+            inst_state.sl_reentry_sl_low = pos.sl_reference_low
             self._save_state()
         self._close_position(reason="signal_exit")
         return True
@@ -2146,9 +2197,22 @@ class StrategyEngine:
             self._save_state()
         big_key_at_entry = (self._last_signal_big.candle_key
                             if (tf_label == "SMALL" and self._last_signal_big is not None) else "")
+        # v2 SL-frozen: re-entry carries forward the ORIGINAL SL anchor price
+        # and candle reference captured when the SL/signal-exit fired, NOT a
+        # fresh reference off the recovery-moment candle (sig.high_prev1/
+        # low_prev1 -- that was v1's behavior, see the sibling deployed
+        # file). Strikes still re-resolve off the current futures_px inside
+        # _open_position, unaffected.
+        # 2026-08-20: apply the same breach-reflect correction here too --
+        # a reference frozen when SL fired can be stale relative to the
+        # (also frozen, unchanged) anchor price by the time recovery fires.
+        reentry_sl_high, reentry_sl_low = _correct_breached_sl_reference(
+            direction, inst_state.sl_reentry_futures_px, inst_state.sl_reentry_sl_high, inst_state.sl_reentry_sl_low)
         self._dispatch_open_position_bg(direction=direction, timeframe=tf_label, futures_px=futures_px,
-                                        sl_high=sig.high_prev1, sl_low=sig.low_prev1,
-                                        big_candle_key_at_entry=big_key_at_entry)
+                                        sl_high=reentry_sl_high,
+                                        sl_low=reentry_sl_low,
+                                        big_candle_key_at_entry=big_key_at_entry,
+                                        sl_anchor_futures_px=inst_state.sl_reentry_futures_px)
         return True
 
     # -------------------------------------------------------------------
@@ -2161,7 +2225,8 @@ class StrategyEngine:
     # for Retry/Cancel/Manual to act on.
     # -------------------------------------------------------------------
     def _dispatch_open_position_bg(self, direction: str, timeframe: str, futures_px: float,
-                                    sl_high: float, sl_low: float, big_candle_key_at_entry: str = ""):
+                                    sl_high: float, sl_low: float, big_candle_key_at_entry: str = "",
+                                    sl_anchor_futures_px: Optional[float] = None):
         """Dispatches _open_position to _bg_executor instead of running it
         inline on run_cycle's own thread -- see _entry_pending's own comment
         (in __init__) for the specific production problem this fixes,
@@ -2180,7 +2245,8 @@ class StrategyEngine:
             try:
                 self._open_position(direction=direction, timeframe=timeframe, futures_px=futures_px,
                                     sl_high=sl_high, sl_low=sl_low,
-                                    big_candle_key_at_entry=big_candle_key_at_entry)
+                                    big_candle_key_at_entry=big_candle_key_at_entry,
+                                    sl_anchor_futures_px=sl_anchor_futures_px)
             except Exception as exc:
                 Log.exception(f"Backgrounded _open_position failed: {exc}")
             finally:
@@ -2189,7 +2255,16 @@ class StrategyEngine:
         self._bg_executor.submit(_run)
 
     def _open_position(self, direction: str, timeframe: str, futures_px: float,
-                        sl_high: float, sl_low: float, big_candle_key_at_entry: str = ""):
+                        sl_high: float, sl_low: float, big_candle_key_at_entry: str = "",
+                        sl_anchor_futures_px: Optional[float] = None):
+        """v2 SL-frozen change: strikes ALWAYS resolve off the current
+        futures_px (unaffected -- a rollover/re-entry still needs a real,
+        current ATM/hedge strike). sl_anchor_futures_px, when given by the
+        caller (rollover reopen / post-SL re-entry), is the ORIGINAL entry
+        price from the very first entry of this logical trade -- used for
+        entry_futures_px (hence the 1% SL threshold) INSTEAD of futures_px.
+        A fresh entry passes sl_anchor_futures_px=None, so futures_px is
+        used for both strikes AND the SL anchor, unchanged from v1."""
         atm_strike = resolve_atm_strike(futures_px)
         chain_strikes = fetch_chain_strikes(self.client, self.inst, self.state.expiry_compact)
         hedge_strike = resolve_hedge_strike(futures_px, direction, chain_strikes)
@@ -2238,9 +2313,10 @@ class StrategyEngine:
             else:
                 self._fill_executor.submit(self._watch_entry_fill, role, leg)
 
+        sl_anchor_px = sl_anchor_futures_px if sl_anchor_futures_px is not None else futures_px
         pos = CombinedPosition(
             direction=direction, core_call=legs["core_call"], core_put=legs["core_put"], hedge=legs["hedge"],
-            entry_time=entry_time, entry_futures_px=futures_px, controlling_timeframe=timeframe,
+            entry_time=entry_time, entry_futures_px=sl_anchor_px, controlling_timeframe=timeframe,
             entry_timeframe=timeframe, big_candle_key_at_entry=big_candle_key_at_entry,
             sl_reference_high=sl_high, sl_reference_low=sl_low,
             expiry_compact=self.state.expiry_compact, execution_id=self.execution_id, is_dry_run=config.dry_run,
@@ -2249,9 +2325,10 @@ class StrategyEngine:
             self.state.instance.position = pos
             self.state.instance.trade_count_today += 1
             self._save_state()
+        frozen_note = f" (SL frozen from original entry={sl_anchor_px:.2f})" if sl_anchor_futures_px is not None else ""
         Log.info(f"OPEN {direction} #{self.execution_id} on {timeframe}: futures_px={futures_px:.2f} "
                  f"ATM={atm_strike} hedge_strike={hedge_strike} expiry={self.state.expiry_compact} "
-                 f"dry_run={config.dry_run}")
+                 f"dry_run={config.dry_run}{frozen_note}")
 
     def _watch_entry_fill(self, role: str, leg: "OptionLeg"):
         self._pending_fills.add(role)
