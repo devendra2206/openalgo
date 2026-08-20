@@ -1223,6 +1223,28 @@ note under "How to sync with upstream" above) — a manual
 `cd frontend && npm run build` is needed on deploy before the new Trades
 columns are visible.
 
+**Sixth bug, found later the same day while manually verifying live PnL**:
+`build_combo_legs()` set every leg's `quantity` to `config.lot_multiplier`
+(`1`) directly — sent as-is to `client.placeorder()` and used directly in
+the strategy's own PnL math. `placeorder()`'s `quantity` is real SHARE
+count, not a lot multiplier (confirmed against
+`Nifty_OI_WeeklyBuy_MonthlySell`'s own `quantity=65` — its own comment:
+"NIFTY's current lot size == 1 lot"); there is no platform-side automatic
+lot conversion, contradicting an earlier, never-actually-verified comment
+on `build_combo_legs` that claimed there was. Impact if ever deployed live
+(`dry_run=False`): real 1-share option orders, which NFO doesn't allow
+(whole lots only) — every real order would likely be rejected outright.
+Impact in dry-run: every PnL figure the strategy reported all day (trade
+log, `report_pnl_tick`, every UI panel) was under-reported by a factor of
+65 versus what a real position would show. Fixed with a new
+`config.nifty_lot_size=65` (`docs/prompt/LotSize.md`), `qty =
+lot_multiplier * nifty_lot_size` in all 3 instances. Verified offline
+(dry run, no live calls): `build_combo_legs()` now returns `quantity=65`
+for every leg across all three instances. Note: the position already open
+on the 27m/9m instance at fix time keeps its already-persisted
+`quantity=1` until it closes and reopens — this only affects entries
+placed after redeploy.
+
 Low conflict risk for the 3 strategy scripts (fork-only files, not tracked
 by upstream at all). Low-to-moderate for `strategy_reporting/server.py`
 and `PythonStrategyTrades.tsx`/`python-strategy.ts` — small, additive,
