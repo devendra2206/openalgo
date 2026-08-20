@@ -1299,34 +1299,6 @@ def resolve_hedge_strike(futures_px: float, direction: str, chain_strikes: list)
     return min(pool, key=lambda s: abs(s - band_mid))
 
 
-def _correct_breached_sl_reference(direction: str, entry_futures_px: float,
-                                    sl_high: float, sl_low: float) -> tuple[float, float]:
-    """FRESH ENTRY ONLY (2026-08-20 fix): the reference candle (sig.high_prev1/
-    low_prev1) is the last CLOSED candle of whichever timeframe drove the
-    entry -- correctly timeframe-matched already (BIG entry -> BIG candle,
-    SMALL entry -> SMALL candle; irrelevant which one, same correction
-    either way). But entry_futures_px is the LIVE tick price at decision
-    time, not that candle's own close -- live price can drift past the
-    candle's own high/low in the time since it closed. Confirmed via a
-    3.2-year backtest (2026-08-20): 105 of ~2196 fresh entries had the
-    candle reference already on the WRONG side of the live entry price
-    (e.g. a LONG's sl_reference_low sitting ABOVE its own entry price) --
-    the trade is technically born already past its own candle-break stop.
-
-    Fix: when breached, reflect the reference to the correct side of entry,
-    preserving the SAME distance the candle originally implied (not an
-    arbitrary new distance, not discarding the candle's own volatility
-    read) -- gap = how far past its own stop entry already is;
-    new_reference = entry_futures_px -/+ gap."""
-    if direction == "LONG" and sl_low >= entry_futures_px:
-        gap = sl_low - entry_futures_px
-        sl_low = entry_futures_px - gap
-    elif direction == "SHORT" and sl_high <= entry_futures_px:
-        gap = entry_futures_px - sl_high
-        sl_high = entry_futures_px + gap
-    return sl_high, sl_low
-
-
 def fetch_chain_strikes(client, inst: InstrumentConfig, expiry_compact: str) -> list:
     """Listed strikes only. Uses the REAL installed openalgo SDK's
     optionchain() signature -- confirmed 2026-08-17 via `help(api.
@@ -2943,12 +2915,8 @@ class StrategyEngine:
             direction, tf_label, sig = found
             big_key_at_entry = (self._last_signal_big.candle_key
                                 if (tf_label == "SMALL" and self._last_signal_big is not None) else "")
-            # Fresh-entry-only breach correction -- see _correct_breached_sl_reference's
-            # own docstring. Applies regardless of whether tf_label is BIG or SMALL.
-            entry_sl_high, entry_sl_low = _correct_breached_sl_reference(
-                direction, futures_px, sig.high_prev1, sig.low_prev1)
             self._dispatch_open_position_bg(direction=direction, timeframe=tf_label, futures_px=futures_px,
-                                            sl_high=entry_sl_high, sl_low=entry_sl_low,
+                                            sl_high=sig.high_prev1, sl_low=sig.low_prev1,
                                             big_candle_key_at_entry=big_key_at_entry)
         except Exception as exc:
             Log.exception(f"run_cycle failed: {exc}")
