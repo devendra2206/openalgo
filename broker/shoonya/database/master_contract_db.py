@@ -55,6 +55,44 @@ def delete_symtoken_table():
     db_session.commit()
 
 
+def drop_incomplete_rows(df, exchange, required=("brsymbol", "name")):
+    """Drops rows missing the fields needed to build an OpenAlgo symbol,
+    called right after the column rename and before any string transform
+    runs on them.
+
+    Shoonya's raw symbol files ship placeholder rows that carry a Token but
+    blank Symbol/TradingSymbol/Expiry columns (NFO_symbols.txt alone has
+    ~18 at the top of the file). Past process_shoonya_nfo_data's own
+    dropna (added 2026-08-07 for that exchange only, see that function),
+    every OTHER exchange's processor still ran its brsymbol-based string
+    transforms (extract_name/extract_instrument_type/get_openalgo_symbol
+    etc.) directly on these NaN values -- raising TypeError and aborting
+    the ENTIRE master_contract_download() (all exchanges), not just the
+    one with the dirty row. copy_from_dataframe's own dropna is a final
+    guard but never reached in that case, since the crash happens earlier,
+    inside the processor itself.
+
+    Args:
+        df: DataFrame with columns already renamed to the schema names.
+        exchange: Exchange name, used for logging only.
+        required: Columns that must be present and non-null.
+
+    Returns:
+        DataFrame containing only the usable rows.
+    """
+    subset = [column for column in required if column in df.columns]
+    if not subset:
+        return df
+
+    cleaned = df.dropna(subset=subset)
+    dropped = len(df) - len(cleaned)
+    if dropped:
+        logger.warning(
+            f"Skipping {dropped} incomplete {exchange} rows with blank {'/'.join(subset)}"
+        )
+    return cleaned.copy()
+
+
 def copy_from_dataframe(df):
     logger.info("Performing Bulk Insert")
     # Convert DataFrame to a list of dictionaries
@@ -183,6 +221,9 @@ def process_shoonya_nse_data(output_path):
 
     # Rename columns to match your schema
     df.columns = ["exchange", "token", "lotsize", "name", "brsymbol", "instrumenttype", "tick_size"]
+
+    # Drop placeholder rows before any string transform runs on a NaN
+    df = drop_incomplete_rows(df, "NSE")
 
     # Add missing columns to ensure DataFrame matches the database structure
     df["symbol"] = df["brsymbol"]  # Initialize 'symbol' with 'brsymbol'
@@ -447,6 +488,9 @@ def process_shoonya_cds_data(output_path):
         df["token"] > 100
     ]  # Filter out CDS tokens with less than 100 digits to avioid dummy entries or index values that are not actual CDS tokens
 
+    # Drop placeholder rows before any string transform runs on a NaN
+    df = drop_incomplete_rows(df, "CDS")
+
     # Add missing columns to ensure DataFrame matches the database structure
     df["expiry"] = df["expiry"].fillna("")  # Fill expiry with empty strings if missing
     df["strike"] = df["strike"].fillna("-1")  # Fill strike with -1 if missing
@@ -574,6 +618,9 @@ def process_shoonya_mcx_data(output_path):
         "tick_size",
     ]
 
+    # Drop placeholder rows before any string transform runs on a NaN
+    df = drop_incomplete_rows(df, "MCX")
+
     # Add missing columns to ensure DataFrame matches the database structure
     df["expiry"] = df["expiry"].fillna("")  # Fill expiry with empty strings if missing
     df["strike"] = df["strike"].fillna("-1")  # Fill strike with -1 if missing
@@ -684,6 +731,9 @@ def process_shoonya_bse_data(output_path):
 
     # Rename columns to match your schema
     df.columns = ["exchange", "token", "lotsize", "name", "brsymbol", "instrumenttype", "tick_size"]
+
+    # Drop placeholder rows before any string transform runs on a NaN
+    df = drop_incomplete_rows(df, "BSE")
 
     # Add missing columns to ensure DataFrame matches the database structure
     df["symbol"] = df["brsymbol"]  # Initialize 'symbol' with 'brsymbol'
@@ -821,6 +871,12 @@ def process_shoonya_bfo_data(output_path):
         "strike",
         "tick_size",
     ]
+
+    # BFO re-derives 'name' from the trading symbol via extract_name below,
+    # so only brsymbol is required -- extract_name/extract_instrument_type
+    # would otherwise raise TypeError on a NaN brsymbol and abort the
+    # entire master_contract_download() (all exchanges), not just BFO.
+    df = drop_incomplete_rows(df, "BFO", required=("brsymbol",))
 
     # Add missing columns to ensure DataFrame matches the database structure
     df["expiry"] = df["expiry"].fillna("")  # Fill expiry with empty strings if missing
