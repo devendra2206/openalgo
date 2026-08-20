@@ -260,6 +260,13 @@ class Config:
     hedge_otm_pct_low: float = 0.02     # 2%
     hedge_otm_pct_high: float = 0.03    # 3% -- midpoint used for hedge strike selection
     lot_multiplier: int = 1             # 1 lot per instance, per explicit instruction
+    nifty_lot_size: int = 65            # NIFTY's current lot size (docs/prompt/LotSize.md) --
+                                         # confirmed 2026-08-20 against Nifty_OI_WeeklyBuy_MonthlySell's
+                                         # own quantity=65 that placeorder()'s quantity is real SHARE
+                                         # count, not a lot multiplier -- there is no platform-side
+                                         # auto lot-conversion (an earlier, wrong comment on
+                                         # build_combo_legs claimed there was). qty must be
+                                         # lot_multiplier * nifty_lot_size, never lot_multiplier alone.
     # strikes-each-side-of-ATM bound for optionchain() -- unbounded (the old
     # default) fans the broker out to a live quote per listed strike (this
     # SDK's optionchain() always returns quotes, no with_quotes toggle) and
@@ -1299,11 +1306,21 @@ def build_combo_legs(inst: InstrumentConfig, expiry_compact: str, direction: str
     'LONG' or 'SHORT'.
         LONG  -> Buy ATM Call + Sell ATM Put, hedge = further-OTM Put (BUY)
         SHORT -> Sell ATM Call + Buy ATM Put, hedge = further-OTM Call (BUY)
-    Hedge is always a BUY (it caps risk on the sold leg), quantity always
-    config.lot_multiplier lots (lot size resolved by the platform's
-    place_smartorder/quantity handling the same way every sibling script
-    does -- via get_symbol_info's lotsize, not hardcoded here)."""
-    qty = config.lot_multiplier
+    Hedge is always a BUY (it caps risk on the sold leg).
+
+    quantity = lot_multiplier * nifty_lot_size (real SHARE count) --
+    corrected 2026-08-20. There is NO platform-side automatic lot
+    conversion; placeorder()'s quantity is taken literally as share count
+    (confirmed against Nifty_OI_WeeklyBuy_MonthlySell's own
+    quantity=65 == 1 lot). The previous version sent quantity=
+    config.lot_multiplier (1) directly -- a real 1-SHARE order, which NFO
+    doesn't allow (options trade in whole lots only; a real order would
+    have been rejected outright) -- and used that same wrong quantity for
+    this strategy's own PnL math all along, under-reporting every PnL
+    figure by a factor of nifty_lot_size (65) versus what a real position
+    would show. Found on the 27m/9m sibling instance while manually
+    verifying its live dry-run PnL against a fresh broker quote fetch."""
+    qty = config.lot_multiplier * config.nifty_lot_size
     call_symbol = option_symbol(inst, expiry_compact, atm_strike, "CE")
     put_symbol = option_symbol(inst, expiry_compact, atm_strike, "PE")
     if direction == "LONG":
