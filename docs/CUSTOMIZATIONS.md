@@ -1116,6 +1116,121 @@ the exception (behavior-preserving for everything except this new alert).
 
 ---
 
+## `Nifty_TrendFollow_DualTF*` family + `strategy_reporting/server.py` +
+## `frontend/src/pages/python-strategy/PythonStrategyTrades.tsx` (2026-08-20)
+
+New strategy family: 3 instances of a NIFTY dual-timeframe MACD/SuperTrend
+trend-follower, executed as a synthetic combo (long/short ATM Call+Put +
+further-OTM hedge) on real NIFTY futures signal — `Nifty_TrendFollow_DualTF1D_1hr_1`
+(Big=1Day/Small=1hr), `Nifty_TrendFollow_DualTF45_15_1` (Big=45m/Small=15m),
+`Nifty_TrendFollow_DualTF27_9_1` (Big=27m/Small=9m, deployed live in dry-run
+2026-08-20 — the other two built/tested but not yet deployed as of this date).
+
+**Five bugs found and fixed the same day the 27m/9m instance went live**,
+each confirmed against real production logs/broker data rather than
+inferred (see `strategies/test/` conventions above):
+
+1. `StateStore.save(self.state)` called with an argument `save()` doesn't
+   take — silently aborted every `run_cycle()`. Caught pre-deploy via an
+   accelerated 2-day replay showing 0 trades.
+2. A `rollover_earliest_time=09:30` gate blocked `_handle_rollover()`
+   entirely, including its cold-start resolution of `futures_symbol` that
+   `run_cycle` depends on to do anything — stalled the whole strategy from
+   market open until 09:30 on the actual live deploy. Fixed by exempting
+   cold start from the gate.
+3. `fetch_chain_strikes()`'s `optionchain()` call had no `strike_count`
+   bound — measured 32.53s live (244 strikes, full quote fan-out). Fixed
+   with `strike_count=20, with_quotes=False` (see the `restx_api/option_chain.py`
+   section above — this is a second, independent consumer of that same
+   `with_quotes` plumbing) → ~instant.
+4. `_resample_to_candle_interval` anchored its pandas resample `origin` to
+   `bars.index[0]` (the OLDEST bar in the 10-day warmup fetch) instead of
+   today. Since `1440 mod 27 == 9` (27m doesn't evenly divide a day), this
+   drifted the whole day's candle grid by 9-minute multiples — confirmed
+   live (BIG candles landed on 09:06/09:33 instead of the correct
+   09:15/09:42 grid). Fixed by anchoring to `bars.index[-1]` instead.
+   Applied to all 3 instances for consistency, though only the 27m/9m one
+   was actually affected (1440 divides evenly into 1440/60/45/15).
+5. `compute_timeframe_signal` dropped the last resampled candle
+   unconditionally by position (`bars.iloc[:-1]`), assuming it's always
+   still-forming. When a refresh fetch landed right at a boundary before
+   the broker had published even the first bar of the new bucket, the last
+   row was actually the fully-CLOSED previous candle — dropping it
+   discarded real data, self-correcting only at the next boundary (a
+   silent, consistent one-full-interval-late signal, confirmed via server
+   log: two `history()` calls exactly one interval apart, each reaching
+   data only up to the boundary instant). Fixed by dropping the last row
+   only if its own implied close time is still in the future vs wall-clock
+   now — same pattern independently found and fixed the same day in
+   `MCX_CrudeOil_EMA34_RSI_ADX_Intraday_1` (smaller ~2-3min impact there,
+   masked mostly by that file's `due_for_refresh` retry-cooldown design).
+
+**Separately, a UI gap found while verifying the above**: the "Today's
+Trades" panel and Trades detail page showed `Qty`/`Entry`/`Direction`/
+`Entry Time`/`LTP-Exit` as blank/`undefined` for TFTT. Two causes:
+- `report_pnl_tick()`'s `open_positions` payload only ever sent
+  `{"symbol", "role", "pnl"}` per leg — missing the full field set
+  (`leg_key`/`direction`/`quantity`/`entry_price`/`current_price`/
+  `entry_time`/`execution_id`) that `MCX_CrudeOil_EMA34_RSI_ADX_Intraday`'s
+  and `Nifty_OI_WeeklyBuy_MonthlySell`'s `report_pnl_tick` already send
+  and the frontend already reads (`entry_price`/`current_price` referenced
+  directly in `PythonStrategyPnl.tsx`/`PythonStrategyTrades.tsx`). Fixed
+  in all 3 instances.
+- TFTT's CSV trade log used `"role"` as its leg-identifier column; both
+  sibling scripts and the frontend's `Trade.leg` field use `"leg"`.
+  Renamed in all 3 instances (safe — zero closed trades logged yet at fix
+  time, confirmed live).
+
+**`frontend/src/pages/python-strategy/PythonStrategyTrades.tsx` +
+`frontend/src/types/python-strategy.ts`**: the richer CSV columns added to
+TFTT earlier in August (`entry_timeframe`, `controlling_timeframe_at_exit`,
+`handoff_occurred`/`handoff_ts`, `sl_pct_amount`/`sl_pct_level`,
+`sl_candle_reference_high`/`sl_candle_reference_low`) reached the CSV file
+and the raw `/trades` API response, but the Trades table has a fixed
+column set with no header/cell for any of them — never actually visible.
+Added 4 new conditional columns (Entry TF, Exit TF, Handoff, SL Levels)
+following the existing `Direction` column's pattern: hidden entirely for
+any strategy that doesn't send these fields (column-visibility keyed off
+`trades[0]?.field !== undefined`, not per-row, to avoid cell/column
+misalignment when OPEN rows — from the live snapshot — and CLOSED rows —
+from the CSV — carry different field sets). `Trade` interface gained the
+matching optional fields (already had a `[key: string]: string | undefined`
+index signature, so this is type-safety/autocomplete only, not required
+for the fields to flow through).
+
+**`strategy_reporting/server.py`**: `api_get_trades`'s OPEN-position dict
+builder now conditionally passes through `entry_timeframe`/
+`handoff_occurred`/`handoff_ts` — added with a loop that only sets the key
+when the strategy's payload actually contains it
+(`if optional_field in pos: trade[optional_field] = pos[optional_field]`),
+never with a `None`/empty default. This matters: a JSON key present with
+value `null` is NOT the same as the key being absent (`undefined` in JS)
+for the frontend's `!== undefined` column-visibility check — a default
+value would have made the new columns silently appear (empty) for every
+OTHER strategy too. `controlling_timeframe`/SL levels stay CLOSED-only
+(CSV-sourced) since they can still change before a position actually
+closes (handoff, SL ratchet) — only the CSV's frozen-at-close values are
+trustworthy for those columns.
+
+Verified: `py_compile` on all 4 Python files; a full CSV write/read
+round-trip simulation confirming the renamed `leg` column and new fields
+persist correctly; a simulation of `server.py`'s conditional field
+passthrough confirming a TFTT-shaped payload gets the extra keys and a
+non-TFTT-shaped payload's JSON genuinely lacks them; `tsc -b` and a full
+`npm run build` with zero errors. `frontend/dist/` was deliberately NOT
+rebuilt/committed as part of this change (see `frontend/dist/` conflict
+note under "How to sync with upstream" above) — a manual
+`cd frontend && npm run build` is needed on deploy before the new Trades
+columns are visible.
+
+Low conflict risk for the 3 strategy scripts (fork-only files, not tracked
+by upstream at all). Low-to-moderate for `strategy_reporting/server.py`
+and `PythonStrategyTrades.tsx`/`python-strategy.ts` — small, additive,
+isolated diffs, but see those files' own sections above/below for their
+general conflict-risk profile.
+
+---
+
 ## Frontend
 
 ### `frontend/src/App.tsx` (+6 lines)
