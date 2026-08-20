@@ -1655,17 +1655,29 @@ def compute_instrument_signal(client, inst: InstrumentConfig, futures_symbol: st
         Log.warning(f"[{inst.name}] resample to {config.candle_interval_minutes}m produced no bars "
                     f"from {len(raw_bars)} {config.fetch_interval} bars.")
         return None
-    # Drop the still-forming last candle -- the broker's last bar keeps
-    # updating well past its nominal close, same defensive pattern used
-    # everywhere else in this codebase. Applies post-resample too, for
-    # whatever candle_interval_minutes is currently set to (a bucket built
-    # from an incomplete run of fetch_interval bars is exactly as "still
-    # forming" as a raw still-forming bar would be) -- genuinely load-
-    # bearing now that candle_interval_minutes (9m) != fetch_interval (3m),
-    # since a 9m bucket built from only 1-2 of its 3 constituent 3m bars is
-    # a real partial candle, not just a technicality.
-    if len(bars) >= 2:
-        bars = bars.iloc[:-1]
+    # Drop the last row ONLY if it's genuinely still forming (its own
+    # implied close time is still in the future) -- NOT unconditionally by
+    # position. Confirmed 2026-08-20 on the NIFTY TrendFollow sibling
+    # strategies (same _resample_to_candle_interval + drop-last-row shape):
+    # when a refresh fetch lands right at a candle boundary before the
+    # broker has published even the first native bar of the new bucket, the
+    # resampled last row is actually the fully-CLOSED previous bucket (no
+    # data exists yet to form a later row) -- blindly dropping it by
+    # position discards real, usable data. Here that manifested as a
+    # smaller but still real ~2-3min lag (masked mostly by due_for_refresh's
+    # retry-until-candle_key-actually-advances design above, at
+    # indicator_refresh_cooldown_sec granularity, rather than NIFTY's worse
+    # full-interval-late symptom since that file lacked an equivalent
+    # retry gate) -- confirmed via this file's own live log, 2026-08-20:
+    # every refresh landed a consistent ~144s (2-3 retry cycles) after the
+    # true candle close instead of the ~10s scheduler-tick granularity it
+    # should have. Mirrors the implied-close-vs-wall-clock check used
+    # correctly in the accelerated replay/backtest harnesses elsewhere in
+    # this project.
+    if len(bars):
+        implied_close = bars.index[-1].to_pydatetime() + timedelta(minutes=config.candle_interval_minutes)
+        if implied_close > datetime.now(IST):
+            bars = bars.iloc[:-1]
     # +3 (not +2): entry_condition's ADX-rising gate reads adx[-3], so the
     # warmup floor must guarantee that index exists too, not just adx[-2].
     warmup_needed = max(config.ema_period, config.adx_period) + 3
