@@ -581,8 +581,19 @@ def _resample_to_candle_interval(bars, interval_minutes: int):
     (NOT midnight -- see _current_candle_boundary's own comment for why:
     neither 45 nor 15 evenly divides the 555-minutes-from-midnight session
     start, so both this function and that one must share the identical
-    anchor or they silently disagree on every bucket, all day)."""
-    session_anchor = bars.index[0].normalize() + pd.Timedelta(hours=9, minutes=15) \
+    anchor or they silently disagree on every bucket, all day).
+
+    Anchored to bars.index[-1] (the LATEST/today's bar), not bars.index[0] --
+    bars spans the full history_lookback_days=10 warmup window, so index[0]
+    is ~10 calendar days stale. Harmless here since 1440 (Big, 1 Day) and 60
+    (Small, 1hr) both evenly divide 1440 (minutes/day), so a stale-day
+    origin still lands on the same daily grid -- but the 27m/9m sibling
+    instance confirmed live 2026-08-20 that an interval NOT evenly dividing
+    1440 drifts the whole day's grid by (1440 mod interval) minutes per
+    elapsed day when anchored to a stale index[0] day. Fixed here too to
+    keep this function identical across all three instances and remove the
+    latent risk entirely."""
+    session_anchor = bars.index[-1].normalize() + pd.Timedelta(hours=9, minutes=15) \
         if len(bars) else None
     resampled = bars.resample(f"{interval_minutes}min", origin=session_anchor if session_anchor is not None else "start_day").agg({
         "open": "first", "high": "max", "low": "min", "close": "last",

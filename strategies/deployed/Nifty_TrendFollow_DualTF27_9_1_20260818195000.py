@@ -543,14 +543,29 @@ def _candle_key_boundary(candle_key: str) -> Optional[datetime]:
 
 
 def _resample_to_candle_interval(bars, interval_minutes: int):
-    """Aggregate fetch_interval (15m, broker-native) bars up to
-    candle_interval_minutes (45m or 15m -- 15m is a 1:1 passthrough, 45m is
-    a genuine 3-bar aggregation). origin anchored to the 09:15 session open
-    (NOT midnight -- see _current_candle_boundary's own comment for why:
-    neither 45 nor 15 evenly divides the 555-minutes-from-midnight session
-    start, so both this function and that one must share the identical
-    anchor or they silently disagree on every bucket, all day)."""
-    session_anchor = bars.index[0].normalize() + pd.Timedelta(hours=9, minutes=15) \
+    """Aggregate fetch_interval (3m, broker-native) bars up to
+    candle_interval_minutes (27m or 9m). origin anchored to the 09:15
+    session open (NOT midnight -- see _current_candle_boundary's own
+    comment for why: neither 27 nor 9 evenly divides the 555-minutes-
+    from-midnight session start for 27m specifically -- 555/27 isn't
+    integral -- so this function and that one must share the identical
+    anchor or they silently disagree on every bucket, all day).
+
+    Anchored to bars.index[-1] (the LATEST/today's bar), not bars.index[0]
+    -- confirmed live, 2026-08-20: bars here spans the full
+    history_lookback_days=10 warmup window, so index[0] is ~10 calendar
+    days in the past. pandas resample's origin is a single fixed instant
+    propagated forward continuously, never re-snapping to 09:15 on later
+    days; since 1440 (minutes/day) mod 27 == 9, a stale-day origin drifts
+    the WHOLE day's 27m grid by a multiple of 9 minutes every subsequent
+    day (confirmed live: BIG candle boundary landed on 09:06:00 instead of
+    the correct 09:15-aligned 09:15/09:42/... grid -- SMALL's 9m interval
+    was unaffected since 1440 mod 9 == 0, evenly divides a day). This is
+    not just a mislabeled timestamp -- it means MACD/SuperTrend were being
+    computed over the wrong 27-minute window of futures prices. Anchoring
+    to the latest bar's own day keeps this in lockstep with
+    _current_candle_boundary's per-day-fresh 09:15 anchor."""
+    session_anchor = bars.index[-1].normalize() + pd.Timedelta(hours=9, minutes=15) \
         if len(bars) else None
     resampled = bars.resample(f"{interval_minutes}min", origin=session_anchor if session_anchor is not None else "start_day").agg({
         "open": "first", "high": "max", "low": "min", "close": "last",
