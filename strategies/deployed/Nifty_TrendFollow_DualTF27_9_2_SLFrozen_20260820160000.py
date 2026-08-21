@@ -2314,10 +2314,22 @@ class StrategyEngine:
             # to push a tick yet) -- but a re-entry onto a symbol still
             # subscribed from moments ago can genuinely hit the WS cache, and
             # it's never wrong to check first.
+            #
+            # require_two_sided=True on the REST fallback: confirmed live
+            # 2026-08-21, a fresh subscribe on this exact broker returned an
+            # option's LTP matching the FUTURES/spot level (24236.6 for
+            # NIFTY29SEP2624400PE, whose real premium was ~305) with no
+            # two-sided market -- same failure mode Nifty_OI_WeeklyBuy_
+            # MonthlySell's fetch_symbol_ltp docstring documents from
+            # 2026-08-10 on this same broker. That entry corrupted this
+            # leg's P&L by over 15 lakh rupees once closed. Rejecting a
+            # quote with no real bid/ask catches it before it becomes a
+            # fill price.
             ltp = self.price_stream.get_ltp(leg.symbol, self.inst.options_exchange,
                                             _current_ws_stale_threshold())
             if ltp is None:
-                ltp = fetch_symbol_ltp(self.client, leg.symbol, self.inst.options_exchange)
+                ltp = fetch_symbol_ltp(self.client, leg.symbol, self.inst.options_exchange,
+                                       require_two_sided=True)
             ltp = ltp or 0.0
             try:
                 orderid, is_dry = place(self.client, self.env.strategy_tag, leg.symbol,
@@ -2415,7 +2427,8 @@ class StrategyEngine:
             ltp = self.price_stream.get_ltp(leg.symbol, self.inst.options_exchange,
                                             _current_ws_stale_threshold())
             if ltp is None:
-                ltp = fetch_symbol_ltp(self.client, leg.symbol, self.inst.options_exchange)
+                ltp = fetch_symbol_ltp(self.client, leg.symbol, self.inst.options_exchange,
+                                       require_two_sided=True)
             ltp = ltp or leg.entry_px
             try:
                 orderid, is_dry = place(self.client, self.env.strategy_tag, leg.symbol,
@@ -2539,7 +2552,8 @@ class StrategyEngine:
                     ltp = self.price_stream.get_ltp(leg.symbol, self.inst.options_exchange,
                                                     _current_ws_stale_threshold())
                     if ltp is None:
-                        ltp = fetch_symbol_ltp(self.client, leg.symbol, self.inst.options_exchange)
+                        ltp = fetch_symbol_ltp(self.client, leg.symbol, self.inst.options_exchange,
+                                               require_two_sided=True)
                     unreal = 0.0
                     if ltp is not None:
                         unreal = ((ltp - leg.entry_px) if leg.action == "BUY"
@@ -2833,7 +2847,8 @@ class StrategyEngine:
                     self._save_state()
                 self._push_leg_error_bg(role, leg, clear=True)
                 if not leg.exit_order_id:
-                    ltp = fetch_symbol_ltp(self.client, leg.symbol, exchange) or leg.entry_px
+                    ltp = fetch_symbol_ltp(self.client, leg.symbol, exchange,
+                                           require_two_sided=True) or leg.entry_px
                     try:
                         orderid, is_dry = place(self.client, self.env.strategy_tag, leg.symbol,
                                                  exchange, close_action, leg.quantity, dry_run_ltp=ltp)
@@ -2874,7 +2889,7 @@ class StrategyEngine:
                     except Exception as exc:
                         Log.warning(f"[{role}] Retry's reprice failed ({exc}) -- resuming watcher as-is.")
             else:  # terminal -- nothing resting, place a genuinely new order
-                ltp = fetch_symbol_ltp(self.client, leg.symbol, exchange) or 0.0
+                ltp = fetch_symbol_ltp(self.client, leg.symbol, exchange, require_two_sided=True) or 0.0
                 try:
                     orderid, is_dry = place(self.client, self.env.strategy_tag, leg.symbol,
                                              exchange, leg.action, leg.quantity, dry_run_ltp=ltp)
