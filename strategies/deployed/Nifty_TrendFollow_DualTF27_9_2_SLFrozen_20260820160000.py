@@ -348,6 +348,19 @@ class Config:
     place_order_max_attempts: int = 3
     place_order_retry_delay: float = 1.5
 
+    # A leg symbol just subscribed via add_instruments() has no WS tick yet,
+    # so entry falls to the REST fetch_symbol_ltp() -- confirmed live
+    # 2026-08-21: that REST read can itself return an untrustworthy quote
+    # (require_two_sided rejects it), and immediately afterward there is
+    # nothing left to fall back to except 0.0, recording a bogus entry
+    # price. Bounded retry here (short, since it blocks _open_position's
+    # per-leg loop) gives the broker a moment to have either a real WS tick
+    # or a real two-sided REST quote ready, same philosophy as
+    # place_order_max_attempts/place_order_retry_delay above but for the
+    # pre-fill price read rather than the order placement call itself.
+    ltp_retry_max_attempts: int = 3
+    ltp_retry_delay: float = 1.0
+
     error_repush_interval_sec: float = 60.0
     signal_refresh_retry_cooldown_sec: float = 60.0  # min gap between retrying a FAILED
                                                        # compute_timeframe_signal for the same
@@ -1151,6 +1164,31 @@ def fetch_symbol_ltp(client, symbol: str, exchange: str, require_two_sided: bool
                         f"market (ltp={ltp}, bid={bid}, ask={ask}) -- treating as untrustworthy")
             return None
     return ltp
+
+
+def fetch_symbol_ltp_with_retry(client, symbol: str, exchange: str,
+                                 max_attempts: int = 1, retry_delay: float = 1.0) -> Optional[float]:
+    """fetch_symbol_ltp(..., require_two_sided=True), retried up to
+    max_attempts times with retry_delay between tries. Only for the ENTRY-
+    FILL price read in _open_position -- a leg symbol just subscribed via
+    add_instruments() has no WS tick yet, so it falls straight to this REST
+    read; if that quote is ALSO untrustworthy (confirmed live 2026-08-21:
+    the same wrong-symbol-level-quote broker bug require_two_sided guards
+    against), there is nothing left to fall back to except a bogus 0.0
+    entry price. A short bounded retry gives the broker a moment to have a
+    genuine two-sided quote ready, same philosophy as
+    place_order_max_attempts/place_order_retry_delay but for this pre-fill
+    price read rather than the order placement call itself."""
+    import time as _time
+    for attempt in range(1, max_attempts + 1):
+        ltp = fetch_symbol_ltp(client, symbol, exchange, require_two_sided=True)
+        if ltp is not None:
+            return ltp
+        if attempt < max_attempts:
+            Log.warning(f"fetch_symbol_ltp_with_retry: no trustworthy quote for {symbol}.{exchange} "
+                        f"(attempt {attempt}/{max_attempts}) -- retrying in {retry_delay}s.")
+            _time.sleep(retry_delay)
+    return None
 
 
 def fetch_symbol_bid_ask(client, symbol: str, exchange: str) -> tuple[Optional[float], Optional[float]]:
@@ -2328,8 +2366,9 @@ class StrategyEngine:
             ltp = self.price_stream.get_ltp(leg.symbol, self.inst.options_exchange,
                                             _current_ws_stale_threshold())
             if ltp is None:
-                ltp = fetch_symbol_ltp(self.client, leg.symbol, self.inst.options_exchange,
-                                       require_two_sided=True)
+                ltp = fetch_symbol_ltp_with_retry(self.client, leg.symbol, self.inst.options_exchange,
+                                                  max_attempts=config.ltp_retry_max_attempts,
+                                                  retry_delay=config.ltp_retry_delay)
             ltp = ltp or 0.0
             try:
                 orderid, is_dry = place(self.client, self.env.strategy_tag, leg.symbol,
