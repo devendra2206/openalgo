@@ -2090,17 +2090,37 @@ class StrategyEngine:
         pct_hit = (futures_px <= sl_pct_level) if pos.direction == "LONG" else (futures_px >= sl_pct_level)
 
         candle_hit = False
+        candle_low_prev1 = None
+        candle_high_prev1 = None
         if candle_just_closed:
             sig = self._last_signal_big if pos.controlling_timeframe == "BIG" else self._last_signal_small
             if sig is not None:
+                candle_low_prev1 = sig.low_prev1
+                candle_high_prev1 = sig.high_prev1
                 candle_hit = ((sig.low_prev1 <= pos.sl_reference_low) if pos.direction == "LONG"
                               else (sig.high_prev1 >= pos.sl_reference_high))
 
         if pct_hit or candle_hit:
             reason = "sl_pct" if pct_hit else "sl_candle"
+            # candle_hit compares the just-closed candle's own high/low
+            # (candle_low_prev1/candle_high_prev1) against the frozen
+            # reference -- NOT futures_px, which is only the live LTP used
+            # for the separate 1% check. Without printing the candle's own
+            # value here, a "sl_candle" line can show futures_px sitting
+            # comfortably inside [ref_low, ref_high] and look like a false
+            # trigger, when the candle actually spiked past the reference
+            # intra-candle before closing back inside it (confirmed live,
+            # 2026-08-21: sl_candle fired on SHORT with futures_px=24380.00
+            # inside a [24354.00, 24386.00] channel -- correct, since that
+            # candle's own high had reached >= 24386.00).
+            candle_detail = (
+                f" candle_low={candle_low_prev1:.2f} candle_high={candle_high_prev1:.2f}"
+                if candle_hit else ""
+            )
             Log.info(f"STOP LOSS ({reason}): {pos.direction} futures_px={futures_px:.2f} "
                      f"entry={pos.entry_futures_px:.2f} sl_pct_level={sl_pct_level:.2f} "
-                     f"ref_low={pos.sl_reference_low:.2f} ref_high={pos.sl_reference_high:.2f}")
+                     f"ref_low={pos.sl_reference_low:.2f} ref_high={pos.sl_reference_high:.2f}"
+                     f"{candle_detail}")
             with self._lock:
                 inst_state = self.state.instance
                 inst_state.awaiting_sl_reentry = True
