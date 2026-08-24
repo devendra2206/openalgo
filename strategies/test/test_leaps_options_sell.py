@@ -1065,3 +1065,65 @@ def test_new_candle_closed_does_not_force_evaluation_on_a_genuinely_fresh_instal
     engine.state.last_candle_key = ""
 
     assert engine._new_candle_closed() is False
+
+
+# =============================================================================
+# _open_positions_for_pnl() -- the hedge/BUY leg must appear as its own
+# reported position, not be silently folded into the short leg's PnL
+# =============================================================================
+def test_open_positions_for_pnl_reports_hedge_leg_separately(script_module, engine):
+    """Confirmed live 2026-08-24: a merged single row meant the platform's
+    View Trade/PnL UI never saw the hedge/BUY leg's own symbol at all,
+    even though it was genuinely filled. Both legs must be reported as
+    independent entries, each with its own correct pnl (not double-
+    counted or combined)."""
+    pos = engine.state.position
+    pos.side = "PE"
+    pos.short_symbol = "NIFTY29DEC2624000PE"
+    pos.quantity = 65
+    pos.entry_px = 306.15
+    pos.entry_filled = True
+    pos.entry_time = "2026-08-24T10:15:19+05:30"
+    pos.hedge_symbol = "NIFTY29SEP2623500PE"
+    pos.hedge_entry_px = 57.6
+    pos.hedge_entry_filled = True
+    engine.price_stream.get_ltp.side_effect = lambda symbol, exchange, max_age: {
+        "NIFTY29DEC2624000PE": 300.0,   # short leg: premium fell -- profit for the seller
+        "NIFTY29SEP2623500PE": 60.0,    # hedge leg: premium rose -- profit for the buyer
+    }[symbol]
+
+    positions = engine._open_positions_for_pnl()
+
+    assert len(positions) == 2
+    short_row = next(p for p in positions if p["leg_key"] == "LEAPS")
+    hedge_row = next(p for p in positions if p["leg_key"] == "LEAPS_HEDGE")
+
+    assert short_row["symbol"] == "NIFTY29DEC2624000PE"
+    assert short_row["direction"] == "SHORT"
+    assert short_row["quantity"] == -65
+    assert short_row["pnl"] == pytest.approx((306.15 - 300.0) * 65)  # short-only, no hedge folded in
+
+    assert hedge_row["symbol"] == "NIFTY29SEP2623500PE"
+    assert hedge_row["direction"] == "LONG"
+    assert hedge_row["quantity"] == 65
+    assert hedge_row["pnl"] == pytest.approx((60.0 - 57.6) * 65)  # hedge-only
+
+
+def test_open_positions_for_pnl_omits_hedge_row_when_unhedged(script_module, engine):
+    """A position left unhedged by a prior failed hedge roll must report
+    only the short leg -- no phantom hedge row for a leg that was never
+    actually bought."""
+    pos = engine.state.position
+    pos.side = "CE"
+    pos.short_symbol = "NIFTY28MAR2420000CE"
+    pos.quantity = 65
+    pos.entry_px = 350.0
+    pos.entry_filled = True
+    pos.entry_time = "2026-08-24T10:15:19+05:30"
+    pos.hedge_symbol = ""  # unhedged
+    engine.price_stream.get_ltp.return_value = 340.0
+
+    positions = engine._open_positions_for_pnl()
+
+    assert len(positions) == 1
+    assert positions[0]["leg_key"] == "LEAPS"

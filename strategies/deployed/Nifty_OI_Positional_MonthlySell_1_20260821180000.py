@@ -2964,6 +2964,15 @@ class StrategyEngine:
         self.save_state()
 
     def _open_positions_for_pnl(self) -> list:
+        """Reports the short leg and the hedge leg as TWO SEPARATE entries
+        -- each with its own symbol/direction/entry_price/pnl -- not one
+        merged row with the hedge's PnL silently folded into the short
+        leg's number. A merged single row means the platform's View
+        Trade/PnL UI never sees the hedge/BUY leg's own symbol at all --
+        confirmed live 2026-08-24 on Nifty_LEAPS_OptionsSell_1 (this
+        script's own descendant), which had the identical shape: the
+        hedge leg simply never appeared there, even though it was
+        genuinely filled."""
         open_positions = []
         for leg_key, leg in self.state.legs.items():
             pos = leg.position
@@ -2974,18 +2983,22 @@ class StrategyEngine:
                 short_ltp = pos.entry_px  # last-known fallback -- never fabricate movement
             short_pnl = (pos.entry_px - short_ltp) * pos.quantity
 
-            hedge_pnl = 0.0
+            open_positions.append({
+                "leg_key": leg_key, "symbol": pos.short_symbol, "direction": "SHORT",
+                "quantity": -pos.quantity, "entry_price": pos.entry_px, "current_price": short_ltp,
+                "pnl": short_pnl, "entry_time": pos.entry_time, "execution_id": pos.execution_id,
+            })
+
             if pos.hedge_symbol and pos.hedge_entry_filled:
                 hedge_ltp = self.price_stream.get_ltp(pos.hedge_symbol, OPTIONS_EXCHANGE, config.ws_stale_seconds)
                 if hedge_ltp is None:
                     hedge_ltp = pos.hedge_entry_px
                 hedge_pnl = (hedge_ltp - pos.hedge_entry_px) * pos.quantity
-
-            open_positions.append({
-                "leg_key": leg_key, "symbol": pos.short_symbol, "direction": "SHORT",
-                "quantity": -pos.quantity, "entry_price": pos.entry_px, "current_price": short_ltp,
-                "pnl": short_pnl + hedge_pnl, "entry_time": pos.entry_time, "execution_id": pos.execution_id,
-            })
+                open_positions.append({
+                    "leg_key": f"{leg_key}_HEDGE", "symbol": pos.hedge_symbol, "direction": "LONG",
+                    "quantity": pos.quantity, "entry_price": pos.hedge_entry_px, "current_price": hedge_ltp,
+                    "pnl": hedge_pnl, "entry_time": pos.entry_time, "execution_id": pos.execution_id,
+                })
         return open_positions
 
     def report_pnl_tick(self):
