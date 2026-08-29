@@ -95,6 +95,11 @@ def drop_incomplete_rows(df, exchange, required=("brsymbol", "name")):
 
 def copy_from_dataframe(df):
     logger.info("Performing Bulk Insert")
+
+    # Final guard: symbol and brsymbol are NOT NULL, and one bad row aborts the
+    # entire transaction for that exchange. Never let one reach the insert.
+    df = df.dropna(subset=["symbol", "brsymbol"])
+
     # Convert DataFrame to a list of dictionaries
     data_dict = df.to_dict(orient="records")
 
@@ -355,12 +360,13 @@ def process_shoonya_nfo_data(output_path):
     # NULL constraint and rolling back the ENTIRE NFO bulk insert (see
     # copy_from_dataframe), not just these rows. Same defensive pattern as
     # process_shoonya_cds_data's token>100 filter for the analogous CDS
-    # dummy-entry case.
-    before = len(df)
-    df = df.dropna(subset=["name", "brsymbol", "instrumenttype"])
+    # dummy-entry case. Routed through the shared drop_incomplete_rows()
+    # helper (upstream's dedup of this same fix) with the fuller
+    # required-columns tuple this exchange's own fix already needed --
+    # the helper's own default (brsymbol/name only) doesn't check
+    # instrumenttype, which the originally-observed bad rows also had NaN.
+    df = drop_incomplete_rows(df, "NFO", required=("brsymbol", "name", "instrumenttype"))
     df = df[(df["name"].str.strip() != "") & (df["brsymbol"].str.strip() != "")]
-    if len(df) < before:
-        logger.warning(f"Dropped {before - len(df)} NFO row(s) with missing symbol/name/instrument data")
 
     # Add missing columns to ensure DataFrame matches the database structure
     df["expiry"] = df["expiry"].fillna("")  # Fill expiry with empty strings if missing

@@ -10,6 +10,7 @@ import type {
   PythonStrategy,
   PythonStrategyContent,
   ScheduleConfig,
+  StrategyExchange,
   TradeDatesResponse,
   TradesResponse,
 } from '@/types/python-strategy'
@@ -17,6 +18,17 @@ import type { ApiResponse } from '@/types/trading'
 import { webClient } from './client'
 
 export const pythonStrategyApi = {
+  /**
+   * Get the exchange options for the strategy selector.
+   *
+   * Session windows come from the market calendar DB, never from a constant
+   * in the frontend, so an exchange timing change reaches the UI on its own.
+   */
+  getExchanges: async (): Promise<StrategyExchange[]> => {
+    const response = await webClient.get<{ exchanges: StrategyExchange[] }>('/python/api/exchanges')
+    return response.data.exchanges || []
+  },
+
   /**
    * Get all Python strategies
    */

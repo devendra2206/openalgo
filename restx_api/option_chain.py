@@ -100,11 +100,13 @@ class OptionChain(Resource):
             expiry_date = data["expiry_date"]
             strike_count = data.get("strike_count")  # None means return entire chain
             with_quotes = data.get("with_quotes", True)
+            with_greeks = data.get("with_greeks", False)
+            interest_rate = data.get("interest_rate")
 
             logger.info(
                 f"Option chain request: underlying={underlying}, exchange={exchange}, "
                 f"expiry={expiry_date}, strike_count={'all' if strike_count is None else strike_count}, "
-                f"with_quotes={with_quotes}"
+                f"with_quotes={with_quotes}, with_greeks={with_greeks}"
             )
 
             # Call service to get option chain
@@ -115,6 +117,8 @@ class OptionChain(Resource):
                 strike_count=strike_count,
                 api_key=api_key,
                 with_quotes=with_quotes,
+                with_greeks=with_greeks,
+                interest_rate=interest_rate,
             )
 
             return response, status_code

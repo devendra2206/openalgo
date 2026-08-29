@@ -252,7 +252,9 @@ def test_only_pilot_brokers_ship_gtt_modules():
     brokers = {
         path.parent.parent.name for path in (repository_root / "broker").glob("*/api/gtt_api.py")
     }
-    assert brokers == {"dhan", "zerodha"}
+    # 2026-08-29 upstream sync: GTT support broadened from the original
+    # Dhan/Zerodha pilot to also cover angel, fyers, and upstox.
+    assert brokers == {"angel", "dhan", "fyers", "upstox", "zerodha"}
 
 
 def test_queue_order_remains_successful_when_notification_fails(monkeypatch):

@@ -20,7 +20,7 @@ threading/queue primitives (the whole process is patched under
 gunicorn+eventlet) -- mutating/signaling them from a real, unpatched OS
 thread is the exact "greenlet.error: Cannot switch to a different thread"
 class of bug already documented and fixed in
-services/websocket_client.py's `_run_coroutine_and_wait` (production
+services/websocket_client.py's `_run_on_loop` (production
 incident, 2026-07-29). It doesn't always hard-crash here -- observed
 in production as "PnL/trade price updating, just slowly": a foreign
 thread's queue.put() can leave the notification the SSE generator's

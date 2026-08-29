@@ -111,6 +111,98 @@ git push origin custom-strategies
 ```
 
 **Sync log:**
+- **2026-08-29**: 303 commits pulled from upstream (by far the largest sync
+  to date — previous max was 39; `main` had not been synced since 2026-08-04).
+  Real conflicts (beyond the routine `frontend/dist/` set) in 10 files:
+  `.claude/skills/broker-integration/SKILL.md` (doc text — kept this fork's
+  more specific HTTP/2-disabled note, took upstream's updated usage counts),
+  `broker/shoonya/database/master_contract_db.py` (both sides independently
+  fixed the same NFO/BFO placeholder-row bug — merged to use upstream's
+  shared `drop_incomplete_rows()` helper with this fork's fuller
+  `required=("brsymbol","name","instrumenttype")` tuple, keeping both the
+  DRY refactor and the extra defensive check), `broker/shoonya/api/data.py`
+  (adopted upstream's `EODChartData`-based daily-candle fetch wholesale,
+  removing this fork's `_get_daily_from_intraday()` 5m-aggregation
+  workaround entirely — see "Never derive a daily candle from another
+  interval" below; kept this fork's independent eventlet/GreenPool/
+  quote_suspect fixes), `broker/shoonya/streaming/shoonya_adapter.py`
+  (upstream generalized this fork's own token-keyed O(1) subscription index
+  to a scrip-keyed one, matching the file's own issue #1732 anti-collision
+  invariant — adopted upstream's indexing, kept this fork's
+  `_token_last_tick`/`_token_first_subscribed_at` staleness-bypass state
+  layered on top), `services/option_chain_service.py` (upstream generalized
+  MCX's no-spot handling to a broader `NO_SPOT_EXCHANGES` set covering
+  currency segments too, via near-month-future auto-resolution — kept this
+  fork's MCX+embedded-expiry special case, which trusts the caller's exact
+  futures symbol, ahead of upstream's auto-resolution in the if/elif chain,
+  since MCX options and futures expiries can differ and the auto-resolved
+  near-month future isn't always the right anchor), `sandbox/websocket_execution_engine.py`
+  and `services/websocket_client.py` (upstream extracted this fork's
+  eventlet-real-lock pattern into a new shared `utils/real_threading.py`
+  module — adopted it, deleting the now-redundant local inline copies;
+  `_run_coroutine_and_wait()` also replaced by upstream's `_run_on_loop()`,
+  which achieves the same fix without ever creating a
+  `concurrent.futures.Future`, backed by a substantially more rigorous
+  test — `test/test_eventlet_cross_thread_locks.py` reproduces the crash
+  under a genuine eventlet hub in a subprocess; this fork's narrower
+  `test_websocket_client_bridge.py` removed as redundant),
+  `restx_api/data_schemas.py` + `restx_api/option_chain.py` (purely additive
+  on both sides — this fork's `with_quotes` alongside upstream's new
+  `with_greeks`/`interest_rate`, both kept), `frontend/src/api/python-strategy.ts`
+  (purely additive type imports, both kept).
+
+  **Never derive a daily candle from another interval — use the broker's own
+  daily endpoint.** The `broker/shoonya/api/data.py` conflict above was
+  investigated at length beforehand (this fork's `_get_daily_from_intraday()`
+  aggregated 5m TPSeries candles into daily bars because Shoonya's own daily
+  endpoints were once unreliable). Live testing against the production
+  broker session found BOTH the old 5m-aggregation approach and a fresh
+  direct `EODChartData` call could return incorrect/inconsistent values for
+  very recent days (data still settling on the broker's side) — but a
+  derived daily candle inherits whatever unreliability its source interval
+  has, plus adds its own aggregation-bug surface, so deriving is strictly
+  worse than asking the broker's own dedicated daily endpoint directly.
+  Adopted upstream's `EODChartData`-based `get_history("D", ...)` for this
+  reason, not because the original 5m-aggregation bug was ever conclusively
+  reproduced.
+
+  **Two additional real fixes found only by running the full test suite**
+  (neither showed up as a git conflict — both files auto-merged cleanly but
+  landed on an internally-inconsistent state):
+  - `test/test_shoonya_subscribe_stale_bypass.py` — its `_make_adapter()`
+    fixture still built the OLD token-keyed `_token_to_cids` index; updated
+    to build `_scrip_to_cids`/`_token_to_scrips` matching the adapter's new
+    scrip-keyed design (see above). All 9 tests pass again.
+  - `broker/tradesmart/api/rate_limiter.py` + `broker/tradesmart/api/data.py`
+    — landed on upstream's OLDER two-budget revision (separate quote/general
+    gates) while `test/test_tradesmart_rate_limiter.py` had already landed on
+    upstream's NEWER single-budget revision (their own docstring: "An earlier
+    revision assumed /GetQuotes had been raised to 100/sec and was exempt
+    from the per-minute allowance; live logs disproved both"). Confirmed by
+    directly loading upstream `main`'s own two files together that this
+    mismatch exists in upstream's `main` branch itself, not just in this
+    merge — their test calls `_reserve_slot()` with no arguments against an
+    implementation requiring 4. Rewrote `rate_limiter.py` to the single-budget
+    model the test (and upstream's own stated, evidence-based understanding)
+    expects, and updated `data.py`'s one dependent `max_workers` sizing call
+    from the removed `TRADESMART_QUOTE_MAX_PER_SECOND` to
+    `TRADESMART_MAX_PER_SECOND`.
+
+  Full verification: every changed Python file compiles
+  (`py_compile`, 395 files); full test suite run twice (before and after the
+  two fixes above) with every remaining failure individually confirmed
+  pre-existing by running the identical test against the pre-merge commit in
+  a throwaway `git worktree` (email/mstock/portfolio/telegram/websocket
+  async-plugin gaps, two `test_oi_weekly_monthly_simulation.py` cases, and
+  the manual-script false positives in `test_rate_limits_mock.py`/
+  `test_websocket_service.py` — none touch anything this merge changed);
+  `test/test_pending_order_execution_service.py::test_only_pilot_brokers_ship_gtt_modules`
+  updated for upstream's legitimate GTT broadening to angel/fyers/upstox
+  (was Dhan/Zerodha only); frontend rebuilt clean after `npm install` picked
+  up an already-bumped `openalgo-charts` 1.0.28→1.8.2 (unrelated to this
+  merge — `package.json` already specified 1.8.2 before it started, `node_modules`
+  was just stale) and `frontend/dist/` recommitted from that fresh build
+  rather than upstream's own CI copy.
 - **2026-08-04**: upstream/main fast-forwarded and merged into
   `custom-strategies`, zero conflicts including `frontend/dist/`. Merge
   itself was clean and fully verified against every customized *Python*
@@ -163,8 +255,13 @@ else) — run either with `uv run pytest strategies/test/` or just
 
 Core-code (non-strategy-script) regression tests stay in the top-level
 `test/` directory as usual, e.g.:
-- `test/test_websocket_client_bridge.py` — the eventlet cross-thread
-  `concurrent.futures.Future` bridge fix in `services/websocket_client.py`
+- `test/test_eventlet_cross_thread_locks.py` — upstream's real-eventlet-hub
+  regression suite covering the same `services/websocket_client.py` cross-
+  thread bridge class of bug this fork found independently (see the
+  `services/websocket_client.py` section below); superseded this fork's own
+  narrower `test_websocket_client_bridge.py` (removed) during the 2026-08-29
+  upstream sync, once `_run_coroutine_and_wait` was replaced by upstream's
+  `_run_on_loop` (same contract, no `concurrent.futures.Future` at all)
 - `test/test_fyers_reconnect.py` — the Fyers adapter's non-blocking
   background reconnect
 
@@ -479,6 +576,19 @@ either side) that the calling thread waits on instead. `disconnect()`'s own
 `run_coroutine_threadsafe()` call was untouched — it's fire-and-forget,
 never calls `.result()`, so it was never affected. Covered by
 `test/test_websocket_client_bridge.py`.
+
+**2026-08-29 upstream sync — superseded by `_run_on_loop`.** Upstream
+independently arrived at the same fix (no touching the Future from the
+calling thread) via a cleaner route: `call_soon_threadsafe` schedules a
+plain wrapper coroutine directly, so no `concurrent.futures.Future` is ever
+created at all (`_run_coroutine_and_wait`'s `add_done_callback` dance is
+unnecessary once that Future never exists). Same contract (timeout still
+real, exceptions still propagate), backed by a substantially more rigorous
+test — `test/test_eventlet_cross_thread_locks.py` reproduces the crash
+under a genuine eventlet hub in a subprocess rather than asserting against
+a real-but-eventlet-free asyncio loop. Adopted `_run_on_loop` wholesale
+during the merge; `test/test_websocket_client_bridge.py` removed as
+redundant.
 
 ---
 

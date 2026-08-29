@@ -13,6 +13,7 @@ Features:
 
 import os
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -107,6 +108,14 @@ class ExecutionEngine:
         self.api_rate_limit = int(os.getenv("API_RATE_LIMIT", "50 per second").split()[0])
         self.batch_delay = 1.0  # 1 second between batches
 
+    # Class-level lock (issue #1808). Each placeorder request constructs a fresh
+    # ExecutionEngine() inside OrderManager.place_order, so an instance-level
+    # lock would give every request its own mutex and the race would remain.
+    # A class attribute is shared across every instance in this process and
+    # therefore serializes the position RMW for them. Multi-process deployments
+    # would still need a DB-level lock.
+    _position_lock = threading.Lock()
+
     def check_and_execute_pending_orders(self):
         """
         Main execution loop - checks all pending orders and executes if conditions met
@@ -152,20 +161,32 @@ class ExecutionEngine:
                     f"{len(failed_symbols)} symbols not available via multiquotes, waiting for WebSocket data"
                 )
 
-            # Process orders in batches (respecting order rate limit of 10/second)
+            # Deliberately unpaced (issue #1768). Every quote this cycle needs
+            # was already fetched above in the single _fetch_quotes_batch call,
+            # so this loop only does dict lookups, local DB writes and async
+            # EventBus publishes -- there is no broker call left to throttle.
+            #
+            # This used to sleep 1s after every ORDER_RATE_LIMIT (10) orders,
+            # which is an *inbound API* limit being reused to rate-limit local
+            # work. That made a cycle cost ceil(N/10)-1 seconds purely as a
+            # function of queue depth -- 14s behind 150 resting orders, and it
+            # was paid even when nothing was fillable at all. Fills queued
+            # behind unrelated resting orders, and it compounded: a slower cycle
+            # stranded more orders, which slowed the next one. Measured on the
+            # old code, one order's time-to-fill went 4.6s -> 34.8s as the
+            # backlog grew from 0 to 150.
             orders_processed = 0
-            for i in range(0, len(pending_orders), self.order_rate_limit):
-                batch = pending_orders[i : i + self.order_rate_limit]
+            for position, order in enumerate(pending_orders, start=1):
+                quote = quote_cache.get((order.symbol, order.exchange))
+                if quote:
+                    self._process_order(order, quote)
+                    orders_processed += 1
 
-                for order in batch:
-                    quote = quote_cache.get((order.symbol, order.exchange))
-                    if quote:
-                        self._process_order(order, quote)
-                        orders_processed += 1
-
-                # Wait 1 second before next batch if more orders remain
-                if i + self.order_rate_limit < len(pending_orders):
-                    time.sleep(self.batch_delay)
+                # Yield to the hub periodically. Under gunicorn's eventlet
+                # worker this loop shares one green thread with request
+                # handling, so a long backlog must not hold it uninterrupted.
+                if position % self.order_rate_limit == 0:
+                    time.sleep(0)
 
             logger.info(f"Processed {orders_processed} orders")
 
@@ -211,7 +232,7 @@ class ExecutionEngine:
                 )
                 continue
             ltp = quote.get("ltp")
-            if not gtt_manager.leg_is_triggered_by(leg.action, leg.trigger_price, ltp):
+            if not gtt_manager.leg_is_triggered_by(leg.trigger_direction, leg.trigger_price, ltp):
                 continue
 
             # The claim is what makes this safe to run alongside the WebSocket
@@ -714,6 +735,12 @@ class ExecutionEngine:
         or during immediate execution (for MARKET orders). We only need to release margin when
         positions are closed/reduced.
         """
+        # Serialize the position RMW (issue #1808). Without this lock two
+        # concurrent same-symbol fills can both read the same old_quantity,
+        # each compute old + its own delta, and last-write-wins -- silently
+        # losing one increment. The lock is released even when the function
+        # raises or rolls back its transaction.
+        self._position_lock.acquire()
         try:
             fund_manager = FundManager(order.user_id)
 
@@ -1013,6 +1040,8 @@ class ExecutionEngine:
             db_session.rollback()
             logger.exception(f"Error updating position for order {order.orderid}: {e}")
             raise
+        finally:
+            self._position_lock.release()
 
     def _calculate_realized_pnl(self, old_quantity, avg_price, close_quantity, close_price, contract_value=1.0):
         """Calculate realized P&L for closed positions, multiplied by contract_value (e.g. 0.01 for ETHUSD.P)."""

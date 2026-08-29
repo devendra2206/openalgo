@@ -62,8 +62,9 @@ def _make_adapter():
     a.connected = True
     a.lock = threading.Lock()
     a.subscriptions = {}
-    a.token_to_symbol = {}
-    a._token_to_cids = {}
+    a.scrip_to_symbol = {}
+    a._scrip_to_cids = {}
+    a._token_to_scrips = {}
     a._token_last_tick = {}
     a._token_first_subscribed_at = {}
     a.ws_subscription_refs = {}
@@ -214,13 +215,15 @@ def test_subscribe_bypasses_and_resends_when_already_subscribed_but_stuck(monkey
 
 def test_process_market_message_updates_token_last_tick():
     a = _make_adapter()
-    a.token_to_symbol[TOKEN] = (SYMBOL, EXCHANGE)
+    scrip = f"NSE|{TOKEN}"
+    a.scrip_to_symbol[scrip] = (SYMBOL, EXCHANGE)
     correlation_id = f"{SYMBOL}_{EXCHANGE}_{MODE}_abc"
     a.subscriptions[correlation_id] = {
         "symbol": SYMBOL, "exchange": EXCHANGE, "mode": MODE,
-        "depth_level": 5, "token": TOKEN, "scrip": f"NSE|{TOKEN}",
+        "depth_level": 5, "token": TOKEN, "scrip": scrip,
     }
-    a._token_to_cids[TOKEN] = {correlation_id}
+    a._scrip_to_cids[scrip] = {correlation_id}
+    a._token_to_scrips[TOKEN] = {scrip}
     a.market_cache = MagicMock()
     a.market_cache.update.return_value = {}
 

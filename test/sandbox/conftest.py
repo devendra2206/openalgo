@@ -70,6 +70,16 @@ def seed_symbol_master():
         # Table may already exist; the query below is the real check.
         pass
 
+    # Sandbox tables and their column migrations. Existing installs upgrade
+    # through init_db(), so the tests must take the same path or they would
+    # only ever exercise a freshly-created schema.
+    try:
+        from database.sandbox_db import init_db as init_sandbox_db
+
+        init_sandbox_db()
+    except Exception as exc:
+        pytest.skip(f"Could not initialise the sandbox database: {exc}")
+
     try:
         for spec in TEST_SYMBOLS:
             existing = SymToken.query.filter_by(
@@ -84,10 +94,14 @@ def seed_symbol_master():
 
     yield
 
+
 #: Modules whose tests place MARKET orders, which the sandbox prices from a live
 #: quote. Without a broker session there is no price, the order is rejected, and
 #: the margin assertions fail for a reason unrelated to margin.
-LIVE_QUOTE_MODULES = ("test_margin_scenarios",)
+LIVE_QUOTE_MODULES = (
+    "test_margin_scenarios",
+    "test_cnc_sell_validation",
+)
 
 
 def _live_quotes_available() -> bool:
@@ -122,3 +136,23 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if any(module in item.nodeid for module in LIVE_QUOTE_MODULES):
             item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True)
+def clean_scoped_sessions():
+    """Drop the scoped session's identity map around every test.
+
+    SQLAlchemy's scoped_session caches loaded objects per thread. Tests that
+    mutate a GTT, and engine code that writes the same rows from a worker
+    thread, otherwise leave stale instances behind, so a later test reads an
+    object whose in-memory state no longer matches the row. That is why these
+    tests passed alone and failed in a full run.
+    """
+    from database.sandbox_db import db_session
+
+    db_session.remove()
+    yield
+    try:
+        db_session.rollback()
+    finally:
+        db_session.remove()

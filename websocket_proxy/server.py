@@ -651,10 +651,19 @@ class WebSocketProxy:
                 continue
             self._last_stale_warn[user_id] = current_time
             broker = self.user_broker_mapping.get(user_id, "unknown")
-            logger.warning(
+            # Debug, not warning. A subscribed feed is legitimately silent every
+            # night, every weekend and every trading holiday, and this check
+            # cannot tell that apart from a dead socket without an
+            # exchange-aware calendar. Logging it at warning meant hours of
+            # identical lines whenever the market was simply shut, which buries
+            # the entries that do need attention. The signal is still available
+            # when it is wanted: get_adapter_health() reports seconds since the
+            # last tick per user, and raising the log level surfaces this again.
+            logger.debug(
                 f"Stale feed: {broker} adapter for user {user_id} reports connected "
-                f"but no ticks for {silent_for:.0f}s while subscribed. If this persists, "
-                f"the broker WebSocket may be silently dead (reconnect/restart may be needed)."
+                f"but no ticks for {silent_for:.0f}s while subscribed. Expected "
+                f"outside market hours; if it persists during a session the "
+                f"broker WebSocket may be silently dead."
             )
 
     def _is_subscription_genuinely_stale(self, sub_key: tuple, now: float) -> bool:
@@ -1461,7 +1470,9 @@ class WebSocketProxy:
         """
         # Check if the client is authenticated
         if client_id not in self.user_mapping:
-            await self.send_error(client_id, "NOT_AUTHENTICATED", "You must authenticate first")
+            await self.send_error(
+                client_id, "NOT_AUTHENTICATED", "You must authenticate first", request_id=data.get("request_id")
+            )
             return
 
         # Get subscription parameters
@@ -1481,7 +1492,9 @@ class WebSocketProxy:
         try:
             mode, mode_label = normalize_mode(raw_mode)
         except (ValueError, TypeError) as e:
-            await self.send_error(client_id, "INVALID_MODE", str(e))
+            await self.send_error(
+                client_id, "INVALID_MODE", str(e), request_id=data.get("request_id")
+            )
             return
         mode_str = mode_label  # Canonical label echoed back in subscribe response
 
@@ -1491,14 +1504,16 @@ class WebSocketProxy:
 
         if not symbols:
             await self.send_error(
-                client_id, "INVALID_PARAMETERS", "At least one symbol must be specified"
+                client_id, "INVALID_PARAMETERS", "At least one symbol must be specified", request_id=data.get("request_id")
             )
             return
 
         # Get the user's broker adapter
         user_id = self.user_mapping[client_id]
         if user_id not in self.broker_adapters:
-            await self.send_error(client_id, "BROKER_ERROR", "Broker adapter not found")
+            await self.send_error(
+                client_id, "BROKER_ERROR", "Broker adapter not found", request_id=data.get("request_id")
+            )
             return
 
         adapter = self.broker_adapters[user_id]
@@ -1685,7 +1700,9 @@ class WebSocketProxy:
         """
         # Check if the client is authenticated
         if client_id not in self.user_mapping:
-            await self.send_error(client_id, "NOT_AUTHENTICATED", "You must authenticate first")
+            await self.send_error(
+                client_id, "NOT_AUTHENTICATED", "You must authenticate first", request_id=data.get("request_id")
+            )
             return
 
         # Check if this is an unsubscribe_all request
@@ -1704,7 +1721,9 @@ class WebSocketProxy:
             try:
                 _mode_int, _ = normalize_mode(data.get("mode", 2))
             except (ValueError, TypeError) as e:
-                await self.send_error(client_id, "INVALID_MODE", str(e))
+                await self.send_error(
+                client_id, "INVALID_MODE", str(e), request_id=data.get("request_id")
+            )
                 return
             symbols = [
                 {
@@ -1717,14 +1736,16 @@ class WebSocketProxy:
         # If no symbols provided and not unsubscribe_all, return error
         if not symbols and not is_unsubscribe_all:
             await self.send_error(
-                client_id, "INVALID_PARAMETERS", "Either symbols or unsubscribe_all is required"
+                client_id, "INVALID_PARAMETERS", "Either symbols or unsubscribe_all is required", request_id=data.get("request_id")
             )
             return
 
         # Get the user's broker adapter
         user_id = self.user_mapping[client_id]
         if user_id not in self.broker_adapters:
-            await self.send_error(client_id, "BROKER_ERROR", "Broker adapter not found")
+            await self.send_error(
+                client_id, "BROKER_ERROR", "Broker adapter not found", request_id=data.get("request_id")
+            )
             return
 
         adapter = self.broker_adapters[user_id]
@@ -1935,7 +1956,9 @@ class WebSocketProxy:
             data: Subscription data (optional request_id)
         """
         if client_id not in self.user_mapping:
-            await self.send_error(client_id, "NOT_AUTHENTICATED", "You must authenticate first")
+            await self.send_error(
+                client_id, "NOT_AUTHENTICATED", "You must authenticate first", request_id=data.get("request_id")
+            )
             return
 
         user_id = self.user_mapping[client_id]
@@ -1961,7 +1984,9 @@ class WebSocketProxy:
             data: Unsubscription data (optional request_id)
         """
         if client_id not in self.user_mapping:
-            await self.send_error(client_id, "NOT_AUTHENTICATED", "You must authenticate first")
+            await self.send_error(
+                client_id, "NOT_AUTHENTICATED", "You must authenticate first", request_id=data.get("request_id")
+            )
             return
 
         user_id = self.user_mapping[client_id]
@@ -2013,7 +2038,7 @@ class WebSocketProxy:
                     f"symbol={message.get('symbol')}, exchange={message.get('exchange')}"
                 )
 
-    async def send_error(self, client_id, code, message):
+    async def send_error(self, client_id, code, message, request_id=None):
         """
         Send an error message to a client
 
@@ -2021,8 +2046,17 @@ class WebSocketProxy:
             client_id: ID of the client
             code: Error code
             message: Error message
+            request_id: The request this error answers, when it answers one.
+                Success responses have echoed it since issue #1376 so a caller
+                can correlate an ack; errors did not, so a client awaiting an
+                ack had nothing to match it against and waited out its own
+                timeout for a reply that had already arrived. Always pass it
+                from a handler that was given one.
         """
-        await self.send_message(client_id, {"status": "error", "code": code, "message": message})
+        payload = {"status": "error", "code": code, "message": message}
+        if request_id is not None:
+            payload["request_id"] = request_id
+        await self.send_message(client_id, payload)
 
     def _handle_cache_invalidation(self, topic_str: str, data_str: str):
         """

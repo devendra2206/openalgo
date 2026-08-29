@@ -70,6 +70,8 @@ MIGRATIONS = [
     ("migrate_samco_auth.py", "Samco 2FA Authentication"),
     ("migrate_zerodha_new_exchanges.py", "Zerodha NCO/GLOBAL_INDEX & GIFTNIFTY Cleanup"),
     ("add_totp_purpose_flags.py", "Per-Purpose 2FA Flags (login/MCP/reset)"),
+    ("migrate_gtt_sandbox.py", "Sandbox GTT Support & CAS F&O Close (15:40)"),
+    ("migrate_historify_drop_indexes.py", "Historify Unused Index Removal (#1779)"),
 ]
 
 
