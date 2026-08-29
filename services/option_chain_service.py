@@ -398,52 +398,65 @@ def get_option_chain(
                 )
             quote_symbol = _perp[0]["symbol"]
 
-        elif exchange.upper() == "MCX" and embedded_expiry:
-            # MCX commodities (CRUDEOIL, GOLD, ...) have no bare quotable
-            # spot/index the way NIFTY/SENSEX do -- the FUTURES contract
-            # itself is the only quotable proxy for spot. Reducing to the
-            # bare base_symbol here (as done in the final fallback below,
-            # where the bare name IS a real quotable index/stock) would try
-            # to quote a non-existent plain symbol (e.g. "CRUDEOIL" alone)
-            # and fail with "Symbol not found" regardless of what the
-            # caller passed in. Keep the caller's exact futures symbol
-            # (e.g. "CRUDEOIL19AUG26FUT") instead -- deliberately NOT routed
-            # through the NO_SPOT_EXCHANGES branch's near-month
-            # auto-resolution below, since the caller already resolved
-            # exactly which contract they want quoted, and MCX options can
-            # settle on a different date than the future itself (e.g.
-            # CRUDEOIL options settle 17-AUG, the future settles 19-AUG).
-            quote_symbol = underlying
-        elif exchange.upper() in NO_SPOT_EXCHANGES:
-            # MCX (without an embedded expiry) and the currency segments
-            # list no spot instrument: there is a CRUDEOIL19AUG26FUT but no
-            # plain CRUDEOIL, so a spot quote returns nothing and the chain
-            # comes back with no underlying price at all. The near-month
-            # future is the pricing reference instead.
-            quote_exchange = exchange.upper()
-            resolved = resolve_underlying_quote(base_symbol, quote_exchange)
-            if resolved is None:
-                return (
-                    False,
-                    {
-                        "status": "error",
-                        "message": (
-                            f"No unexpired futures found for {base_symbol} on "
-                            f"{quote_exchange}. {quote_exchange} options are priced "
-                            "against the near-month future, which this product does "
-                            "not currently have."
-                        ),
-                    },
-                    404,
+        # Step 2b: Determine quote_symbol for every NON-CRYPTO exchange --
+        # deliberately a SEPARATE, unconditional check from the quote_exchange
+        # remapping above, not a further elif chained onto it. NFO/BFO (the
+        # exchange for every NIFTY/BANKNIFTY/SENSEX options request) only
+        # rewrites quote_exchange above and falls through to here for its own
+        # quote_symbol -- chaining this as elif off the NFO/BFO branch (a
+        # 2026-08-29 merge-resolution bug) left quote_symbol unset for every
+        # NFO/BFO call, an UnboundLocalError on literally every NIFTY/SENSEX
+        # option-chain request in production.
+        if exchange.upper() not in CRYPTO_EXCHANGES:
+            if exchange.upper() == "MCX" and embedded_expiry:
+                # MCX commodities (CRUDEOIL, GOLD, ...) have no bare quotable
+                # spot/index the way NIFTY/SENSEX do -- the FUTURES contract
+                # itself is the only quotable proxy for spot. Reducing to the
+                # bare base_symbol here (as done in the final fallback below,
+                # where the bare name IS a real quotable index/stock) would
+                # try to quote a non-existent plain symbol (e.g. "CRUDEOIL"
+                # alone) and fail with "Symbol not found" regardless of what
+                # the caller passed in. Keep the caller's exact futures
+                # symbol (e.g. "CRUDEOIL19AUG26FUT") instead -- deliberately
+                # NOT routed through the NO_SPOT_EXCHANGES branch's
+                # near-month auto-resolution below, since the caller already
+                # resolved exactly which contract they want quoted, and MCX
+                # options can settle on a different date than the future
+                # itself (e.g. CRUDEOIL options settle 17-AUG, the future
+                # settles 19-AUG).
+                quote_symbol = underlying
+            elif exchange.upper() in NO_SPOT_EXCHANGES:
+                # MCX (without an embedded expiry) and the currency segments
+                # list no spot instrument: there is a CRUDEOIL19AUG26FUT but
+                # no plain CRUDEOIL, so a spot quote returns nothing and the
+                # chain comes back with no underlying price at all. The
+                # near-month future is the pricing reference instead.
+                quote_exchange = exchange.upper()
+                resolved = resolve_underlying_quote(base_symbol, quote_exchange)
+                if resolved is None:
+                    return (
+                        False,
+                        {
+                            "status": "error",
+                            "message": (
+                                f"No unexpired futures found for {base_symbol} on "
+                                f"{quote_exchange}. {quote_exchange} options are priced "
+                                "against the near-month future, which this product does "
+                                "not currently have."
+                            ),
+                        },
+                        404,
+                    )
+                quote_symbol, quote_exchange = resolved
+                logger.info(
+                    f"{exchange.upper()} has no spot; pricing {base_symbol} against "
+                    f"{quote_symbol}"
                 )
-            quote_symbol, quote_exchange = resolved
-            logger.info(
-                f"{exchange.upper()} has no spot; pricing {base_symbol} against "
-                f"{quote_symbol}"
-            )
-        else:
-            # Use base symbol for index quotes (non-Delta)
-            quote_symbol = base_symbol if embedded_expiry else underlying
+            else:
+                # Use base symbol for index quotes (non-Delta) -- this is
+                # the branch every NFO/BFO (NIFTY/BANKNIFTY/SENSEX) request
+                # actually falls into.
+                quote_symbol = base_symbol if embedded_expiry else underlying
 
         # Step 3: Fetch underlying LTP
         logger.info(f"Fetching LTP for {quote_symbol} on {quote_exchange}")
