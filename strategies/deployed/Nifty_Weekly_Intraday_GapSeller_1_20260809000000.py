@@ -267,7 +267,7 @@ signal loop -- the gap decision and strike-selection scan each fire AT MOST
 ONCE PER DAY PER INSTRUMENT, inside the narrow 09:30-09:35 entry window.
 run_cycle evaluates NIFTY then SENSEX sequentially inline each tick (one
 history() call + up to two optionchain() calls per instrument, each bounded
-by Environment.timeout=10s) -- a deliberate choice to keep the script simpler
+by Environment.timeout=12s) -- a deliberate choice to keep the script simpler
 without reintroducing the actual bug class the executor pattern exists to
 prevent (nothing else in run_cycle is EVER blocked behind this: force-exit
 checks, pending-action resolution, and PnL reporting all still go through
@@ -613,7 +613,10 @@ class Environment:
             or "http://127.0.0.1:5000"
         )
         self.version = "v1"
-        self.timeout = 10.0
+        # 12.0, not the 10s most deployed strategies use: a 2026-08-29 safety
+        # margin against Shoonya's multiquotes batching delay (BATCH_SIZE=20 +
+        # a 1s inter-batch sleep) on this script's own optionchain() calls.
+        self.timeout = 12.0
         self.ltp_timeout = 3.0
         self.ws_url = os.getenv("WEBSOCKET_URL")
         self.strategy_tag = (

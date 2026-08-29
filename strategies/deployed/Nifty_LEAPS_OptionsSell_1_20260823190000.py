@@ -43,9 +43,11 @@ Main (sold) leg
 OTM strikes at 500-point increments from ATM (round(spot/500)*500 as base),
 scanned up to config.max_otm_steps (6, i.e. 3000pt OTM -- a DELIBERATE
 reduction from the validated backtest's 10 steps/5000pt, to keep every
-optionchain() scan band comfortably under the 10s client timeout every
-deployed strategy in this repo uses; see select_main_strike()'s own
-docstring for the measured-latency reasoning). Premium target Rs 350, band
+optionchain() scan band comfortably under this script's own 12s client
+timeout (bumped from the 10s most deployed strategies use, as a safety
+margin against Shoonya's multiquotes batching delay -- see
+select_main_strike()'s own docstring for the measured-latency reasoning).
+Premium target Rs 350, band
 300-400 -- picks whichever scanned strike has premium closest to 350 within
 the band; if none fall in the band, closest-to-350 among all scanned.
 Expiry is a genuinely long-dated QUARTERLY contract, resolved via
@@ -236,12 +238,13 @@ class Config:
                                             # NOT 10 (5000pt): with_quotes=True's real per-strike
                                             # broker quote fan-out was measured live at 32.53s for
                                             # a ~120-strike_count request (Nifty_TrendFollow_
-                                            # DualTF27_9_2's own finding), and every deployed
-                                            # strategy in this repo uses a 10s client timeout
-                                            # (Environment.timeout) -- a 60-strike_count band
-                                            # needed for 5000pt reach would likely always exceed
-                                            # that budget. 3000pt keeps every band's worst-case
-                                            # comfortably under 10s instead.
+                                            # DualTF27_9_2's own finding), and this script uses a
+                                            # 12s client timeout (Environment.timeout, bumped from
+                                            # the 10s most deployed strategies use as a safety
+                                            # margin) -- a 60-strike_count band needed for 5000pt
+                                            # reach would likely still exceed even that budget.
+                                            # 3000pt keeps every band's worst-case comfortably
+                                            # under 12s instead.
     main_strike_scan_bands: tuple = (10, 20, 30)   # expanding optionchain() strike_count --
                                             # try small (cheap, with_quotes=True fans out a
                                             # real broker quote call per strike) before
@@ -414,7 +417,11 @@ class Environment:
             or "http://127.0.0.1:5000"
         )
         self.version = "v1"
-        self.timeout = 10.0
+        # 12.0, not the 10s most deployed strategies use: a 2026-08-29 safety
+        # margin against Shoonya's multiquotes batching delay (BATCH_SIZE=20 +
+        # a 1s inter-batch sleep can push a wide with_quotes=True optionchain()
+        # scan close to 10s on its own -- see main_strike_scan_bands' docstring).
+        self.timeout = 12.0
         self.ltp_timeout = 3.0
         self.ws_url = os.getenv("WEBSOCKET_URL")
         self.strategy_tag = (
@@ -1022,11 +1029,11 @@ def select_main_strike(client, spot: float, side: str, expiry_compact: str) -> O
     its own documented sample response for NIFTY lists strikes 100 points
     apart near ATM (26100/26200/26300), not 50. config.max_otm_steps is
     deliberately capped at 6 (3000pt OTM, not the wider 5000pt a 10-step
-    scan would need) so the final band (30) stays comfortably under the
-    ~10s client timeout every deployed strategy in this repo uses
-    (Environment.timeout) -- at the measured ~0.133s/row rate, a
-    60-strike_count band (needed for 5000pt reach) would likely exceed
-    that budget most of the time, while 30 (needed for 3000pt reach) has
+    scan would need) so the final band (30) stays comfortably under this
+    script's own 12s client timeout (Environment.timeout, bumped from the
+    10s most deployed strategies use) -- at the measured ~0.133s/row rate,
+    a 60-strike_count band (needed for 5000pt reach) would likely still
+    exceed that budget most of the time, while 30 (needed for 3000pt reach) has
     real margin (~8s worst case)."""
     atm = round(spot / config.main_strike_round) * config.main_strike_round
     direction = 1 if side == "CE" else -1
@@ -1703,7 +1710,7 @@ class StrategyEngine:
                         main = select_main_strike(self.client, spot, side, expiry_compact)
                     except Exception as exc:
                         # Broad catch, not just RuntimeError -- a real HTTP
-                        # timeout (env.timeout=10s) raises a different
+                        # timeout (env.timeout=12s) raises a different
                         # exception type that a narrower catch would miss
                         # entirely, silently swallowed by the fire-and-
                         # forget executor submission. Treated as a failed

@@ -445,7 +445,11 @@ class Environment:
             or "http://127.0.0.1:5000"
         )
         self.version = "v1"
-        self.timeout = 10.0
+        # 12.0, not the 10s most deployed strategies use: a 2026-08-29 safety
+        # margin against Shoonya's multiquotes batching delay (BATCH_SIZE=20 +
+        # a 1s inter-batch sleep) on the monthly delta strike scan's
+        # with_quotes=True optionchain() calls.
+        self.timeout = 12.0
         self.ltp_timeout = 3.0
         self.ws_url = os.getenv("WEBSOCKET_URL")
         self.strategy_tag = (
