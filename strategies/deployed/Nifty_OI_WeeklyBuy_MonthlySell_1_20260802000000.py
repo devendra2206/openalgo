@@ -3534,15 +3534,22 @@ def main():
 
     price_stream = PriceStream(client)
 
-    already_known = []
-    today_key = datetime.now(IST).date().isoformat()
-    if state_store.state.current_day == today_key:
-        already_known.append({"symbol": UNDERLYING_SYMBOL, "exchange": UNDERLYING_SPOT_EXCHANGE})
-        for leg in state_store.state.legs.values():
-            if leg.position.symbol:
-                already_known.append({"symbol": leg.position.symbol, "exchange": OPTIONS_EXCHANGE})
-    else:
-        already_known.append({"symbol": UNDERLYING_SYMBOL, "exchange": UNDERLYING_SPOT_EXCHANGE})
+    already_known = [{"symbol": UNDERLYING_SYMBOL, "exchange": UNDERLYING_SPOT_EXCHANGE}]
+    # NOT gated on current_day == today: current_day only tracks the daily
+    # reset (set once a scheduled cycle actually runs, not yet at this point
+    # in startup), unrelated to whether an open position still exists. This
+    # strategy holds positions for weeks (monthly leg), so on any restart
+    # after the entry day -- i.e. virtually every restart -- current_day is
+    # still whatever day was last saved, never "today" yet, and gating on it
+    # here silently skipped re-subscribing every open leg's own option
+    # symbol to the price feed. Confirmed live 2026-08-28 on the sibling
+    # LEAPS strategy (identical pattern): LTP froze at entry price and PnL
+    # stayed at Rs0 for days once the price stream lost the symbol. Whether
+    # a leg needs resubscribing depends only on whether it actually has an
+    # open position right now.
+    for leg in state_store.state.legs.values():
+        if leg.position.symbol:
+            already_known.append({"symbol": leg.position.symbol, "exchange": OPTIONS_EXCHANGE})
     if already_known:
         # Seed BEFORE start() -- see seed_instruments' own docstring for why
         # this avoids a race between start()'s background _connect() and a

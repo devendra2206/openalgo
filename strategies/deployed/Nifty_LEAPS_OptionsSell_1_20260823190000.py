@@ -2965,13 +2965,24 @@ def main():
     price_stream = PriceStream(client)
 
     already_known = [{"symbol": UNDERLYING_SYMBOL, "exchange": UNDERLYING_SPOT_EXCHANGE}]
-    today_key = datetime.now(IST).date().isoformat()
-    if state_store.state.current_day == today_key:
-        pos = state_store.state.position
-        if pos.short_symbol:
-            already_known.append({"symbol": pos.short_symbol, "exchange": OPTIONS_EXCHANGE})
-        if pos.hedge_symbol:
-            already_known.append({"symbol": pos.hedge_symbol, "exchange": OPTIONS_EXCHANGE})
+    # NOT gated on current_day == today: current_day only tracks the daily
+    # today_realized_pnl/_leaps_expiry_cache reset (set by _reset_day_if_needed,
+    # which only runs during a scheduled cycle -- not yet, at this point in
+    # startup). LEAPS holds a position for weeks/months, so on any restart
+    # after the entry day (i.e. virtually every restart), current_day is
+    # still whatever day was last saved before the process stopped, never
+    # "today" yet -- gating on it here silently skipped re-subscribing the
+    # open position's own option legs to the price feed on every such
+    # restart, confirmed live 2026-08-28: a position opened 2026-08-24 sat
+    # with LTP==entry_px and PnL frozen at ₹0 for 4+ days, since
+    # price_stream.get_ltp() had nothing to return but its own
+    # never-fabricate-movement fallback. Whether a position needs
+    # resubscribing depends only on whether one is actually open right now.
+    pos = state_store.state.position
+    if pos.short_symbol:
+        already_known.append({"symbol": pos.short_symbol, "exchange": OPTIONS_EXCHANGE})
+    if pos.hedge_symbol:
+        already_known.append({"symbol": pos.hedge_symbol, "exchange": OPTIONS_EXCHANGE})
     # Seed BEFORE start() -- see PriceStream.seed_instruments' own docstring
     # for why this avoids a race between start()'s background _connect()
     # and a separate add_instruments() call from this (the main) thread.
