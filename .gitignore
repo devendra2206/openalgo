@@ -134,3 +134,18 @@ workspace/**/.sample.env
 
 # Local Git worktrees created for isolated feature and documentation work.
 .worktrees/
+
+# Local live-broker backtest/dry-run tooling with a hardcoded API key
+# (algodev.co.in) -- personal dev scripts, never meant to be committed.
+# A committed secret must be rotated, not just deleted, so keep these out
+# of the repo entirely rather than relying on remembering not to `git add`
+# them.
+strategies/backtest/run_oi_live_backtest.py
+strategies/backtest/dry_run_oi_positional_live.py
+strategies/backtest/live_backtest_oi_positional_aug2026.py
+strategies/backtest/live_backtest_oi_positional_aug2026_always_prevclose.py
+# Generated outputs from the scripts above.
+oi_live_fixed930_state.json
+oi_live_original_state.json
+strategies/backtest/results_live/
+strategies/backtest/results_live_smoke/
