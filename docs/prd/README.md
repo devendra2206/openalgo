@@ -10,15 +10,15 @@ Use `PRD.md` as the source for current behavior. It is grounded in `DISCOVERY_MA
 
 ## Current Snapshot
 
-- Documented HTTP endpoints: 517
+- Documented HTTP endpoints: 500
 - RESTX `/api/v1` endpoints: 57
-- Flask blueprint routes: 459
+- Flask blueprint routes: 442
 - App-level routes: 1
 - Broker plugins: 36
 - RESTX Swagger UI: deliberately disabled (`doc=False`)
 - BDD feature files: 17
-- BDD scenario definitions: 86
-- BDD expanded cases: 184
+- BDD scenario definitions: 85
+- BDD expanded cases: 183
 - Application / SDK: `2.0.1.4` / `2.0.2`
 
 ## Existing Module PRDs
@@ -34,6 +34,7 @@ The files below are module-level historical PRDs. Treat them as secondary refere
 - [Sandbox Architecture](./sandbox-architecture.md)
 - [Sandbox Execution Engine](./sandbox-execution-engine.md)
 - [Sandbox Margin System](./sandbox-margin-system.md)
+- [Strategy Module and RMS](./strategy-module-rms.md)
 - [Python Strategies](./python-strategies.md)
 - [Python Strategies API Reference](./python-strategies-api-reference.md)
 - [Python Strategies Process Management](./python-strategies-process-management.md)
