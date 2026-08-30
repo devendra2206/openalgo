@@ -111,6 +111,37 @@ git push origin custom-strategies
 ```
 
 **Sync log:**
+- **2026-08-30**: 85 commits pulled from upstream. Only `frontend/dist/`
+  conflicted (the routine content-hash rename/rename set) — resolved by
+  taking `main`'s copy wholesale. Every customized file (`app.py`,
+  `blueprints/python_strategy.py`, `services/option_chain_service.py`,
+  `services/websocket_client.py`, `sandbox/websocket_execution_engine.py`,
+  `websocket_proxy/server.py`, `broker/shoonya/streaming/shoonya_adapter.py`,
+  `broker/shoonya/api/data.py`, `broker/fyers/streaming/fyers_websocket_adapter.py`,
+  `broker/fyers/streaming/fyers_adapter.py`, `CLAUDE.md`) came through with a
+  0-line diff against the pre-merge tip, except `app.py`: upstream renamed
+  its own `strategy_bp` to `strategy_module_bp` (a new Strategy Module
+  system replacing the old `blueprints/strategy.py`/`database/strategy_db.py`)
+  and added a new `watchlist_bp` — purely additive/orthogonal, this fork's
+  `python_strategy_bp` CSRF exemptions (including `api_complete_force_exit`)
+  untouched.
+
+  All 78 changed Python files compile clean. Full suite: 3749 passed, 36
+  failed, 9 errors, 40 skipped, 1 xfailed — every failure/error traced to
+  one of three causes, not a regression from this merge: (1) a pre-existing
+  environment gap reproducing identically on the pre-merge commit in a
+  throwaway `git worktree` (email/mstock/portfolio/telegram/websocket
+  async-plugin gaps, 2 OI-simulation cases,
+  `test_rate_limits_mock.py`/`test_websocket_service.py` — the same set
+  documented in the 2026-08-29 entry below); (2) confirmed test flakiness
+  reproducing on both branches (`test_precompress_assets.py`'s
+  `os.urandom()`-based compressibility check — different specific test
+  fails from run to run on both the pre- and post-merge tip); (3) a new
+  upstream feature's test-isolation artifact (`test_watchlist_db.py`, all
+  14 failures — every one of its 16 tests passes standalone/as a whole
+  file, only fails amid full-suite ordering pollution from some earlier
+  test's leftover shared state; the underlying watchlist code itself is
+  correct).
 - **2026-08-29**: 303 commits pulled from upstream (by far the largest sync
   to date — previous max was 39; `main` had not been synced since 2026-08-04).
   Real conflicts (beyond the routine `frontend/dist/` set) in 10 files:
