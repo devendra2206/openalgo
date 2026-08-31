@@ -1409,7 +1409,13 @@ class StrategyEngine:
             _candle_key_boundary(cached_for_boundary.candle_key)
             if cached_for_boundary is not None else None
         )
-        have_current_candle = cached_boundary is not None and cached_boundary >= current_boundary
+        # candle_key is the START of the last CLOSED bar (compute_instrument_signal
+        # drops the still-forming last row), so it always lags current_boundary
+        # (the start of the currently-forming bar) by exactly one bar_minutes
+        # interval -- compare against that, not against current_boundary itself,
+        # or this never matches and due_signal is permanently true.
+        last_closed_boundary = current_boundary - timedelta(minutes=config.bar_minutes)
+        have_current_candle = cached_boundary is not None and cached_boundary >= last_closed_boundary
         due_signal = last is None or not have_current_candle
 
         if (due_daily or due_signal) and inst.name not in self._signal_refresh_pending:
