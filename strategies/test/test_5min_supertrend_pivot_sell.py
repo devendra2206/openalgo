@@ -18,7 +18,9 @@ exact rule text each test exercises.
 
 import importlib.util
 import sys
+from datetime import datetime as real_datetime
 from datetime import time as dtime
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -640,3 +642,270 @@ class TestDailyPivotFormula:
         assert s1 == pytest.approx(expected_s1)
         assert r2 == pytest.approx(expected_r2)
         assert s2 == pytest.approx(expected_s2)
+
+
+# ---------------------------------------------------------------------------
+# get_signal(): candle-boundary due_signal check compares against
+# last_closed_boundary (current_boundary minus one bar_minutes interval),
+# not current_boundary itself -- the 2026-08-31 off-by-one fix -- plus the
+# indicator_refresh_interval cooldown that paces RETRIES against the SAME
+# last_closed_boundary (ported from MCX_CrudeOil_EMA34_RSI_ADX_Intraday_1's
+# identical mechanism). Both bugs were confirmed live before this fix:
+# continuous ~10s-interval optionchain() calls for minutes on end around
+# every candle close (13 calls observed for a single 9:40 boundary).
+# ---------------------------------------------------------------------------
+class _FixedDateTime:
+    _fixed = None
+
+    @classmethod
+    def fromisoformat(cls, value):
+        return real_datetime.fromisoformat(value)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._fixed
+
+
+class TestGetSignalCandleBoundaryAndCooldown:
+    def _freeze(self, script_module, monkeypatch, hour, minute, second=0):
+        fixed = script_module.IST.localize(real_datetime(2026, 8, 31, hour, minute, second))
+        _FixedDateTime._fixed = fixed
+        monkeypatch.setattr(script_module, "datetime", _FixedDateTime)
+        return fixed
+
+    def _run_sync(self, engine, monkeypatch):
+        """Runs get_signal's background dispatch inline instead of on
+        _fill_executor -- deterministic, no thread-timing races."""
+        monkeypatch.setattr(engine._fill_executor, "submit", lambda fn, *a, **k: fn(*a, **k))
+
+    def test_dispatches_on_first_call(self, script_module, engine, monkeypatch):
+        inst = script_module.INSTRUMENTS[0]
+        self._freeze(script_module, monkeypatch, 9, 20, 5)
+        calls = []
+        monkeypatch.setattr(engine, "_refresh_signal_chain_bg", lambda *a, **k: calls.append(a))
+        self._run_sync(engine, monkeypatch)
+
+        engine.get_signal(inst, ltp=100.0)
+
+        assert len(calls) == 1
+
+    def test_no_dispatch_when_cache_already_covers_last_closed_boundary(
+        self, script_module, engine, monkeypatch
+    ):
+        """Cache's candle_key IS the last CLOSED bar (10:00-10:05's start),
+        while wall clock sits mid-candle in the 10:05-10:10 bucket -- no
+        refresh is due at all until that bucket itself closes."""
+        inst = script_module.INSTRUMENTS[0]
+        now = self._freeze(script_module, monkeypatch, 10, 7, 0)
+        engine._signal_cache[inst.name] = _make_signal(script_module, candle_key="2026-08-31 10:00:00+05:30")
+        engine._last_indicator_refresh[inst.name] = now
+        engine._last_daily_refresh[inst.name] = now
+        calls = []
+        monkeypatch.setattr(engine, "_refresh_signal_chain_bg", lambda *a, **k: calls.append(a))
+        self._run_sync(engine, monkeypatch)
+
+        engine.get_signal(inst, ltp=100.0)
+
+        assert calls == []
+
+    def test_dispatches_immediately_on_a_fresh_boundary_regardless_of_cooldown(
+        self, script_module, engine, monkeypatch
+    ):
+        """A genuine boundary transition always gets its first retry
+        attempt, even if the previous (different-boundary) attempt was
+        made moments ago -- the cooldown only paces RETRIES against the
+        SAME last_closed_boundary, never the first attempt on a new one."""
+        inst = script_module.INSTRUMENTS[0]
+        now = self._freeze(script_module, monkeypatch, 10, 5, 2)
+        # Cache still reflects the candle that was the last-closed one
+        # during the PREVIOUS bucket (09:55-10:00's start).
+        engine._signal_cache[inst.name] = _make_signal(script_module, candle_key="2026-08-31 09:55:00+05:30")
+        engine._last_indicator_refresh[inst.name] = now
+        engine._last_daily_refresh[inst.name] = now
+        # A prior dispatch was tracked against the PREVIOUS last_closed_boundary.
+        engine._indicator_cooldown_boundary[inst.name] = script_module.IST.localize(
+            real_datetime(2026, 8, 31, 9, 55, 0)
+        )
+        calls = []
+        monkeypatch.setattr(engine, "_refresh_signal_chain_bg", lambda *a, **k: calls.append(a))
+        self._run_sync(engine, monkeypatch)
+
+        engine.get_signal(inst, ltp=100.0)
+
+        assert len(calls) == 1
+
+    def test_cooldown_blocks_retry_within_interval_for_same_boundary(
+        self, script_module, engine, monkeypatch
+    ):
+        inst = script_module.INSTRUMENTS[0]
+        now = self._freeze(script_module, monkeypatch, 10, 5, 5)
+        engine._signal_cache[inst.name] = _make_signal(script_module, candle_key="2026-08-31 09:50:00+05:30")
+        engine._last_indicator_refresh[inst.name] = now - timedelta(seconds=5)
+        engine._last_daily_refresh[inst.name] = now
+        last_closed_boundary = script_module.IST.localize(real_datetime(2026, 8, 31, 10, 0, 0))
+        engine._indicator_cooldown_boundary[inst.name] = last_closed_boundary
+        calls = []
+        monkeypatch.setattr(engine, "_refresh_signal_chain_bg", lambda *a, **k: calls.append(a))
+        self._run_sync(engine, monkeypatch)
+
+        engine.get_signal(inst, ltp=100.0)
+
+        assert calls == [], (
+            "expected the cooldown to block this retry: only 5s have passed "
+            f"since the last attempt against the same {last_closed_boundary} "
+            f"boundary, below indicator_refresh_interval="
+            f"{script_module.config.indicator_refresh_interval}s"
+        )
+
+    def test_retry_allowed_once_cooldown_interval_elapses_same_boundary(
+        self, script_module, engine, monkeypatch
+    ):
+        inst = script_module.INSTRUMENTS[0]
+        now = self._freeze(script_module, monkeypatch, 10, 5, 20)
+        engine._signal_cache[inst.name] = _make_signal(script_module, candle_key="2026-08-31 09:50:00+05:30")
+        engine._last_indicator_refresh[inst.name] = now - timedelta(
+            seconds=script_module.config.indicator_refresh_interval
+        )
+        engine._last_daily_refresh[inst.name] = now
+        last_closed_boundary = script_module.IST.localize(real_datetime(2026, 8, 31, 10, 0, 0))
+        engine._indicator_cooldown_boundary[inst.name] = last_closed_boundary
+        calls = []
+        monkeypatch.setattr(engine, "_refresh_signal_chain_bg", lambda *a, **k: calls.append(a))
+        self._run_sync(engine, monkeypatch)
+
+        engine.get_signal(inst, ltp=100.0)
+
+        assert len(calls) == 1
+
+    def test_broker_publish_lag_retries_paced_by_cooldown_not_every_tick(
+        self, script_module, engine, monkeypatch
+    ):
+        """Regression for the exact live incident (2026-08-31): the
+        broker's history() lagged past a 9:40 candle close and, before this
+        fix, every 10s scheduler tick re-dispatched a background refresh
+        (and, while still_enterable, a real optionchain() call) the whole
+        time -- 13 calls logged for that one boundary, matching a ~127s lag
+        at a 10s tick cadence. With the cooldown in place, the same lag
+        must produce meaningfully fewer dispatches."""
+        inst = script_module.INSTRUMENTS[0]
+        scheduler_interval = script_module.config.scheduler_interval
+        cooldown = script_module.config.indicator_refresh_interval
+
+        # Cache reflects the candle before the one that should have just
+        # closed at 9:40:00 -- i.e. the broker hasn't published 09:35-09:40 yet.
+        engine._signal_cache[inst.name] = _make_signal(script_module, candle_key="2026-08-31 09:30:00+05:30")
+        engine._last_daily_refresh[inst.name] = script_module.IST.localize(
+            real_datetime(2026, 8, 31, 9, 40, 0)
+        )
+
+        dispatch_count = 0
+
+        def fake_dispatch(*_a, **_k):
+            nonlocal dispatch_count
+            dispatch_count += 1
+            engine._last_indicator_refresh[inst.name] = script_module.datetime.now(script_module.IST)
+            engine._signal_refresh_pending.discard(inst.name)
+
+        monkeypatch.setattr(engine, "_refresh_signal_chain_bg", fake_dispatch)
+        self._run_sync(engine, monkeypatch)
+
+        lag_seconds = 127
+        t = 0
+        while t <= lag_seconds:
+            fixed = script_module.IST.localize(real_datetime(2026, 8, 31, 9, 40, 0)) + timedelta(seconds=t)
+            _FixedDateTime._fixed = fixed
+            monkeypatch.setattr(script_module, "datetime", _FixedDateTime)
+            engine.get_signal(inst, ltp=100.0)
+            t += scheduler_interval
+
+        naive_tick_count = (lag_seconds // scheduler_interval) + 1
+        assert dispatch_count < naive_tick_count, (
+            f"expected fewer than {naive_tick_count} dispatches (one per "
+            f"{scheduler_interval}s tick) over a {lag_seconds}s broker lag; "
+            f"got {dispatch_count} -- cooldown={cooldown}s should pace this"
+        )
+        assert dispatch_count <= (lag_seconds // cooldown) + 2
+
+
+# ---------------------------------------------------------------------------
+# _refresh_signal_chain_bg(): chain re-fetch is skipped once the chain
+# cache is already confirmed current for the reference candle_key --
+# ported from MCX_CrudeOil_EMA34_RSI_ADX_Intraday_1's identical dedup fix.
+# Without this, every due_signal retry (while waiting for the broker's
+# history() to publish the just-closed bar) also re-fetched the option
+# chain, not just the indicator.
+# ---------------------------------------------------------------------------
+class TestChainRefreshDedup:
+    def _stub_chain_refresh(self, engine, monkeypatch):
+        calls = []
+        monkeypatch.setattr(engine, "_refresh_chain_cache", lambda i: calls.append(i.name) or True)
+        return calls
+
+    def test_skips_chain_refetch_when_already_current_for_fresh_candle(
+        self, script_module, engine, monkeypatch
+    ):
+        inst = script_module.INSTRUMENTS[0]
+        engine._daily_pivot_cache[inst.name] = (100.0, 80.0, 110.0, 70.0)
+        fresh_signal = _make_signal(script_module, candle_key="2026-08-31 09:40:00+05:30")
+        monkeypatch.setattr(script_module, "compute_instrument_signal", lambda *a, **k: fresh_signal)
+        engine._chain_cache_candle_key[inst.name] = "2026-08-31 09:40:00+05:30"
+        chain_calls = self._stub_chain_refresh(engine, monkeypatch)
+
+        engine._refresh_signal_chain_bg(inst, ltp=100.0, refresh_chain=True, refresh_daily=False)
+
+        assert chain_calls == []
+
+    def test_refetches_chain_when_candle_key_advances(self, script_module, engine, monkeypatch):
+        inst = script_module.INSTRUMENTS[0]
+        engine._daily_pivot_cache[inst.name] = (100.0, 80.0, 110.0, 70.0)
+        fresh_signal = _make_signal(script_module, candle_key="2026-08-31 09:45:00+05:30")
+        monkeypatch.setattr(script_module, "compute_instrument_signal", lambda *a, **k: fresh_signal)
+        engine._chain_cache_candle_key[inst.name] = "2026-08-31 09:40:00+05:30"  # stale
+        chain_calls = self._stub_chain_refresh(engine, monkeypatch)
+
+        engine._refresh_signal_chain_bg(inst, ltp=100.0, refresh_chain=True, refresh_daily=False)
+
+        assert chain_calls == [inst.name]
+        assert engine._chain_cache_candle_key[inst.name] == "2026-08-31 09:45:00+05:30"
+
+    def test_falls_back_to_previous_signal_candle_key_when_fetch_fails(
+        self, script_module, engine, monkeypatch
+    ):
+        """A bare history() blip (fresh is None) must not force a chain
+        re-fetch when the chain is already correctly cached for the last
+        known-good candle."""
+        inst = script_module.INSTRUMENTS[0]
+        engine._daily_pivot_cache[inst.name] = (100.0, 80.0, 110.0, 70.0)
+        engine._signal_cache[inst.name] = _make_signal(script_module, candle_key="2026-08-31 09:40:00+05:30")
+        monkeypatch.setattr(script_module, "compute_instrument_signal", lambda *a, **k: None)
+        engine._chain_cache_candle_key[inst.name] = "2026-08-31 09:40:00+05:30"
+        chain_calls = self._stub_chain_refresh(engine, monkeypatch)
+
+        engine._refresh_signal_chain_bg(inst, ltp=100.0, refresh_chain=True, refresh_daily=False)
+
+        assert chain_calls == []
+
+    def test_refetches_when_fetch_fails_and_previous_candle_key_is_stale(
+        self, script_module, engine, monkeypatch
+    ):
+        inst = script_module.INSTRUMENTS[0]
+        engine._daily_pivot_cache[inst.name] = (100.0, 80.0, 110.0, 70.0)
+        engine._signal_cache[inst.name] = _make_signal(script_module, candle_key="2026-08-31 09:45:00+05:30")
+        monkeypatch.setattr(script_module, "compute_instrument_signal", lambda *a, **k: None)
+        engine._chain_cache_candle_key[inst.name] = "2026-08-31 09:40:00+05:30"  # stale
+        chain_calls = self._stub_chain_refresh(engine, monkeypatch)
+
+        engine._refresh_signal_chain_bg(inst, ltp=100.0, refresh_chain=True, refresh_daily=False)
+
+        assert chain_calls == [inst.name]
+
+    def test_refresh_chain_false_never_touches_chain(self, script_module, engine, monkeypatch):
+        inst = script_module.INSTRUMENTS[0]
+        engine._daily_pivot_cache[inst.name] = (100.0, 80.0, 110.0, 70.0)
+        fresh_signal = _make_signal(script_module, candle_key="2026-08-31 09:45:00+05:30")
+        monkeypatch.setattr(script_module, "compute_instrument_signal", lambda *a, **k: fresh_signal)
+        chain_calls = self._stub_chain_refresh(engine, monkeypatch)
+
+        engine._refresh_signal_chain_bg(inst, ltp=100.0, refresh_chain=False, refresh_daily=False)
+
+        assert chain_calls == []
