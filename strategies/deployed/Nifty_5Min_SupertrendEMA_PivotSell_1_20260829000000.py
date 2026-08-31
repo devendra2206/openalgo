@@ -1322,6 +1322,14 @@ class StrategyEngine:
         self._pending_action_inflight: set = set()
         self._expiry_cache: dict[str, str] = {}
         self._chain_cache: dict[str, dict] = {}
+        # Which candle_key self._chain_cache[inst.name] was actually
+        # successfully populated for -- see _refresh_signal_chain_bg's
+        # comment for why this is needed on top of the cooldown below.
+        self._chain_cache_candle_key: dict[str, str] = {}
+        # Paces due_signal retries against the SAME last_closed_boundary --
+        # see get_signal's comment (ported from MCX_CrudeOil_EMA34_RSI_ADX,
+        # confirmed live 2026-08-11 there and 2026-08-31 here).
+        self._indicator_cooldown_boundary: dict[str, datetime] = {}
         self._signal_refresh_pending: set[str] = set()
 
     def _save_state(self):
@@ -1348,21 +1356,39 @@ class StrategyEngine:
         entry = self._running_extreme.get(inst_name)
         return (entry[1], entry[2]) if entry is not None else (None, None)
 
-    def _refresh_chain_cache(self, inst: InstrumentConfig):
+    def _refresh_chain_cache(self, inst: InstrumentConfig) -> bool:
+        """Returns True if self._chain_cache[inst.name] was actually updated
+        (fetch succeeded), False otherwise -- callers use this to decide
+        whether it's safe to mark the chain as done for the current candle,
+        or whether it must keep being retried."""
         try:
             expiry = self._expiry_cache.get(inst.name)
             if expiry is None:
                 expiry = resolve_current_week_expiry(self.client, inst)
                 self._expiry_cache[inst.name] = expiry
             self._chain_cache[inst.name] = fetch_chain(self.client, inst, expiry)
+            return True
         except Exception as exc:
             Log.warning(f"[{inst.name}] Background chain refresh failed (will retry live at "
                         f"entry if needed): {exc}")
+            return False
 
     def _refresh_signal_chain_bg(self, inst: InstrumentConfig, ltp: Optional[float],
                                    refresh_chain: bool, refresh_daily: bool):
         """Runs on _fill_executor -- makes get_signal's periodic refresh
-        genuinely non-blocking, same pattern as Pivot_Supertrend."""
+        genuinely non-blocking, same pattern as Pivot_Supertrend.
+
+        Chain refresh is skipped when self._chain_cache was already
+        SUCCESSFULLY populated for the "reference" candle_key -- this
+        cycle's fresh signal if the indicator fetch succeeded, else the
+        PREVIOUS cached signal. Ported from MCX_CrudeOil_EMA34_RSI_ADX's
+        identical fix (2026-08-11 there): without this, get_signal's
+        due_signal retries (while waiting for the broker's history() to
+        publish the just-closed bar) re-fetch the chain on every retry too,
+        not just the indicator -- confirmed live here 2026-08-31 via 13
+        optionchain() calls for a single candle boundary."""
+        previous = self._signal_cache.get(inst.name)
+        fresh = None
         try:
             if refresh_daily:
                 fresh_daily = fetch_daily_pivot(self.client, inst)
@@ -1387,8 +1413,17 @@ class StrategyEngine:
         except Exception as exc:
             Log.warning(f"[{inst.name}] Background indicator refresh failed (will retry "
                         f"next cycle): {exc}")
+
         if refresh_chain:
-            self._refresh_chain_cache(inst)
+            reference_signal = fresh if fresh is not None else previous
+            reference_candle_key = reference_signal.candle_key if reference_signal is not None else None
+            chain_already_current = (
+                reference_candle_key is not None
+                and self._chain_cache_candle_key.get(inst.name) == reference_candle_key
+            )
+            if not chain_already_current:
+                if self._refresh_chain_cache(inst) and reference_candle_key is not None:
+                    self._chain_cache_candle_key[inst.name] = reference_candle_key
         self._signal_refresh_pending.discard(inst.name)
 
     def get_signal(self, inst: InstrumentConfig, ltp: Optional[float] = None,
@@ -1418,8 +1453,24 @@ class StrategyEngine:
         have_current_candle = cached_boundary is not None and cached_boundary >= last_closed_boundary
         due_signal = last is None or not have_current_candle
 
-        if (due_daily or due_signal) and inst.name not in self._signal_refresh_pending:
+        # Cooldown floor, separate from due_signal -- ported from
+        # MCX_CrudeOil_EMA34_RSI_ADX's identical mechanism. Boundary-aware,
+        # not purely time-based: tracking which last_closed_boundary the
+        # cooldown timer covers means a genuine boundary transition always
+        # bypasses the cooldown for its first attempt, and only repeated
+        # retries against that SAME boundary (while the broker's history()
+        # hasn't published the just-closed bar yet) get paced to
+        # indicator_refresh_interval instead of firing every scheduler tick.
+        cooldown_boundary = self._indicator_cooldown_boundary.get(inst.name)
+        cooldown_elapsed = (
+            last is None
+            or cooldown_boundary != last_closed_boundary
+            or (now - last).total_seconds() >= config.indicator_refresh_interval
+        )
+
+        if (due_daily or due_signal) and cooldown_elapsed and inst.name not in self._signal_refresh_pending:
             self._signal_refresh_pending.add(inst.name)
+            self._indicator_cooldown_boundary[inst.name] = last_closed_boundary
             self._fill_executor.submit(
                 self._refresh_signal_chain_bg, inst, ltp, refresh_chain, due_daily
             )
