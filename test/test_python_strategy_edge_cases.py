@@ -569,6 +569,87 @@ def test_stop_restored_psutil_process_does_not_call_wait(ps_module, monkeypatch)
     assert ps_module.STRATEGY_CONFIGS["restored"]["pid"] is None
 
 
+def test_stop_process_releases_lock_before_log_cleanup(ps_module, monkeypatch):
+    """cleanup_strategy_logs() must run AFTER PROCESS_LOCK is released.
+
+    Regression for the 2026-09-02 fix: cleanup_strategy_logs() previously
+    ran while stop_strategy_process() still held PROCESS_LOCK, despite a
+    comment claiming otherwise. Since api_get_strategies() (which the
+    strategies list view depends on) also needs PROCESS_LOCK via
+    cleanup_dead_processes(), a slow log-file scan/delete during a stop
+    blocked that view for its entire duration -- while every other
+    blueprint kept working, since nothing else needs this lock. Confirmed
+    live: the strategies view hung twice while the rest of the app was
+    fine.
+
+    PROCESS_LOCK is an RLock, so re-acquiring it from the SAME thread would
+    "succeed" even while genuinely held (reentrancy) -- proving a real
+    release requires attempting the acquire from a DIFFERENT thread.
+    """
+    import threading
+
+    class FakeProcess:
+        pid = 636363
+
+        def __init__(self):
+            self.terminated = False
+            self.killed = False
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+
+        def is_running(self):
+            return not self.terminated
+
+        def status(self):
+            return ps_module.psutil.STATUS_ZOMBIE
+
+    process = FakeProcess()
+    ps_module.RUNNING_STRATEGIES["locktest"] = {
+        "process": process,
+        "pid": process.pid,
+        "started_at": datetime.now(IST),
+        "log_file": None,
+    }
+    ps_module.STRATEGY_CONFIGS["locktest"] = {
+        "name": "LockTest",
+        "exchange": "NSE",
+        "is_running": True,
+        "pid": process.pid,
+    }
+
+    monkeypatch.setattr(ps_module.psutil, "pid_exists", lambda pid: True)
+    monkeypatch.setattr(ps_module, "save_configs", lambda: None)
+    monkeypatch.setattr(ps_module, "broadcast_status_update", lambda *a, **kw: None)
+
+    lock_was_free = {"value": None}
+
+    def fake_cleanup(strategy_id):
+        def _try_acquire_from_other_thread():
+            acquired = ps_module.PROCESS_LOCK.acquire(blocking=True, timeout=2)
+            lock_was_free["value"] = acquired
+            if acquired:
+                ps_module.PROCESS_LOCK.release()
+
+        t = threading.Thread(target=_try_acquire_from_other_thread)
+        t.start()
+        t.join(timeout=3)
+
+    monkeypatch.setattr(ps_module, "cleanup_strategy_logs", fake_cleanup)
+
+    success, msg = ps_module.stop_strategy_process("locktest")
+
+    assert success, msg
+    assert lock_was_free["value"] is True, (
+        "PROCESS_LOCK was still held (by another thread's measure) while "
+        "cleanup_strategy_logs ran -- this reintroduces the strategies-list-"
+        "view hang."
+    )
+
+
 def test_cleanup_dead_processes_clears_restored_zombie(ps_module, monkeypatch):
     """A zombie psutil.Process should be reaped from strategy state."""
 

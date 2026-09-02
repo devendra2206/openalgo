@@ -767,19 +767,30 @@ def stop_strategy_process(strategy_id):
             broadcast_status_update(strategy_id, status, status_message)
 
             logger.info(f"Stopped strategy {strategy_id} at {ist_now.strftime('%H:%M:%S IST')}")
-
-            # Cleanup old log files based on configured limits
-            # Run outside the lock to avoid blocking
-            try:
-                cleanup_strategy_logs(strategy_id)
-            except Exception as cleanup_err:
-                logger.warning(f"Log cleanup failed for {strategy_id}: {cleanup_err}")
-
-            return True, f"Strategy stopped at {ist_now.strftime('%H:%M:%S IST')}"
+            stopped_ok = True
+            stop_message = f"Strategy stopped at {ist_now.strftime('%H:%M:%S IST')}"
 
         except Exception as e:
             logger.exception(f"Failed to stop strategy {strategy_id}: {e}")
             return False, f"Failed to stop strategy: {str(e)}"
+
+    # Cleanup old log files based on configured limits -- runs AFTER
+    # PROCESS_LOCK is released (moved 2026-09-02; previously ran inside the
+    # lock despite a comment here claiming otherwise) so a slow filesystem
+    # scan/delete never blocks other PROCESS_LOCK holders. Notably,
+    # api_get_strategies()'s cleanup_dead_processes() needs this same lock
+    # on every load of the strategies list view -- confirmed live that the
+    # view hung while every other blueprint kept working, exactly the shape
+    # of a PROCESS_LOCK holder stuck behind a slow call inside the lock.
+    # cleanup_strategy_logs() itself needs no lock: it only touches log
+    # files on disk and re-checks RUNNING_STRATEGIES (already updated above
+    # before the lock was released) before doing anything.
+    try:
+        cleanup_strategy_logs(strategy_id)
+    except Exception as cleanup_err:
+        logger.warning(f"Log cleanup failed for {strategy_id}: {cleanup_err}")
+
+    return stopped_ok, stop_message
 
 
 def psutil_process_has_exited(process):

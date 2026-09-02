@@ -19,6 +19,7 @@ import logging
 import os
 import threading
 import time
+import tracemalloc
 from datetime import datetime, timezone
 
 import psutil
@@ -38,6 +39,15 @@ logger = logging.getLogger(__name__)
 HEALTH_MONITOR_ENABLED = os.getenv("HEALTH_MONITOR_ENABLED", "true").lower() == "true"
 HEALTH_SAMPLE_INTERVAL = int(os.getenv("HEALTH_SAMPLE_INTERVAL", "10"))  # seconds
 HEALTH_RETENTION_DAYS = int(os.getenv("HEALTH_RETENTION_DAYS", "7"))
+
+# Off by default -- tracemalloc adds a few % CPU and its own bookkeeping
+# memory, so it should only run when actively hunting a leak. Enable with
+# MEMORY_PROFILING=true in .env, restart, then poll GET /health/api/memory-snapshot
+# while memory is climbing to see which line of code is holding the growth --
+# see the 2026-09-02 investigation (root cause never pinned down from
+# FD/RSS graphs and logs alone; this is the instrumentation that would
+# have answered it directly).
+MEMORY_PROFILING_ENABLED = os.getenv("MEMORY_PROFILING", "false").lower() == "true"
 
 # File Descriptor / Handle Thresholds
 # Windows handles are NOT Unix FDs — a normal Flask app uses 500-2000+ handles.
@@ -83,6 +93,51 @@ _cached_metrics = {
     "threads": {},
 }
 _cache_lock = threading.Lock()
+
+# Diagnostics directory for auto-captured memory snapshots -- durable on
+# disk specifically so a leak can be diagnosed after the fact (mobile-only
+# monitoring, no ability to act the moment it happens; see the 2026-09-02
+# investigation this was added for). Rate-limited independently of the
+# alert's own dedup so a sustained breach doesn't write a new file every
+# HEALTH_SAMPLE_INTERVAL.
+_MEMORY_SNAPSHOT_DIR = os.path.join("log", "memory_snapshots")
+_MEMORY_SNAPSHOT_MIN_INTERVAL_SEC = 300
+_last_memory_snapshot_at = 0.0
+_memory_snapshot_lock = threading.Lock()
+
+
+def _maybe_dump_memory_snapshot(rss_mb: float, severity: str):
+    """Auto-captures a tracemalloc top-allocations snapshot to disk the
+    moment memory crosses its warn/fail threshold -- only if MEMORY_PROFILING
+    is enabled and tracemalloc is actually tracing (started at app init,
+    see init_health_monitoring). Never raises: a failed diagnostic dump
+    must not affect the health check itself."""
+    if not MEMORY_PROFILING_ENABLED or not tracemalloc.is_tracing():
+        return
+
+    global _last_memory_snapshot_at
+    now = time.time()
+    with _memory_snapshot_lock:
+        if now - _last_memory_snapshot_at < _MEMORY_SNAPSHOT_MIN_INTERVAL_SEC:
+            return
+        _last_memory_snapshot_at = now
+
+    try:
+        os.makedirs(_MEMORY_SNAPSHOT_DIR, exist_ok=True)
+        snapshot = tracemalloc.take_snapshot()
+        top_stats = snapshot.statistics("lineno")[:30]
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        path = os.path.join(_MEMORY_SNAPSHOT_DIR, f"{ts}_{severity}_{rss_mb:.0f}mb.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"Auto memory snapshot -- rss={rss_mb:.1f}MB severity={severity} at {ts}\n")
+            f.write("Top 30 allocations by line (current, not cumulative):\n\n")
+            for stat in top_stats:
+                f.write(f"{stat}\n")
+
+        logger.warning(f"Memory snapshot dumped to {path} (rss={rss_mb:.1f}MB)")
+    except Exception as e:
+        logger.exception(f"Failed to dump memory snapshot: {e}")
 
 
 def get_cached_health_status():
@@ -275,6 +330,7 @@ def get_memory_metrics():
                 threshold_value=MEMORY_CRITICAL_THRESHOLD,
                 message=f"Memory usage critical: {rss_mb:.1f} MB (threshold: {MEMORY_CRITICAL_THRESHOLD} MB)",
             )
+            _maybe_dump_memory_snapshot(rss_mb, "fail")
         elif rss_mb >= MEMORY_WARNING_THRESHOLD:
             status = "warn"
             HealthAlert.create_alert(
@@ -285,6 +341,7 @@ def get_memory_metrics():
                 threshold_value=MEMORY_WARNING_THRESHOLD,
                 message=f"Memory usage elevated: {rss_mb:.1f} MB (threshold: {MEMORY_WARNING_THRESHOLD} MB)",
             )
+            _maybe_dump_memory_snapshot(rss_mb, "warn")
         else:
             status = "pass"
             HealthAlert.auto_resolve_alerts("memory_rss_mb", rss_mb, MEMORY_WARNING_THRESHOLD)
@@ -715,6 +772,14 @@ def init_health_monitoring(app):
 
         # Start collector (background daemon thread)
         start_health_collector()
+
+        if MEMORY_PROFILING_ENABLED and not tracemalloc.is_tracing():
+            tracemalloc.start()
+            logger.warning(
+                "MEMORY_PROFILING enabled -- tracemalloc active. Auto-dumps a top-allocations "
+                f"snapshot to {_MEMORY_SNAPSHOT_DIR}/ whenever memory crosses its warn/fail "
+                "threshold (rate-limited to once per 5 minutes)."
+            )
 
         logger.debug("Health monitoring initialized successfully (background mode)")
     except Exception as e:
