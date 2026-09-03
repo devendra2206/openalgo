@@ -70,7 +70,12 @@ curl -X POST http://127.0.0.1:5000/api/v1/strategy/list \
       "status": "running",
       "current_run_id": 42,
       "created_at": "2026-08-24T04:11:52.104883+00:00",
-      "updated_at": "2026-08-30T03:50:11.482913+00:00"
+      "updated_at": "2026-08-30T03:50:11.482913+00:00",
+      "last_finalized_run": {
+        "id": 41,
+        "pnl_realized": 1250.0,
+        "stopped_at": "2026-08-29T09:40:11.482913+00:00"
+      }
     },
     {
       "id": 4,
@@ -97,7 +102,12 @@ curl -X POST http://127.0.0.1:5000/api/v1/strategy/list \
       "status": "stopped",
       "current_run_id": null,
       "created_at": "2026-08-18T06:02:19.775410+00:00",
-      "updated_at": "2026-08-18T06:02:19.775410+00:00"
+      "updated_at": "2026-08-18T06:02:19.775410+00:00",
+      "last_finalized_run": {
+        "id": 16,
+        "pnl_realized": -52.0,
+        "stopped_at": "2026-08-18T06:02:19.775410+00:00"
+      }
     }
   ]
 }
@@ -136,7 +146,7 @@ Each object in `data`:
 | name | string | Strategy name, unique per user |
 | strategy_kind | string | `batch` or `signal` |
 | direction | string | `both`, `long_only` or `short_only`. Signal mode only |
-| universe_tab | string | Which instrument universe the wizard built this from |
+| universe_tab | string | Which instrument universe the strategy was built from: `weekly_monthly`, `monthly_only`, `stocks_fno` or `mcx`. It decides which segments a leg may use, and cash is offered on `stocks_fno` only. A strategy saved without one has it derived from its own legs |
 | underlying | string | Underlying symbol |
 | underlying_exchange | string | Exchange the underlying is quoted on |
 | strategy_type | string | `intraday` or `positional` |
@@ -157,6 +167,7 @@ Each object in `data`:
 | current_run_id | integer or null | The run this strategy is executing, if any |
 | created_at | string | ISO 8601 UTC |
 | updated_at | string | ISO 8601 UTC |
+| last_finalized_run | object or null | Most recently finalised run: `{id, pnl_realized, stopped_at}`. For a stopped strategy, `pnl_realized` is the durable final P&L and unrealised P&L is zero; do not infer final P&L from an earlier checkpoint |
 
 ## Notes
 
@@ -166,6 +177,7 @@ Each object in `data`:
 - No response here or anywhere else on this surface carries a webhook token. Only its SHA-256 digest is stored, so there is nothing to return.
 - An out-of-vocabulary `status` is a 400, not an empty list.
 - `status` and `q` may be sent as `null` explicitly; that is the same as omitting them.
+- A checkpoint is a live mark only. After a run stops, use `last_finalized_run.pnl_realized` as the final total; its unrealised P&L is `0.00` because the run has confirmed flatness.
 
 ## Use Cases
 

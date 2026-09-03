@@ -111,6 +111,79 @@ git push origin custom-strategies
 ```
 
 **Sync log:**
+- **2026-09-03**: 87 commits pulled from upstream, including issue #1737's
+  fix for the exact `PROCESS_LOCK`/strategies-list-view hang this fork had
+  independently diagnosed and partially patched the same day (`bcc8907aa`) —
+  upstream's version (`a3e8202f9`/`6681bd7e4`) is strictly more complete
+  (claim-based start/stop locking, `process.wait()` moved off the event
+  loop entirely via polling, not just log cleanup) and superseded this
+  fork's own fix; taken wholesale.
+
+  Real conflicts in 4 files:
+  - `blueprints/python_strategy.py` — one conflict, resolved by taking
+    upstream's `stop_strategy_process()` rewrite in full (see above) and
+    deleting this fork's now-dead-code tail left over from `bcc8907aa`.
+  - `broker/shoonya/streaming/shoonya_adapter.py` — upstream added
+    transactional unsubscribe tracking (`_pending_ws_unsubscribes`) and
+    extracted `_remove_subscription_locked()`; this fork's own stale-token
+    bypass fix (`535ff34cf`, `_token_last_tick`/`_token_first_subscribed_at`)
+    needed porting into that new shared helper, since upstream's version
+    didn't know about it. Both fixes now compose correctly.
+  - `websocket_proxy/server.py` — five conflicts. `cleanup_client()`'s
+    per-client teardown: took upstream's rewrite (transactional, yields to
+    the event loop every 128 symbols for a 3,000-subscription teardown),
+    porting this fork's `subscription_first_held_at`/`_stale_bypass_attempts`
+    cleanup into `_drop_subscription_ownership()`/
+    `_purge_client_subscription_ownership()`. `authenticate_client()`'s
+    stale-adapter-eviction/create-or-reuse section: kept this fork's side —
+    confirmed upstream's `main` has zero occurrences of `_run_blocking`
+    anywhere in the file, meaning taking their side would have silently
+    reintroduced the exact bug that call exists to fix (a synchronous
+    `adapter.initialize()`/`.connect()` freezing the entire proxy for every
+    client while one connection is being established, `8d978dd25`).
+  - `frontend/package-lock.json` — regenerated via `npm install
+    --package-lock-only` against the merged `package.json` rather than
+    hand-resolving; came out identical to upstream's, `package.json`
+    itself merged conflict-free already at `openalgo-charts: 1.9.2`.
+
+  Two real, pre-existing bugs found and fixed while resolving conflicts
+  (both predate this merge, exposed by porting upstream's new
+  `test_websocket_unsubscribe_contract.py`):
+  - `unsubscribe_client()`'s `is_unsubscribe_all` branch: an `UnboundLocalError`
+    on a bare `mode` variable never assigned in that branch — the loop had
+    been refactored to iterate upstream's new `_indexed_client_subscriptions()`
+    helper (unpacking `sub_key`/`mode_label`, not `mode`) without updating
+    this one leftover reference. Fixed by reading `mode` from `sub_key[2]`
+    (already the exact `(symbol, exchange, mode)` tuple).
+  - Both `unsubscribe_client()` branches (`is_unsubscribe_all` and specific-
+    symbols): when a client was the *last* owner of a subscription, the
+    real `adapter.unsubscribe()` call's response was never checked and the
+    symbol was never appended to `successful_unsubscriptions` — a genuinely
+    successful last-owner unsubscribe silently reported neither success nor
+    failure to the caller. Fixed by delegating both branches to
+    `_unsubscribe_owned_subscription()` (the same "commit only after broker
+    ack" helper `cleanup_client()` already used correctly), removing the
+    duplicated, buggy inline reimplementation.
+
+  Several test files carried their own minimal `WebSocketProxy.__new__(...)`/
+  `ShoonyaWebSocketAdapter.__new__(...)` fixtures (bypassing `__init__` on
+  purpose, for fast unit tests) that predated upstream's new attributes
+  (`_pending_ws_unsubscribes`, `subscription_first_held_at`,
+  `_stale_bypass_attempts`) — updated `test_shoonya_subscribe_stale_bypass.py`,
+  `test_websocket_unsubscribe_contract.py` (3 fixture sites),
+  `test_flattrade_issue_1806.py` to set them.
+
+  All Python files touched compile clean. Full suite: 4155 passed, 10
+  failed, 3 errors — every one confirmed pre-existing/environmental, not a
+  regression from this merge: `test_flow_custom_legs.py` (3, calendar-date
+  drift in "next month" fixtures, reproduces identically on pristine
+  `main`), `test_mstock.py` (4, explicitly a live-server integration test
+  needing an authenticated mstock session), `test_telegram_bot.py`/
+  `test_telegram_charts.py` (async-plugin config gap, files untouched by
+  this merge), `test_telegram_startup.py` (`eventlet` not installed in this
+  Windows dev venv — expected per this file's own "Windows/dev-machine
+  testing has no eventlet installed at all" note), `test_rate_limits_mock.py`
+  (3 errors, missing `api` pytest fixture, file untouched by this merge).
 - **2026-08-30**: 85 commits pulled from upstream. Only `frontend/dist/`
   conflicted (the routine content-hash rename/rename set) — resolved by
   taking `main`'s copy wholesale. Every customized file (`app.py`,

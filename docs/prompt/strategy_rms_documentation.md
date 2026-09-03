@@ -121,6 +121,38 @@ figure vanish the moment the next entry was placed, so a daily loss limit reset
 on every flat moment and could never be reached. A position that never closed
 carries zero there, so nothing else changes.
 
+### Points or percent
+
+Each leg carries `risk_unit`, either `points` (the default) or `percent`, and it
+governs `sl_pts`, `target_pts` and both halves of `trail` together. A leg with
+no `risk_unit` is a points leg, which is every leg written before the field
+existed, so nothing stored has to change and legs remain JSON with no migration.
+
+One toggle covers all three on purpose: a leg whose stop is a percentage of
+entry and whose target is an absolute distance is far more likely to be a
+mistake than an intention.
+
+**The conversion happens in `risk_adapter` and nowhere else.** `services/risk/`
+speaks one language, points from entry, and translating into it is the adapter's
+whole job. A second unit inside the core would mean two ways to express the same
+stop and two places to get it wrong, which is the rule the module already
+follows for every other decision: consumers translate, they do not decide.
+
+A percentage is measured against the leg's own entry price, so 2% on a short
+filled at 2500 is a stop at 2550 and a 4% target is 2400. Percentages are capped
+at 100 in the validator, because 150% of entry below a long's entry price is not
+a wider stop, it is a negative price.
+
+**A percent leg with no confirmed fill gets no levels at all.** A percentage of
+an entry of zero is not a stop at the entry price, it is a stop that cannot be
+computed yet, and inventing one would put it on top of the entry and fire it on
+the first tick. The leg has no confirmed position in that state anyway.
+
+The field names keep saying `pts` in both the wire format and the database. They
+are wrong for a percent leg and they are kept anyway, because renaming them
+would break every stored strategy and every existing caller for a cosmetic gain.
+The unit is displayed beside the number everywhere an operator reads it.
+
 ### risk_adapter public surface
 
 ```python
@@ -142,6 +174,29 @@ Two mappings in here are easy to get wrong:
   move a stop at all.
 - **`overall_sl_mtm` is stored positive and applied as a negative threshold.**
   It passes through unchanged; the core takes it the same way.
+
+### Combined MTM is an exit trigger, not an execution guarantee
+
+The combined stop, target and lock-profit rules evaluate the run's rolling
+latest-known LTP mark. A tick for one symbol updates the matching leg and the
+engine immediately evaluates the basket using that new mark plus the most
+recent marks already held for the other legs. Independent WebSocket ticks are
+not a simultaneous, exchange-atomic basket snapshot.
+
+Crossing `overall_sl_mtm` or `overall_target_mtm` therefore proves that the
+marked basket crossed the configured threshold and that an exit was requested.
+It does not guarantee the same realized P&L. The covering MARKET orders execute
+against the available side of the book (a BUY at the ask and a SELL at the bid),
+and the spread, price movement and sequential leg placements can move the final
+fills away from the trigger mark. The durable run keeps both truths: `pnl_peak`
+and `pnl_trough` describe the marked path, while `pnl_realized` comes from the
+confirmed entry and exit fills.
+
+For the reported Run 12, the durable evidence proves a `513.00` peak, an
+`overall_target` stop and `117.00` realized after both exits filled. It does not
+retain sufficiently granular per-leg tick-arrival evidence to prove that mixed-
+age marks caused the difference. The rolling calculation makes that a possible
+contributor, but not an established cause for that run.
 
 ## The daily loss limit
 
@@ -172,12 +227,12 @@ is the protocol, the leg shape and the run lifecycle.
 |---|---|---|
 | Trigger | `start` enters every leg, `stop` exits every leg | one alert moves one leg |
 | Leg shape | segment, position, lots, option type, strike mode, offset, expiry | symbol, exchange, side, qty, segment, expiry |
-| Options | yes, this is what it is for | no, spreads stay in batch mode |
-| Quantity | lots multiplied by `lotsize` from `SymToken` | absolute shares or units |
-| Run | one per start-to-stop cycle | one per trading day, opened by the first signal |
+| Options | relative option legs and spreads | an exact option contract may be named, but there is no `options` segment, expiry-rank or strike resolution; spreads stay in batch mode |
+| Quantity | the configured count multiplied by the exact `SymToken` lot size, on every segment including cash. A cash row's lot size is 1, so the count is a share count, but the multiplication is unconditional and nothing asserts the 1 | derivatives accept `qty_mode=lots` (multiplied by the exact `SymToken` lot size) or `qty_mode=units` (absolute quantity on a whole-lot boundary); cash is units only and uses the exact quantity |
+| Run | one per start-to-stop cycle | one per platform session, opened by the first signal |
 | Webhook actions | `start`, `stop` | `long_entry`, `long_exit`, `short_entry`, `short_exit` |
 | Legs at run start | all entered together | inactive until a signal opens one |
-| Order kinds | `entry`, `exit_sl`, `exit_target`, ... | adds `exit_signal` |
+| Order kinds | `entry` plus the risk, scheduler and manual `exit_*` kinds | `entry` and `exit_signal` |
 
 Each kind refuses the other's action vocabulary. `signals.actions_for(kind)`
 returns the accepted set and the webhook validates against it.
@@ -207,7 +262,7 @@ Other signal-mode rules:
 - **An opposite entry squares first, then opens.** Reversing without closing
   leaves both positions on the book.
 - **A leg returns to `configured` after an exit**, not `closed`, so the same
-  symbol can be signalled again the same day. Its realized P&L accumulates on
+  symbol can be signalled again in the same platform session. Its realized P&L accumulates on
   the leg, and `run_pnl` counts realized from any leg that has it.
 - **Signal actions skip the webhook dedupe and cooling-off windows.** They exist
   because a repeated `start` would open a second position; signal mode is
@@ -224,10 +279,10 @@ related to each other or to this module.
 | Table | Purpose |
 |---|---|
 | `sm_strategy` | config: legs (JSON), risk parameters, scheduler, webhook token hash |
-| `sm_strategy_run` | one activation, start to stop |
-| `sm_strategy_order` | every order the engine places, audit grade |
+| `sm_strategy_run` | one activation, including durable pending-stop timestamp/reason and terminal P&L |
+| `sm_strategy_order` | every durable order intent, its exact `position_ref`, acknowledgement, fills and rejection context |
 | `sm_strategy_checkpoint` | periodic runtime snapshot, for crash recovery |
-| `sm_webhook_event` | every inbound webhook, accepted or rejected |
+| `sm_webhook_event` | every request admitted to the webhook pipeline, accepted or rejected; route preflight 429/declared-size 413 refusals are not stored |
 | `sm_strategy_event` | risk-event audit trail |
 
 Conventions:
@@ -271,8 +326,9 @@ get_strategy_by_webhook_token(token) -> SmStrategy | None
 clear_strategy_module_cache() -> None
 
 # runs, orders, events, checkpoints, webhook audit
-create_run(...) / finish_run(...) / get_run(run_id) / list_runs(...) / list_open_runs()
-record_order(run_id, leg_id, kind, order) / update_order(...) / list_orders(run_id)
+create_run(...) / finish_run(...) / finish_run_and_release_strategy(...) / get_run(run_id) / list_runs(...) / list_open_runs()
+request_run_stop(run_id, reason) / reconcile_run_pnl(run_id)
+record_order(run_id, leg_id, kind, order) / update_order(...) / transition_order_terminal(...) / list_orders(run_id)
 list_orders_for_strategy(strategy_id, run_id=None)
 get_order_by_broker_id(broker_order_id)
 record_event(...) / list_events(...)
@@ -301,6 +357,7 @@ snapshot round-trips without translation.
 
 ```python
 get_state_lock(run_id) -> threading.Lock
+new_position_ref() -> str
 run_state(run_id)                       # context manager, yields the live dict or None
 init_run_state(run_id, strategy_id, legs) -> dict
 add_leg(run_id, leg) -> dict | None     # signal mode: a leg appears when a signal opens it
@@ -311,6 +368,9 @@ active_run_ids() -> list[int]
 open_legs(state) / legs_for_symbol(state, symbol, exchange) / subscribed_symbols(state)
 snapshot_for_checkpoint(state) -> dict
 favorable_peak_points(leg) -> float
+mark_stopping(run_id) -> bool
+claim_signal_entry(...) / finish_signal_entry(...) / release_signal_entry_claim(...) / reject_entry_intent(...)
+claim_legs_for_exit(...) / claim_superseded_exit(...) / bind_live_exit(...) / bind_superseded_exit(...)
 ```
 
 Two rules:
@@ -329,9 +389,11 @@ Two rules:
 start_run(strategy_id, user_id, mode, trigger_source="manual",
           webhook_event_id=None) -> StartResult(ok, run_id, error, legs)
 stop_run(run_id, user_id, reason="manual") -> dict
+reconcile_pending_stop(run_id) -> dict | None
 close_leg(run_id, leg_id, user_id) -> dict
 apply_fill(run_id, leg_id, avg_price, is_entry,
-           filled_qty=None, order_row_id=None) -> bool       # True when the run went flat
+           filled_qty=None, order_row_id=None,
+           position_ref=None) -> bool       # True when the run went flat
 process_tick(symbol, exchange, ltp) -> None
 ```
 
@@ -356,9 +418,50 @@ Load-bearing orderings:
   recorded is placed anyway.** Opposite decisions, on purpose. Refusing an
   entry costs one leg not opened. Refusing an exit costs a position that stays
   open with a database outage standing between it and every attempt to close
-  it, so getting flat wins and the audit row is what is lost, loudly.
-- **A leg is closed by its fill arriving**, not by its exit being placed.
-  `apply_fill` finalises a run that has gone flat.
+  it, so getting flat wins and the audit row is what is lost, loudly. The
+  signal path applies the same two rules as the batch path.
+- **The broker's acknowledgement is written back, and that write is checked.**
+  `update_order` swallows its own failure and returns False. Ignoring it left
+  the row `pending` with no broker order id, so no fill could ever be matched
+  to it: the leg was never seeded and nothing evaluated a stop for a position
+  that existed. The replay buffer cannot cover this, because the id it would
+  match on is what was lost. Retried once, and if it still will not persist the
+  exact row/run/leg, broker id and accepted/rejected facts go to the event log
+  as structured `order_ack_unrecorded` metadata at critical severity. The
+  dispatch call immediately binds only that row through an idempotent CAS. The
+  existing shared scheduler rotates through bounded pages of ordinary open
+  runs, retries interrupted repair, and broker-polls an accepted working order
+  if the short-lived replay frame is gone. Recovery and pending-stop polling
+  use the same repair. Missing or conflicting linkage remains open and
+  reserved; it is never read as flat.
+- **A leg whose entry has been accepted but not filled is never exited.** A leg
+  is `open` from broker acceptance, so squaring off would send the configured
+  size the other way against a position that may be nothing at all, and if that
+  entry were then cancelled the square-off is itself a naked position in the
+  reverse direction. `state.claim_legs_for_exit` refuses it and names it, in
+  **one** hold of the run lock: claiming and classifying separately left a
+  window in which an arriving fill made a leg appear in neither list, and the
+  run then finalised with the position still open. The stop is reported as
+  refused so the run stays open and managed, and it succeeds once the fill
+  lands.
+- **A rejected exit is undone wherever the rejection arrives.** The
+  synchronous path releases the claim; a rejection or cancellation arriving
+  later on the order stream does the same, so the leg stays exitable. An entry
+  that dies asynchronously is marked rejected rather than left reading `open`,
+  or the next square-off sends the full size against nothing. A pending stop
+  stays open and managed; a terminal exit rejection/cancellation releases the
+  exact owner claim, records `run_stop_failed` at critical severity, and can be
+  retried.
+- **A flip whose closing order is refused leaves both sides on the book.** The
+  outgoing position is kept under `superseded`, and if its exit dies that
+  record is cleared so the old side can be closed again: an exit signal naming
+  a side the live leg does not hold is matched against it before being called
+  a no-op. Both positions are real, and one leg id can only describe one of
+  them.
+- **A leg is closed by its fill arriving**, not by its exit being placed. A
+  batch run or a run with a durable pending stop finalises after it is confirmed
+  flat. A normal risk exit on a signal strategy does not end its session run; the
+  next signal can reopen a leg in the same session and P&L history.
 - **A leg is claimed for exit under the state lock**, by
   `state.claim_leg_exit`, which does the claim and the duplicate check in one
   hold. The marker is `exit_kind`, written before any dispatch, because
@@ -375,6 +478,12 @@ Load-bearing orderings:
   while the positions are still at the broker. It stays open, emits
   `run_stop_failed` at critical severity, and reports what was refused.
   `close_leg` likewise reports a refusal rather than answering ok.
+- **A stop request is durable before any exit.** `request_run_stop` writes the
+  timestamp and reason, then `mark_stopping` gates signal entry claims. Accepted
+  working exits return `stop_pending: true`; the run stays current, subscribed
+  and managed. Finalization happens only after exact owner quantities confirm
+  flatness and atomically writes the run plus releases the strategy. Recovery
+  resumes the persisted reason after a crash.
 - **Trail-to-entry fires only on a stop-driven exit**, never on a manual close.
   That rule answers the market moving against the book; an operator closing a
   leg by hand is an override.
@@ -389,7 +498,7 @@ resolve_live_auth(api_key) -> (auth_token, broker, error)
 dispatch_order(*, mode, api_key, order) -> DispatchResult(ok, broker_order_id, response, error)
 ```
 
-Three departures from how the rest of the product places orders:
+Five departures from how the rest of the product places orders:
 
 - **Mode is per run, not global.** The analyzer setting is one platform-wide
   switch and `place_order` consults it, but two runs may disagree. This module
@@ -403,7 +512,12 @@ Three departures from how the rest of the product places orders:
   every leg. `build_order` reads it as the intent rather than the literal: MIS
   is intraday everywhere, anything else means carry, which is NRML on a
   derivatives venue and CNC on cash. A basket mixing a cash leg and an option
-  leg therefore works, and no leg is ever sent a product its venue refuses.
+  leg therefore works, and no leg is ever sent a product its venue refuses. One
+  combination is refused rather than translated: a short cash leg under a
+  carrying product, because cash cannot be held short overnight and anything
+  that is not MIS would reach the venue as a naked short delivery. A batch leg
+  is refused at save; a signal leg at signal time, when the side being opened
+  is known rather than the sides it accepts.
 - **Entries are MARKET.** Neither the strategy nor a leg carries a price, so a
   LIMIT, SL or SL-M entry would go out priced at zero. Exits are MARKET on every
   path regardless: a stop that cannot fill is not a stop.
@@ -501,9 +615,14 @@ start() -> bool                          # idempotent; called by runtime
   the combined stop, the combined target and the lock-profit floor are judged
   against.
 - **A cancel is recorded as cancelled**, not as a rejection.
-- **A fill arriving after the run finalised reconciles the run row** from its
-  own order rows. `stop_run` does not wait for fills, so the figure it writes at
-  that instant is zero; the fill that follows is what makes the row right.
+- **A terminal partial quantity is still exposure.** Positive `filled_qty`
+  counts in every status, including cancellation and rejection; only a complete
+  order may fall back to requested quantity when the broker omitted it. A stop
+  stays pending until exact entry quantity minus exact exit fills is zero.
+- **Missing price is not zero value.** A positive fill with no strictly positive
+  finite average price still proves position quantity. Risk valuation remains
+  unavailable until another durable witness supplies the price; recovery never
+  turns that missing evidence into a fake zero.
 
 ## Durability
 
@@ -519,12 +638,12 @@ normalise_order_status(raw) -> str
 order_is_filled(raw) / order_is_dead(raw) / order_is_working(raw)
 ```
 
-Recovery merges two sources with a deliberate precedence. Identity and
-disposition come from the **order rows**, which are authoritative about what was
-placed and filled. Volatile risk state (last price, effective stop and target,
-trail flags, favourable extremes) comes from the **checkpoint**, because no
-order row carries it. A leg's side is derived from its entry order's action, so
-a recovered leg can never come back with a side it did not trade.
+Recovery merges two sources with a deliberate precedence. Identity,
+disposition and ownership come from **order rows grouped by exact
+`position_ref`**. Volatile risk state (last price, effective stop and target,
+trail flags, favourable extremes) comes from the checkpoint, because no order
+row carries it. A leg's side is derived from its entry action, so a recovered
+leg can never come back with a side it did not trade.
 
 Two asymmetries matter:
 
@@ -536,8 +655,27 @@ Order status is normalised in exactly one place. An unrecognised status is
 treated as *working*, because reading an unknown exit as dead would let a second
 exit be placed, and a second exit opens the opposite position.
 
-A run that cannot be recovered is finalised with `stop_reason="recovery_failed"`
-so one bad run cannot wedge every future boot.
+One leg can safely represent at most two held reference groups: the newest live
+owner plus one outgoing `superseded` owner from a signal flip. If durable rows
+prove more held owners, overlapping instruments or another ambiguous exposure,
+the run is **not** installed in memory and is **not** finalised. It remains
+database-open and reserves the strategy while a critical `recovery_failed`
+event requests manual reconciliation. Closing it would falsely assert broker
+flatness and permit a new run over unmanaged exposure. Ordinary malformed state
+with no proven exposure is still finalised with `stop_reason="recovery_failed"`
+so it cannot wedge startup.
+
+A durable pending stop is recovered with its persisted reason. A flat rebuild
+finishes it atomically; a held rebuild is hydrated in `stopping` state and its
+exits are retried. New signal entries remain gated throughout.
+
+Realized P&L follows evidence provenance. When every exact reference group has
+priced entry and exit fills, the durable sum is authoritative even when it is
+exactly zero. If one or more fills are unpriced, the checkpoint total is used
+only when the checkpoint witnessed exactly the recovered live/superseded owner
+shape and quantities. Otherwise recovery retains the known priced portion,
+marks it non-authoritative internally and writes a critical
+`recovery_succeeded` event requiring manual P&L reconciliation.
 
 ## Scheduler
 
@@ -594,6 +732,12 @@ reset_state() -> None
 
 Five properties the token being the whole credential makes necessary:
 
+- **The token is removed at every shipped logging boundary.** One shared path
+  redactor covers standard and JSON application logs plus `logs.db`; every
+  shipped nginx direct, Docker, multi-instance, update and change-domain
+  template suppresses those paths from access logs. External senders and
+  proxies remain the operator's boundary: apply the same control there and
+  rotate any credential that may have been logged previously.
 - **The token never reaches `logs.db`.** `utils/traffic_logger.py` masks the
   credential segment of `/strategy/webhook/`, `/flow/webhook/` and
   `/chartink/webhook/` paths. The traffic log keeps 30 days and is readable at
@@ -602,8 +746,9 @@ Five properties the token being the whole credential makes necessary:
 - **The caller is `get_real_ip()`, not `remote_addr`.** Behind a reverse proxy,
   which is how most installs run, `remote_addr` is the proxy: the IP allowlist
   would be either useless or total, and the audit trail would name the proxy.
-- **An oversized body is refused from `Content-Length`, before it is read.**
-  The cap inside the pipeline is measured on bytes already in memory.
+- **An oversized body is refused from `Content-Length`, before it is read or
+  audited.** The cap inside the admitted pipeline is measured on bytes already
+  in memory, and a refusal at that second cap is audited as `rejected_payload`.
 - **The rate limiter is keyed on the token's digest.** Its in-memory storage
   empties the event list of an expired window but never removes the key, so a
   raw token there would persist for the life of the worker, one entry per token
@@ -614,7 +759,10 @@ Five properties the token being the whole credential makes necessary:
   are kept rather than dropped because a run of them is the first sign of
   somebody walking the token space.
 
-Validation pipeline, in order, with every stage audited to `sm_webhook_event`:
+The route applies its two rate limits and the declared `Content-Length` cap
+before this function. A preflight 429 or 413 does not write `sm_webhook_event`.
+For a request admitted to `handle_webhook`, the validation pipeline is in this
+order and every terminal stage is audited:
 
 | Stage | Result label | Status |
 |---|---|---|
@@ -655,10 +803,32 @@ strategy_positions(strategy_id, api_key, run_id=None) -> dict
 ```
 
 These call the platform's own global services and filter the response to this
-strategy, so the envelope, field names and formatting are identical to
-`/orderbook`, `/tradebook` and `/positionbook` and the existing tables render
-them unchanged. Statistics are recounted over the filtered rows, because a
-global statistic on a filtered list is wrong.
+strategy. On the Detail page the broker result is primary truth for the current
+or latest run; recorded strategy order rows remain visible as an explicitly
+labelled audit fallback. The hook requests a book only when a valid run exists
+and its tab is active. A separate `queried` flag distinguishes “not requested”
+from a successful empty broker book.
+
+Broker numerics are nullable at normalization. Missing, empty, non-finite or
+malformed quantity/price/P&L renders as unavailable; legitimate numeric zero is
+preserved. The local fallback treats any positive `filled_qty` as fill proof in
+any status, and permits requested-quantity fallback only for `complete`.
+Positions preserve quantity and side when fill price is unavailable while
+average price, realized and unrealized P&L stay unavailable.
+
+The position fallback folds lifetime strategy orders so a residual owner from
+an earlier run and lifetime realized P&L do not disappear merely because a new
+run is current. Live leg marks are different: they are used only when the live
+frame's `runId` equals the selected/current broker-book run. A stale prior-run
+frame can therefore never value the current fallback.
+
+Orderbook and tradebook reconcile a unique broker order id to local audit
+context. Multiple broker trade rows are aggregated by filled quantity and
+weighted price before comparison. Local-only, ambiguous and mismatched rows are
+visible, and local rejection reasons stay visible alongside broker rows. A
+broker error says the account book is unavailable and that the local audit may
+lag; a missing run says the broker book was not requested, not that the broker
+reported an empty book.
 
 Sandbox runs read the sandbox books. Live reads pass `original_data=None`, the
 internal-call form, so the platform-wide analyzer toggle cannot divert a live
@@ -679,7 +849,7 @@ resolve_leg(leg, underlying, underlying_exchange, strategy_type=None, *,
             api_key=None, underlying_ltp=None) -> ResolvedLeg
 derivatives_exchange(exchange) -> str
 lot_size_for(symbol, exchange) -> int | None
-quantity_is_whole_lots(quantity, lot_size) -> bool
+quantity_is_whole_lots(quantity, symbol, exchange) -> (whole, lot_size)
 resolve_quantity(value, qty_mode, symbol, exchange) -> (quantity, lot_size, error)
 contract_exists(symbol, exchange) -> bool
 ```
@@ -696,12 +866,14 @@ unanchored prefix let `GOLD` match `GOLDM` and `GOLDPETAL`, so a base with no
 contract of its own was handed a neighbour's lot size and the user's lot count
 was multiplied by it.
 
-`contract_exists` is what a **signal** leg is checked against. A signal leg
-names its own instrument, so nothing resolves it from an underlying and a rank,
-and a futures leg configured as the base symbol went to the broker verbatim
-with a quantity that looked entirely plausible. It answers True when the master
-contract has no rows for that venue at all, so a strategy is not blocked merely
-because the contract has not been downloaded yet.
+`contract_exists` is what a **signal** leg is checked against, on every venue
+including cash. A signal leg names its own instrument, so nothing resolves it
+from an underlying and a rank: a futures leg configured as the base symbol went
+to the broker verbatim with a quantity that looked entirely plausible, and a
+misspelled equity on a cash venue went the same way, because a cash leg is not
+resolved from an underlying either. It answers True when the master contract
+has no rows for that venue at all, so a strategy is not blocked merely because
+the contract has not been downloaded yet.
 
 Delegates every piece of market knowledge it can to
 `services/option_symbol_service.py`, including the rule that an MCX commodity
@@ -759,6 +931,18 @@ strategy scheduler failed is worse than one that boots without it.
 
 Both enforce the same properties:
 
+- **Configuration vocabularies are not all in the store.** `universe_tab`, a
+  leg's `segment`, `product`, `pricetype` and `qty_mode` are validated in
+  `blueprints/strategy_module.py`, because the store has no opinion on a leg's
+  shape: legs are a JSON column. `UNIVERSE_TABS` and `TAB_SEGMENTS` are the
+  pair that matters, because the tab decides which segments can resolve against
+  the underlying, and cash resolves on `stocks_fno` only. A configuration that
+  names no tab has one derived from its own legs rather than defaulted.
+- **`strategy_kind` is settable at create and never updatable.** It sits
+  outside `UPDATABLE_FIELDS`, and `update_strategy` refuses a request to change
+  it by name rather than dropping it silently, which would have read as
+  success. The two kinds do not share a leg shape, so a flip would leave every
+  stored leg describing the other kind's contract in an opaque JSON column.
 - `mode` is required on start and has no default anywhere in the chain.
 - Live is opt-in per strategy.
 - A strategy that is not yours answers **404, never 403**, identical to one that
@@ -826,6 +1010,10 @@ Each is pinned by a test that says so.
   distinguish a browser start from an API one.
 - **Account-level RMS caps** across strategies, and a Flow `riskGuard` node on
   the shared core.
+- **Webhook audit and IP-allowlist controls on the strategy page.** The session
+  API exposes webhook audit rows, but Detail does not fetch/render them. The
+  wizard currently creates strategies with no allowlist and provides no editor;
+  do not claim these operator surfaces exist until they are built.
 
 ## Related documents
 

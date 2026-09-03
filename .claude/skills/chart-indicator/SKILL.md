@@ -53,6 +53,28 @@ fix connectivity, or install without the pre-flight check and rely on the
 chart's own validation, which reports the same structural problems as toasts
 when the indicator loads. Do not silently skip validation.
 
+## Recent changes worth knowing
+
+The descriptor contract has not changed, so an existing indicator keeps working.
+Three things did:
+
+- **1.8.4: `calc` runs once per animation frame, not once per tick.** A data
+  update marks the indicators stale and the flush happens before the paint, so a
+  burst of ticks collapses into one call. `calc` must therefore be a pure
+  function of `(bars, settings)`. It always had to be, but running per tick used
+  to hide an indicator that counted its own calls or accumulated into `store`.
+  Reading `chart.indicators()` or an instance's `values()` flushes first, so a
+  read-after-update in the same turn still sees fresh numbers.
+- **1.8.4: `calcTail` is rarely worth it now.** The tick-rate problem it existed
+  to solve is gone. It only pays when one pass over the loaded history is itself
+  slow, which means deep history, not a fast feed.
+- **1.8.3: the catalogue went from 91 to 102 built-ins**, so a file written
+  earlier can shadow an id that did not exist when it was named. The new ids are
+  listed in `reference/pitfalls.md` under the collision entry. That release also
+  corrected nine built-ins and moved ten defaults, so an indicator that compares
+  itself against a built-in may need its expectations re-derived rather than
+  assumed unchanged.
+
 ## Workflow
 
 1. **Read the request.** If it is a study from another platform, read it fully
@@ -61,7 +83,7 @@ when the indicator loads. Do not silently skip validation.
    resets per day or per session.
 2. **Before writing a formula, check `reference/cookbook.md`.** Every
    author-facing call is demonstrated there, and the first section is the one
-   that saves the most work: the 91 built-ins are descriptors, so
+   that saves the most work: the 102 built-ins are descriptors, so
    `getIndicator('macd').calc(bars, settings, {})` gives you MACD's own columns
    rather than a reimplementation that can drift from the chart's.
 3. **Load the context you need.** `reference/contract.md` for the descriptor
@@ -165,7 +187,7 @@ export default function ({ registerIndicator, sourceValues, sma, nulls }) {
 A `bar` is `{ time, open, high, low, close, volume }` with `time` in **UTC
 seconds**.
 
-## What the library gives you (1.8.1)
+## What the library gives you
 
 The descriptor is much wider than the plot-plus-calc it started as. Before
 hand-rolling anything, check whether one of these already covers it:
@@ -181,6 +203,7 @@ hand-rolling anything, check whether one of these already covers it:
 | Candles or bars as a plot | `plot.ohlc: { open, high, low, close }` |
 | Know the bar state, symbol, interval, clock | the 4th `calc` argument |
 | The instrument's tick size | `ctx.tickSize`, never an input for it |
+| The decimals your plots print at | Nothing: it follows the pane, see below |
 | Parse a session window | `parseSessionSpec`, `inSessionAt`, `sessionFlags` |
 | Reason about the timeframe | `intervalParts`, `isIntradayInterval`, ... |
 | A colour ramp or alpha | `fromGradient`, `withAlpha` |
@@ -212,7 +235,16 @@ Full list in `reference/pitfalls.md`. These four account for most failures:
   plot's `style`. Your own width input becomes a second control that disagrees.
 - Reuse a built-in id unless overriding it is the actual intent. Custom modules
   register last, so they win. The validator warns on this.
-- Add an input for the tick size. `ctx.tickSize` carries it since 1.8.2, and an
+- Add a precision or decimals input. Precision follows the pane, not the
+  descriptor, so there is nothing to declare and an override would only let a
+  plot disagree with the axis it is drawn against. An `onchart` plot is a price
+  and prints at the instrument's tick (Supertrend on a 0.05 tick reads
+  `1339.70`); a plot on its own pane prints at that pane's own span with a floor
+  of two decimals (an RSI reads `70.00`, a percentage study `0.61`). A study pane
+  is not quoted in the instrument's tick, because an RSI is a dimensionless
+  0..100 band. If a plot of yours really is a price, put it on the candles with
+  `overlay: true` rather than reaching for a precision knob.
+- Add an input for the tick size. `ctx.tickSize` carries it, and an
   input is a second source of truth that disagrees with the axis. Point value is
   the exception: the chart does not know it, so that one is an input at 1.
 - Assume the browser's local time. Use `zonedDayIndex` /

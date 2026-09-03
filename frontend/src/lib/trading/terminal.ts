@@ -29,6 +29,8 @@ import {
   OpenAlgoWsFeed,
   type PriceLine,
   ReplayController,
+  ReplayShade,
+  TextWatermark,
   type ReplayState,
   readChartSettings,
   type SeriesApi,
@@ -81,13 +83,10 @@ import {
 } from './intervals'
 import {
   buildChartLegend,
-  DN,
   type LegendRun,
-  LTP_NEUTRAL,
   legendHtml,
   legendToneStyle,
   lotInfoText,
-  UP,
 } from './legend'
 
 export type OrderSide = 'BUY' | 'SELL'
@@ -171,6 +170,8 @@ export interface TerminalCallbacks {
    * chart is live again, which is the transport bar's cue to hide itself.
    */
   onReplayChange?(state: ReplayState | null): void
+  /** The volume histogram was switched from the legend readout. */
+  onVolumeChange?(on: boolean): void
   /**
    * A text-bearing drawing needs its content. The engine renders `style.text`
    * but has no DOM to collect it with, so the host prompts.
@@ -369,6 +370,8 @@ export function dedupeIndicators<T extends { indicatorId: string; settings: unkn
 }
 const STRATEGY = 'chart-trading'
 const VISIBLE_BARS = 120
+/** Empty bars kept between the newest candle and the price axis. */
+const RIGHT_PAD_BARS = 4
 
 /**
  * Where the exported PNG paints the OHLC readout, in CSS px. These mirror the
@@ -453,7 +456,6 @@ export class TradingTerminal {
         shiftKey?: boolean
       }) => string | null)
     | null = null
-  private ltpLine: PriceLine | null = null
   private posLine: PriceLine | null = null
   private tradeBtns: BuySellButtonsInstance | null = null
   /** The bar the OHLC readout is currently showing; replayed into the export. */
@@ -514,6 +516,14 @@ export class TradingTerminal {
   private link: LinkGroup | null = null
   /** Non-null only while the chart is showing a replayed prefix. */
   private replay: ReplayController | null = null
+  /** Non-null while the user is choosing the bar to replay from. */
+  private replayPickIndex: number | null = null
+  private replayPicking = false
+  /** One veil per pane: the future has to be hidden on all of them. */
+  private replayShades: ReplayShade[] = []
+  private replayMark: TextWatermark | null = null
+  /** Base-interval bars under the displayed ones, for intra-bar replay. */
+  private replaySub: { interval: string; bars: Bar[] } | null = null
   /** The price axis's autoscale state before replay forced it on. */
   private replayAutoScale = true
   /** Held so it can be moved to whichever pane is currently at the bottom. */
@@ -521,7 +531,6 @@ export class TradingTerminal {
   private shownCount = 0
   private liveBucket: number | null = null
   private lastLtp: number | null = null
-  private prevClose: number | null = null
   private sym: SymbolView | null = null
   private position: PositionState | null = null
   private readonly orderLines = new Map<string, OrderLineRec>()
@@ -541,6 +550,7 @@ export class TradingTerminal {
     this.wsUrl = opts.wsUrl
     this.container = opts.container
     this.legendEl = opts.legendEl
+    this.wireLegendActions()
     this.getTheme = opts.getTheme
     this.cb = opts.callbacks
     this.sk = opts.storageKey || 'oa-trading'
@@ -659,6 +669,43 @@ export class TradingTerminal {
     this.shownCount = this.shownBars.length
   }
 
+  /**
+   * Push one bar into the live series without rebuilding either of them.
+   *
+   * `setPriceData` replaces both series wholesale and allocates a fresh volume
+   * bar for every bar in history. On a tick that is the dominant cost of the
+   * update, paid before a single indicator runs, and it grows with the history
+   * loaded rather than with what changed. A one-bar update is O(1) and the chart
+   * splices it.
+   *
+   * Only valid without a transform. Renko, Range, Point and Figure and Kagi
+   * re-derive their whole series from the raw bars, so one new raw bar can
+   * change the count and the shape of the output and the transform has to run
+   * again. Those fall back to the full path.
+   *
+   * Returns false when the caller must rebuild instead.
+   */
+  private updateLiveBar(bar: Bar): boolean {
+    if (!this.price || !this.volume) return false
+    const cfg = CHART_TYPES[this.ctype] || CHART_TYPES.candlestick
+    if (cfg.transform) return false
+    // `update` appends or replaces by time on its own, which is exactly the
+    // append-or-replace the caller has already applied to `rawBars`.
+    this.price.update(bar)
+    this.volume.update({
+      time: bar.time,
+      open: 0,
+      high: bar.volume || 0,
+      low: 0,
+      close: bar.volume || 0,
+    })
+    // Untransformed, the shown series *is* rawBars, which the caller mutated in
+    // place, so only the count can have moved.
+    this.shownBars = this.rawBars
+    this.shownCount = this.rawBars.length
+    return true
+  }
+
   private bucketVolume(tbars: Bar[]): Bar[] {
     const out: Bar[] = []
     let ri = 0
@@ -684,6 +731,24 @@ export class TradingTerminal {
   }
 
   /* ── legend (imperative; high-frequency, kept off React state) ────────── */
+  /**
+   * Close of the element before `bar` in whatever series is on screen.
+   *
+   * Read from `shownBars`, not `rawBars`: on a transformed chart type a drawn
+   * element is not one raw bar, so measuring a Renko brick against the raw
+   * candle behind it would report a change the chart never drew. Matched on
+   * time, because the crosshair hands back the element it is over rather than
+   * its index.
+   */
+  private closeBefore(bar: Bar | null): number | null {
+    if (!bar) return null
+    const bars = this.shownBars
+    for (let i = bars.length - 1; i >= 0; i--) {
+      if (bars[i].time === bar.time) return i > 0 ? bars[i - 1].close : null
+    }
+    return null
+  }
+
   private setLegend(bar: Bar | null) {
     this.legendBar = bar
     if (!this.sym) {
@@ -691,6 +756,29 @@ export class TradingTerminal {
       return
     }
     this.legendEl.innerHTML = legendHtml(this.legendModel(bar))
+  }
+
+  /**
+   * The legend is rewritten on every crosshair move, so its controls are bound
+   * by delegation on the container that survives. Binding per render would leak
+   * a listener a frame.
+   */
+  private wireLegendActions(): void {
+    const act = (e: Event): void => {
+      const el = (e.target as HTMLElement | null)?.closest?.("[data-legend-action]")
+      if (!el) return
+      if (el.getAttribute("data-legend-action") !== "volume") return
+      e.preventDefault()
+      e.stopPropagation()
+      this.setVolumeVisible(!this.volumeOn)
+      this.setLegend(this.legendBar)
+      this.cb.onVolumeChange?.(this.volumeOn)
+    }
+    this.legendEl.addEventListener("click", act)
+    this.legendEl.addEventListener("keydown", (e) => {
+      const k = (e as KeyboardEvent).key
+      if (k === "Enter" || k === " ") act(e)
+    })
   }
 
   /**
@@ -707,13 +795,10 @@ export class TradingTerminal {
       exchange: sym.exchange,
       lotsize: sym.lots ? sym.lotsize : null,
       bar,
-      ltp: this.lastLtp,
-      changePct:
-        this.lastLtp != null && this.prevClose
-          ? ((this.lastLtp - this.prevClose) / this.prevClose) * 100
-          : null,
+      prevClose: this.closeBefore(bar),
       fmt: (n) => this.fmt(n),
       fmtVolume: compactVolume,
+      volumeHidden: !this.volumeOn,
     })
   }
 
@@ -841,6 +926,7 @@ export class TradingTerminal {
   }
 
   private async placeFromMenu(side: OrderSide, type: OrderType) {
+    if (this.refuseWhileReplaying()) return
     if (!this.sym || !this.trade) {
       this.toast('search a symbol first')
       return
@@ -885,6 +971,7 @@ export class TradingTerminal {
   }
 
   async exitPosition() {
+    if (this.refuseWhileReplaying()) return
     if (!this.trade || !this.position || !this.sym) return
     const qty = Math.abs(this.position.net)
     const side: OrderSide = this.position.net > 0 ? 'SELL' : 'BUY'
@@ -1002,28 +1089,26 @@ export class TradingTerminal {
     this.joinLink()
     this.setPriceData()
 
-    // Default zoom: a FIXED number of recent bars, so the visible price range
-    // (and cursor→price mapping) is the same on every screen width.
-    if (this.shownCount > VISIBLE_BARS) {
-      const to = this.shownCount - 1 + 4
-      this.chart.timeScale.setVisibleLogicalRange({ from: to - VISIBLE_BARS, to })
-    } else if (this.chart.timeScale.barSpacing > 14) {
-      this.chart.timeScale.setBarSpacing(14)
-    }
+    this.applyDefaultViewport()
 
+    // No LTP price line of our own. The engine already draws one for the price
+    // series: a dashed line across the plot and a filled axis tag, coloured by
+    // the forming candle's direction, at the same price. Adding a second put two
+    // tags on the same pixel row, which is what made the axis read "24058.65"
+    // twice, one printed through the other.
+    //
+    // The engine's is the one to keep. It reserves its band before the tick
+    // ladder is drawn, so the prices either side yield to it instead of being
+    // painted over, and it carries the countdown to the bar close. A price line
+    // takes part in none of that: its tag is drawn straight onto the strip.
+    //
+    // The price itself is still needed: the Buy/Sell panel marks it.
     const lp =
       this.lastLtp != null
         ? this.lastLtp
         : this.rawBars.length
           ? this.rawBars[this.rawBars.length - 1].close
           : null
-    this.ltpLine =
-      lp != null
-        ? this.chart.addPriceLine(
-            { price: lp, color: this.ltpColor(lp), lineWidth: 1, dashed: true, id: 'ltp' },
-            0
-          )
-        : null
 
     // Mini brand mark, bottom-left. On pane 0 now that volume is an overlay
     // there rather than a pane of its own — pane 1 only exists once an
@@ -1065,14 +1150,35 @@ export class TradingTerminal {
       this.addExcludedPrimitive(this.tradeBtns, 0)
     } else this.tradeBtns = null
 
-    this.chart.subscribeCrosshairMove((e) =>
+    this.chart.subscribeCrosshairMove((e) => {
       this.setLegend(e.bar || (this.rawBars.length ? this.rawBars[this.rawBars.length - 1] : null))
-    )
+      this.moveReplayPick(e.index ?? null)
+    })
+
+    // Committing the pick on a plain DOM click rather than `subscribeClick`,
+    // which reports the primitive that was hit: the shade deliberately hit-tests
+    // to nothing so the bar underneath stays reachable, so there is no primitive
+    // to report. A click that ends a pan must not count, so a drag of more than
+    // a couple of pixels disarms it.
+    let pressAt: { x: number; y: number } | null = null
+    this.container.addEventListener('pointerdown', (ev) => {
+      pressAt = { x: (ev as PointerEvent).clientX, y: (ev as PointerEvent).clientY }
+    })
+    this.container.addEventListener('pointerup', (ev) => {
+      const from = pressAt
+      pressAt = null
+      if (!this.replayPicking || !from) return
+      const e = ev as PointerEvent
+      if (Math.abs(e.clientX - from.x) > 3 || Math.abs(e.clientY - from.y) > 3) return
+      this.commitReplayPick()
+    })
 
     // drag-to-modify with a drag ghost; commit on release (tick-snapped)
     this.chart.subscribeDrag(
       (id, p) => {
         if (!id.startsWith('order:') || id.endsWith('::close')) return
+        // Silent: a refusal toast on every pointer sample would be a wall of them.
+        if (this.tradingLocked()) return
         const rec = this.orderLines.get(id.slice(6))
         if (!rec) return
         if (rec.dragFrom == null) {
@@ -1083,6 +1189,8 @@ export class TradingTerminal {
       },
       (id, p) => {
         if (!id.startsWith('order:') || id.endsWith('::close')) return
+        // The release is the modify, so this is the one that must refuse.
+        if (this.refuseWhileReplaying()) return
         const oid = id.slice(6)
         const rec = this.orderLines.get(oid)
         if (!rec) return
@@ -1111,6 +1219,7 @@ export class TradingTerminal {
       if (id === 'trade:sell') return void this.placeFromMenu('SELL', 'MARKET')
       if (id === 'position::close') return void this.exitPosition()
       if (id.startsWith('order:') && id.endsWith('::close')) {
+        if (this.refuseWhileReplaying()) return
         const oid = id.slice(6, -7)
         this.trade!.cancel(oid)
           .then(() => {
@@ -1794,11 +1903,40 @@ export class TradingTerminal {
     await this.loadIndicators()
     if (!this.chart) return
     try {
-      this.chart.addIndicator(indicatorId, {})
+      const inst = this.chart.addIndicator(indicatorId, {})
       this.syncIndicators()
+      this.warnIfStarved(inst)
     } catch (e) {
       this.toast(this.cleanError(e), 'err')
     }
+  }
+
+  /**
+   * Tell the user when an indicator drew nothing because the chart is too short.
+   *
+   * Every indicator needs a warmup before it can print, and a few need a long
+   * one: Special K sums rates of change out to 530 bars and only starts at 725,
+   * and openalgo-charts 1.8.3 lengthened several warmups by correcting how they
+   * seed. On an intraday chart holding a few hundred bars those studies now draw
+   * an empty pane, which is the correct answer and looks exactly like a broken
+   * indicator. Saying so once, at the moment it is added, is the difference.
+   *
+   * Reading `values()` is safe here: the engine flushes any pending recompute on
+   * that call, so this sees the result of the add rather than the frame before.
+   */
+  private warnIfStarved(inst: { name: string; values(): Record<string, unknown> }): void {
+    const loaded = this.rawBars.length
+    if (!loaded) return
+    const cols = Object.values(inst.values()).filter(Array.isArray) as unknown[][]
+    if (cols.length === 0) return
+    const anyFinite = cols.some((col) =>
+      col.some((v) => typeof v === 'number' && Number.isFinite(v))
+    )
+    if (anyFinite) return
+    this.toast(
+      `${inst.name} needs more history than the ${loaded} bars loaded, so it has nothing to draw yet. Widen the range or pick a longer interval.`,
+      ''
+    )
   }
 
   removeIndicatorById(instanceId: string): void {
@@ -1901,6 +2039,20 @@ export class TradingTerminal {
     return this.volumeOn
   }
 
+  /**
+   * The interval a displayed bar is built from, so replay can form one in front
+   * of the user rather than landing it whole.
+   *
+   * One rung down, not the finest available: 1-minute bars under a daily chart
+   * are 375 steps per candle, which is not a replay, it is a stall. An interval
+   * with no rung below it replays bar by bar, as it always did.
+   */
+  private static readonly REPLAY_SUB: Record<string, string> = {
+    '3m': '1m', '5m': '1m', '10m': '5m', '15m': '5m', '30m': '15m',
+    '1h': '15m', '60m': '15m', '2h': '30m', '4h': '1h',
+    'D': '1h', '1d': '1h', 'W': 'D', '1w': 'D',
+  }
+
   /* ── market replay ──────────────────────────────────────────────────────
    * Walk the loaded session forward a bar at a time. The engine's controller
    * feeds the series a prefix of the bars, which is what makes every indicator
@@ -1917,6 +2069,33 @@ export class TradingTerminal {
     return this.replay !== null
   }
 
+  /**
+   * Order entry is closed while the chart is replaying, or while a start bar is
+   * being picked.
+   *
+   * A replayed chart is a simulation, and an order placed from one is not: it
+   * goes to the broker, at the live price, against a chart showing a session
+   * that finished weeks ago. The two things a trader reads before pressing Buy,
+   * the candles and the button's own price, disagree by however far back the
+   * playhead is, and neither of them says so.
+   *
+   * Guarded here rather than only on the buttons, because every route into an
+   * order has to close: the on-chart Buy and Sell, the context menu, a bracket,
+   * dragging an order line to a new price, cancelling one, and closing a
+   * position. A guard on the visible control is a guard on the route somebody
+   * did not use.
+   */
+  private tradingLocked(): boolean {
+    return this.replay !== null || this.replayPicking
+  }
+
+  /** Says no once, in the words of the reason, rather than doing nothing. */
+  private refuseWhileReplaying(): boolean {
+    if (!this.tradingLocked()) return false
+    this.toast('Replay is a simulation. Leave replay to trade.', 'err')
+    return true
+  }
+
   replayState(): ReplayState | null {
     return this.replay?.state() ?? null
   }
@@ -1926,21 +2105,118 @@ export class TradingTerminal {
    * read on the left and session left to walk on the right: opening on bar 0
    * shows an empty chart, which reads as broken.
    */
+  /** True while the user is choosing a start bar. */
+  replayPickingBar(): boolean {
+    return this.replayPicking
+  }
+
+  /**
+   * Step one of replay: choose where to start.
+   *
+   * Opening a quarter of the way in quietly decided the exercise for the user.
+   * The bar you start from is the whole premise ("from here, what happens
+   * next?"), so it is picked, and while it is being picked everything to the
+   * right is greyed. Choosing a start while able to read the next twenty bars is
+   * choosing on hindsight, which is the one thing replay exists to remove.
+   */
   startReplay(startIndex?: number): void {
+    if (this.replay || this.replayPicking || !this.chart || !this.price) return
+    if (this.shownBars.length < 2) return
+    if (startIndex !== undefined) {
+      void this.beginReplayAt(startIndex)
+      return
+    }
+    this.replayPicking = true
+    this.replayPickIndex = Math.floor(this.shownBars.length / 4)
+    this.setReplayShade(this.replayPickIndex)
+    this.showTradeButtons(false)
+    this.cb.onReplayChange?.(null)
+  }
+
+  /** The hovered bar, while the picker is open. Driven by the crosshair. */
+  moveReplayPick(index: number | null): void {
+    if (!this.replayPicking || index === null) return
+    const total = this.shownBars.length
+    if (total === 0) return
+    const clamped = Math.max(0, Math.min(total - 1, Math.round(index)))
+    if (clamped === this.replayPickIndex) return
+    this.replayPickIndex = clamped
+    this.setReplayShade(clamped)
+  }
+
+  /** The bar under the cursor right now, for a host that labels the prompt. */
+  replayPickBar(): Bar | null {
+    if (this.replayPickIndex === null) return null
+    return this.shownBars[this.replayPickIndex] ?? null
+  }
+
+  /** Commit the pick. A click on the plot lands here. */
+  commitReplayPick(): void {
+    if (!this.replayPicking || this.replayPickIndex === null) return
+    void this.beginReplayAt(this.replayPickIndex)
+  }
+
+  cancelReplayPick(): void {
+    if (!this.replayPicking) return
+    this.replayPicking = false
+    this.replayPickIndex = null
+    this.setReplayShade(null)
+    this.showTradeButtons(true)
+    this.cb.onReplayChange?.(null)
+  }
+
+  /**
+   * Move (or raise, or clear) the veil on every pane.
+   *
+   * Per pane and built lazily, because a pane can appear while the picker is
+   * open and one left bright to the right of the cut shows exactly what the
+   * shade is hiding on the pane above it.
+   */
+  private setReplayShade(index: number | null): void {
+    if (!this.chart) return
+    const panes = this.chart.panes()
+    for (let i = this.replayShades.length; i < panes.length; i++) {
+      const shade = new ReplayShade({ index: null, lineVisible: i === 0 })
+      this.chart.addPrimitive(shade, i)
+      this.replayShades.push(shade)
+    }
+    for (const shade of this.replayShades) shade.setOptions({ index })
+  }
+
+  /**
+   * Step two: walk forward from the chosen bar.
+   *
+   * The veil comes off here rather than staying on the un-walked future, because
+   * replay truncates the series: past the playhead there is nothing left to
+   * cover.
+   */
+  private async beginReplayAt(startIndex: number): Promise<void> {
     if (this.replay || !this.chart || !this.price || this.shownBars.length < 2) return
+    this.replayPicking = false
+    this.setReplayShade(null)
     const driven = this.volume ? [this.price, this.volume] : [this.price]
     // Walk what the price series is showing, not the raw feed: on Heikin Ashi
     // or Renko those are different arrays of different lengths, so replaying
     // rawBars would repaint the chart as plain candles and put the playhead at
     // the wrong bar.
-    const bars = this.shownBars
-    const from = startIndex ?? Math.floor(bars.length / 4)
+    // Copied, not aliased. Untransformed, `shownBars` *is* `rawBars`, which
+    // the tick path pushes to, so handing it over directly let the replay set
+    // grow while it was being walked: the total moved and the end of the session
+    // receded with every tick that arrived.
+    const bars = this.shownBars.slice()
+    const from = Math.max(0, Math.min(bars.length - 1, Math.floor(startIndex)))
+    const sub = await this.loadReplaySubBars()
+    // The await above yields, and the user may have left in the meantime.
+    if (!this.chart || !this.price || this.replay) return
     this.replay = new ReplayController(this.chart, {
       series: driven,
       bars,
       startIndex: from,
+      subBars: sub ?? undefined,
       onFrame: (state) => this.cb.onReplayChange?.(state),
     })
+    this.showReplayMark(true)
+    this.showTradeButtons(false)
     // Entering replay truncates the series to a prefix, but leaves the viewport
     // and the price range where the user had them -- which is at the right edge
     // on the newest bars, hundreds of bars past the end of that prefix and at a
@@ -1955,16 +2231,93 @@ export class TradingTerminal {
     // autoscale to stay readable as it walks, but that is replay's state, not
     // a change to the chart the user set up.
     this.replayAutoScale = this.chart.panes()[0]?.priceScale.autoScale ?? true
+
     this.chart.setAutoScale(true)
     this.cb.onReplayChange?.(this.replay.state())
   }
 
+  /**
+   * The base-interval session under the displayed one.
+   *
+   * Closed bars are immutable, so this is cached for the interval it belongs to
+   * and re-fetched only when the interval changes. It deliberately reads through
+   * the plain REST feed rather than the bar cache: the cache is keyed on the
+   * chart's own interval, and a replay set is history, so there is nothing here
+   * for a forming-bar rule to protect.
+   *
+   * A failure is not an error the user needs to see. Replay falls back to
+   * whole-bar steps, which is what it did before this existed.
+   */
+  private async loadReplaySubBars(): Promise<Bar[] | null> {
+    const finer = TradingTerminal.REPLAY_SUB[this.interval]
+    const sym = this.sym
+    const rest = this.rest
+    if (!finer || !sym || !rest) return null
+    if (this.replaySub && this.replaySub.interval === this.interval) return this.replaySub.bars
+    try {
+      const to = this.gridNow()
+      const bars = await rest.getBars({
+        symbol: sym.symbol,
+        exchange: sym.exchange,
+        interval: finer,
+        from: to - lookbackDays(this.interval) * 86400,
+        to,
+      })
+      if (!bars.length) return null
+      this.replaySub = { interval: this.interval, bars }
+      return bars
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * The mode marker. A chart replaying August looks exactly like a chart showing
+   * today, and reading a live decision off history is the mistake this prevents,
+   * so it goes on with replay and comes off with it.
+   */
+  /**
+   * Take the Buy and Sell buttons off the chart, or put them back.
+   *
+   * Removing rather than grey-ing: the panel quotes a live price, and a live
+   * price sitting over a replayed session is the confusion this exists to
+   * remove, whether or not it can be pressed. `removePrimitive` only marks the
+   * pane dirty, so the chart repaints them away on the next frame.
+   */
+  private showTradeButtons(on: boolean): void {
+    if (!this.chart || !this.tradeBtns) return
+    if (on) this.chart.addPrimitive(this.tradeBtns, 0)
+    else this.chart.removePrimitive(this.tradeBtns)
+  }
+
+  private showReplayMark(on: boolean): void {
+    if (!this.chart) return
+    if (on) {
+      if (!this.replayMark) {
+        this.replayMark = new TextWatermark({ text: 'Replay' })
+        this.chart.addPrimitive(this.replayMark, 0)
+      } else {
+        this.replayMark.setOptions({ text: 'Replay' })
+      }
+    } else if (this.replayMark) {
+      this.replayMark.setOptions({ text: '' })
+    }
+  }
+
   /** Leave replay and put the live chart back exactly where the user left it. */
   stopReplay(): void {
+    this.cancelReplayPick()
     if (!this.replay) return
     this.replay.stop()
     this.replay = null
+    this.showReplayMark(false)
+    this.showTradeButtons(true)
     if (!this.replayAutoScale) this.chart?.setAutoScale(false)
+    // The session kept accumulating in rawBars while replay held the series, so
+    // the live chart comes back caught up rather than frozen at the moment
+    // replay started. Only a transformed chart has to rebuild from scratch.
+    this.setPriceData()
+    this.setLegend(this.rawBars.length ? this.rawBars[this.rawBars.length - 1] : null)
     this.cb.onReplayChange?.(null)
   }
 
@@ -2029,17 +2382,6 @@ export class TradingTerminal {
     }
   }
 
-  /**
-   * Colour for the last-price line: the direction of the bar it sits in, so it
-   * matches that candle and the OHLC legend. Amber only until a bar exists to
-   * compare against.
-   */
-  private ltpColor(price: number): string {
-    const bar = this.rawBars.length ? this.rawBars[this.rawBars.length - 1] : null
-    if (!bar) return LTP_NEUTRAL
-    return price >= bar.open ? UP : DN
-  }
-
   /* single tick path shared by WS pushes and the REST fallback */
   private onTick(e: { symbol?: string; ltp: number; ltq?: number; timeSec?: number }) {
     if (!this.sym || (e.symbol && e.symbol !== this.sym.symbol)) return
@@ -2047,7 +2389,6 @@ export class TradingTerminal {
     this.cb.onLtp(e.ltp)
     // Recolour with the price: the line belongs to the forming candle, so it
     // follows that candle's direction rather than sitting amber forever.
-    if (this.ltpLine) this.ltpLine.setOptions({ price: e.ltp, color: this.ltpColor(e.ltp) })
     if (this.position && this.posLine) this.posLine.setLeftLabel(this.posLabel())
     if (this.tradeBtns && !this.depthActive) this.tradeBtns.setMark(e.ltp)
     if (this.builder) {
@@ -2060,10 +2401,26 @@ export class TradingTerminal {
         const last = this.rawBars[this.rawBars.length - 1]
         if (last && last.time === u.bar.time) this.rawBars[this.rawBars.length - 1] = u.bar
         else this.rawBars.push(u.bar)
-        this.setPriceData()
+        // Replay owns the series while it is running. Writing the live bar into
+        // it puts a candle at the current wall-clock bucket, at the current
+        // price, hundreds of bars past the playhead: a lone spike far from the
+        // replayed action that drags the price axis and the last-price line with
+        // it, then vanishes on the next replay frame when setData rewrites the
+        // prefix. rawBars keeps accumulating either way, so leaving replay finds
+        // the session already caught up.
+        if (this.replay) {
+          this.cb.onLtp(e.ltp)
+          return
+        }
+        // One bar in, one bar out. Only a transformed chart has to rebuild.
+        if (!this.updateLiveBar(u.bar)) this.setPriceData()
       }
     }
-    this.setLegend(this.rawBars.length ? this.rawBars[this.rawBars.length - 1] : null)
+    // The legend belongs to the bar on screen. During replay that is the
+    // playhead's, written by onReplayChange, not the live one.
+    if (!this.replay) {
+      this.setLegend(this.rawBars.length ? this.rawBars[this.rawBars.length - 1] : null)
+    }
   }
 
   /* ── live data: WS ticks → candles; depth → bid/ask ───────────────────── */
@@ -2122,67 +2479,112 @@ export class TradingTerminal {
     }
   }
 
+  /**
+   * Reconcile now rather than on the next cycle.
+   *
+   * The periodic pass is deliberately slow and jittered, which is right for
+   * steady state and wrong for the moment a gap appears. Coming back from a
+   * dropped socket or a hidden tab, the missing buckets are known immediately,
+   * so re-arming the timer with no delay closes the hole at once and keeps a
+   * single code path doing the work.
+   */
+  private reconcileNow(): void {
+    if (this.reconcileTimer) clearTimeout(this.reconcileTimer)
+    this.reconcileTimer = setTimeout(() => this.runReconcile(), 0)
+  }
+
   /* periodic history reconcile: snap completed bars to broker OHLC/volume */
   private scheduleReconcile() {
     if (this.reconcileTimer) clearTimeout(this.reconcileTimer)
-    this.reconcileTimer = setTimeout(
-      async () => {
-        try {
-          if (this.sym && this.rest) {
-            const to = nowSec()
-            const fresh = await this.rest.getBars({
-              symbol: this.sym.symbol,
-              exchange: this.sym.exchange,
-              interval: this.interval,
-              from: to - Math.min(3, lookbackDays(this.interval)) * 86400,
-              to,
-            })
-            const byTime = new Map(fresh.map((b) => [b.time, b]))
-            let changed = false
-            for (let i = 0; i < this.rawBars.length; i++) {
-              const f = byTime.get(this.rawBars[i].time)
-              if (f && (this.liveBucket == null || f.time < this.liveBucket)) {
-                this.rawBars[i] = f
+    this.reconcileTimer = setTimeout(() => this.runReconcile(), 25000 + Math.random() * 10000)
+  }
+
+  private async runReconcile(): Promise<void> {
+    try {
+      if (this.sym && this.rest) {
+        const to = nowSec()
+        const fresh = await this.rest.getBars({
+          symbol: this.sym.symbol,
+          exchange: this.sym.exchange,
+          interval: this.interval,
+          from: to - Math.min(3, lookbackDays(this.interval)) * 86400,
+          to,
+        })
+        const byTime = new Map(fresh.map((b) => [b.time, b]))
+        let changed = false
+        for (let i = 0; i < this.rawBars.length; i++) {
+          const f = byTime.get(this.rawBars[i].time)
+          if (f && (this.liveBucket == null || f.time < this.liveBucket)) {
+            this.rawBars[i] = f
+            changed = true
+          }
+        }
+
+        // Insert the bars we never built at all.
+        //
+        // The loop above only snaps bars already on the chart, so a bucket
+        // the client missed outright stayed missing until a reload. It goes
+        // missing whenever the tick stream is not running for a whole
+        // interval: the socket drops, the feed pauses because the tab was
+        // hidden, or the machine sleeps. The candles either side are fine,
+        // so the chart shows a clean hole and the OHLC legend disagrees with
+        // the broker for those buckets.
+        //
+        // `fresh` already holds them, and this is the one place that has
+        // both sides to compare. Only closed buckets are filled: the
+        // forming bar belongs to the tick stream, which is fresher than a
+        // poll and must never be overwritten by it.
+        if (this.rawBars.length > 0) {
+          const known = new Set(this.rawBars.map((b) => b.time))
+          const earliest = this.rawBars[0].time
+          const missing = fresh.filter(
+            (b) =>
+              b.time > earliest &&
+              !known.has(b.time) &&
+              (this.liveBucket == null || b.time < this.liveBucket)
+          )
+          if (missing.length > 0) {
+            // Merge and re-sort rather than splice at a found index: a
+            // history page landing between the fetch and this line would
+            // invalidate any index computed before the await.
+            this.rawBars = [...this.rawBars, ...missing].sort((a, b) => a.time - b.time)
+            changed = true
+          }
+        }
+        // The forming bar's volume cannot come from the tick stream. A
+        // tradeable's only subscription is Depth, and a depth payload
+        // carries ltp but no last-traded-qty, so 'ltq-sum' has nothing to
+        // accumulate and the live bar reads 0 on a symbol visibly trading.
+        // History is the only source that has it, so take it from there --
+        // and take only it. OHLC stays with the ticks, which are fresher
+        // than a 30-second poll and must not jump backwards to it.
+        if (this.builder && this.liveBucket != null) {
+          const f = byTime.get(this.liveBucket)
+          const cur = this.builder.current()
+          if (f && cur && cur.time === this.liveBucket) {
+            // Volume inside a bar only ever grows, so the higher of the two
+            // is the later reading. It also keeps the histogram monotonic
+            // when a poll lands mid-print and briefly reports less.
+            const vol = Math.max(f.volume ?? 0, cur.volume ?? 0)
+            if (vol !== (cur.volume ?? 0)) {
+              // Re-seed rather than patch rawBars alone: the builder folds
+              // the next tick into its own copy of the bar, which would
+              // write the stale volume straight back over this.
+              this.builder.seed({ ...cur, volume: vol })
+              const last = this.rawBars[this.rawBars.length - 1]
+              if (last && last.time === this.liveBucket) {
+                this.rawBars[this.rawBars.length - 1] = { ...last, volume: vol }
                 changed = true
               }
             }
-            // The forming bar's volume cannot come from the tick stream. A
-            // tradeable's only subscription is Depth, and a depth payload
-            // carries ltp but no last-traded-qty, so 'ltq-sum' has nothing to
-            // accumulate and the live bar reads 0 on a symbol visibly trading.
-            // History is the only source that has it, so take it from there --
-            // and take only it. OHLC stays with the ticks, which are fresher
-            // than a 30-second poll and must not jump backwards to it.
-            if (this.builder && this.liveBucket != null) {
-              const f = byTime.get(this.liveBucket)
-              const cur = this.builder.current()
-              if (f && cur && cur.time === this.liveBucket) {
-                // Volume inside a bar only ever grows, so the higher of the two
-                // is the later reading. It also keeps the histogram monotonic
-                // when a poll lands mid-print and briefly reports less.
-                const vol = Math.max(f.volume ?? 0, cur.volume ?? 0)
-                if (vol !== (cur.volume ?? 0)) {
-                  // Re-seed rather than patch rawBars alone: the builder folds
-                  // the next tick into its own copy of the bar, which would
-                  // write the stale volume straight back over this.
-                  this.builder.seed({ ...cur, volume: vol })
-                  const last = this.rawBars[this.rawBars.length - 1]
-                  if (last && last.time === this.liveBucket) {
-                    this.rawBars[this.rawBars.length - 1] = { ...last, volume: vol }
-                    changed = true
-                  }
-                }
-              }
-            }
-            if (changed) this.setPriceData()
           }
-        } catch {
-          /* next cycle retries */
         }
-        this.scheduleReconcile()
-      },
-      25000 + Math.random() * 10000
-    )
+        if (changed) this.setPriceData()
+      }
+    } catch {
+      /* next cycle retries */
+    }
+    this.scheduleReconcile()
   }
 
   /** Monotonic id for the most recent loadSymbol; older loads abandon. */
@@ -2272,7 +2674,6 @@ export class TradingTerminal {
     // history
     const to = this.gridNow()
     this.lastLtp = null
-    this.prevClose = null
     this.liveBucket = null
     this.noMoreHistory = false
     try {
@@ -2296,10 +2697,6 @@ export class TradingTerminal {
         this.toast(`no history for ${this.sym.symbol} ${this.sym.exchange} ${this.interval}`, 'err')
       return false
     }
-    this.prevClose =
-      this.rawBars.length > 1
-        ? this.rawBars[this.rawBars.length - 2].close
-        : this.rawBars[this.rawBars.length - 1].open
     this.lastLtp = this.rawBars[this.rawBars.length - 1].close
     this.buildChart()
     this.cb.onLtp(this.lastLtp)
@@ -2343,8 +2740,40 @@ export class TradingTerminal {
     if (this.chart && this.rawBars.length) this.buildChart()
   }
 
+  /**
+   * The zoom the chart opens at: a FIXED number of recent bars, so the visible
+   * price range, and the cursor to price mapping, are the same on every screen
+   * width.
+   *
+   * The trailing pad is what keeps the newest candle off the price axis. It is
+   * measured in bars, which is the reason it has to be applied together with the
+   * bar count and not on its own: four bars is a comfortable margin at this
+   * zoom and three pixels once a month of five-minute history is squeezed into
+   * one screen.
+   */
+  private applyDefaultViewport(): void {
+    if (!this.chart) return
+    if (this.shownCount > VISIBLE_BARS) {
+      const to = this.shownCount - 1 + RIGHT_PAD_BARS
+      this.chart.timeScale.setVisibleLogicalRange({ from: to - VISIBLE_BARS, to })
+    } else if (this.chart.timeScale.barSpacing > 14) {
+      this.chart.timeScale.setBarSpacing(14)
+    }
+  }
+
+  /**
+   * Reset returns to the view the chart opened at, not to the whole of history.
+   *
+   * `chart.resetScale()` alone re-enables price autoscale and then fits every
+   * loaded bar, which on a month of five-minute history is roughly 1900 candles
+   * across 1400 px: sub-pixel bars, and a trailing gap of three pixels because
+   * that gap is counted in bars too. A reference terminal returns to a readable
+   * window instead, which is also what this chart did when it loaded.
+   */
   resetScale() {
-    this.chart?.resetScale()
+    if (!this.chart) return
+    this.chart.resetScale()
+    this.applyDefaultViewport()
   }
 
   /* ── PNG export ───────────────────────────────────────────────────────── */
@@ -2372,18 +2801,51 @@ export class TradingTerminal {
    * detach the interaction-only overlays, take the composite, paint the readout
    * onto it, restore. Filename convention and canvas theme are unchanged.
    */
+  /** `SYMBOL-interval-timestamp.png`, so a folder of these sorts usefully. */
+  private screenshotName(): string {
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[T:]/g, '-')
+    return `${this.sym?.symbol ?? 'chart'}-${this.interval}-${stamp}.png`
+  }
+
+  /** Save the chart as a PNG. */
   async screenshot(): Promise<void> {
     const chart = this.chart
     if (!chart || !this.sym) return
-    const stamp = new Date().toISOString().slice(0, 16).replace(/[T:]/g, '-')
-    const filename = `${this.sym.symbol}-${this.interval}-${stamp}.png`
     try {
       const canvas = await this.captureCanvas(chart)
       if (!canvas) return
       const a = document.createElement('a')
       a.href = canvas.toDataURL('image/png')
-      a.download = filename
+      a.download = this.screenshotName()
       a.click()
+      this.toast('Chart saved', 'ok')
+    } catch (e) {
+      this.toast(this.cleanError(e), 'err')
+    }
+  }
+
+  /**
+   * Put the chart on the clipboard as an image, ready to paste.
+   *
+   * The image clipboard is the only form that pastes into a post composer or a
+   * chat, which is what people do with a chart far more often than they file it.
+   * It needs a secure context and a user gesture: a click on the menu item is
+   * the gesture, and 127.0.0.1 counts as secure alongside https, so a local
+   * OpenAlgo qualifies. Anything else is reported rather than failing silently.
+   */
+  async copyScreenshot(): Promise<void> {
+    const chart = this.chart
+    if (!chart || !this.sym) return
+    try {
+      if (!navigator.clipboard || typeof ClipboardItem === 'undefined') {
+        throw new Error('Copying images needs https or localhost')
+      }
+      const canvas = await this.captureCanvas(chart)
+      if (!canvas) return
+      const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, 'image/png'))
+      if (!blob) throw new Error('The chart produced no image')
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+      this.toast('Chart copied, paste it anywhere', 'ok')
     } catch (e) {
       this.toast(this.cleanError(e), 'err')
     }
@@ -2525,6 +2987,10 @@ export class TradingTerminal {
     this.ws.onState((s) => {
       this.cb.onWsState(s)
       if (s === 'closed' || s === 'error' || s === 'reconnecting') this.startLtpFallback()
+      // Back on the wire after a break: whatever closed between the drop and
+      // now was never built from ticks, so reconcile at once instead of waiting
+      // out the rest of the 25 to 35 second cycle staring at the hole.
+      if (s === 'open') this.reconcileNow()
     })
     this.ws.onControl((m) => {
       if (m.type === 'auth' && m.status !== 'success') this.cb.onWsState('auth failed')

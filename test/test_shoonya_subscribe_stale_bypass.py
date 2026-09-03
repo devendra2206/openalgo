@@ -67,6 +67,7 @@ def _make_adapter():
     a._token_to_scrips = {}
     a._token_last_tick = {}
     a._token_first_subscribed_at = {}
+    a._pending_ws_unsubscribes = set()
     a.ws_subscription_refs = {}
     a.zmq_port = 5555
     return a
