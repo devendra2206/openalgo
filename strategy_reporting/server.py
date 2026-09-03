@@ -999,9 +999,26 @@ def _relay(_unused):
         response.headers["Cache-Control"] = "no-cache"
         return response
 
-    upstream = _relay_client.request(
-        request.method, target_url, headers=headers, content=request.get_data(),
-    )
+    try:
+        upstream = _relay_client.request(
+            request.method, target_url, headers=headers, content=request.get_data(),
+        )
+    except httpx.TransportError as exc:
+        # The main app was briefly unreachable (e.g. a fresh connection
+        # refused under load, or genuinely down) -- previously unhandled
+        # here, which crashed this ONE request thread with a 500 traceback
+        # but is worth a distinct 503 so nginx/the browser can tell
+        # "upstream down" apart from a genuine app-level error. Does not
+        # affect this subprocess's own liveness either way (werkzeug's
+        # threaded server isolates each request to its own thread) -- this
+        # is purely about giving the caller an honest, structured response
+        # instead of a bare exception.
+        logger.warning(f"Relay to main app failed for {request.path}: {exc}")
+        return jsonify({
+            "status": "error",
+            "message": "Main app temporarily unreachable, please retry",
+        }), 503
+
     response_headers = [
         (k, v) for k, v in upstream.headers.items() if k.lower() not in _HOP_BY_HOP_HEADERS
     ]
