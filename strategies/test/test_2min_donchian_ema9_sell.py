@@ -1,0 +1,422 @@
+"""
+Unit tests for
+strategies/deployed/Nifty_2Min_DonchianEMA9_Sell_1_20260906000000.py -- the
+NIFTY 2-min Donchian(10)/EMA(9) naked option-SELLING strategy ported from
+data23_to_26/backtest_nifty_2min_donchian_ema9_sell.py.
+
+No live broker connection is used anywhere in this file -- every
+client/price_stream dependency is a stub or MagicMock, and network-side
+calls are monkeypatched out. Focuses on the logic that is genuinely NEW in
+this script (not copied verbatim from an already-tested donor):
+  - The Donchian-channel fidelity requirement (excludes the current/trigger
+    candle, unlike ta.donchian()'s own inclusive rolling window).
+  - The arm/confirm/countdown/cancel state machine, including the
+    catch-up-batch handling that only dispatches an entry on the LATEST
+    closed candle.
+  - The ITM-floor strike-selection fallback (mirrors the corrected
+    backtest's own fix).
+  - The SL/target premium check.
+  - The single shared daily trade cap and single-position-slot semantics
+    (the two bugs the backtest itself needed fixing before it was
+    trustworthy -- this is their live-code regression coverage).
+"""
+
+import importlib.util
+import sys
+from datetime import date, datetime as real_datetime
+from datetime import time as dtime
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import numpy as np
+import pandas as pd
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+SCRIPT_PATH = (
+    REPO_ROOT
+    / "strategies"
+    / "deployed"
+    / "Nifty_2Min_DonchianEMA9_Sell_1_20260906000000.py"
+)
+
+
+def _ensure_real_openalgo_sdk_loaded():
+    """See test_5min_supertrend_pivot_sell.py's identical helper: the repo
+    root is itself importable as a package literally named `openalgo`,
+    which can shadow the pip-installed SDK under pytest's
+    rootdir-on-sys.path behavior."""
+    existing = sys.modules.get("openalgo")
+    if existing is not None and hasattr(existing, "api"):
+        return
+
+    site_pkg_init = REPO_ROOT / ".venv" / "Lib" / "site-packages" / "openalgo" / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        "openalgo", site_pkg_init, submodule_search_locations=[str(site_pkg_init.parent)]
+    )
+    real_openalgo = importlib.util.module_from_spec(spec)
+    sys.modules["openalgo"] = real_openalgo
+    spec.loader.exec_module(real_openalgo)
+
+
+def _load_script_module():
+    _ensure_real_openalgo_sdk_loaded()
+    spec = importlib.util.spec_from_file_location("nifty_2min_donchian_ema9_sell_script", SCRIPT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def script_module():
+    return _load_script_module()
+
+
+@pytest.fixture
+def engine(script_module, monkeypatch):
+    monkeypatch.setattr(script_module, "notify_trade_closed", lambda *a, **k: None)
+    monkeypatch.setattr(script_module, "notify_telegram_error", lambda *a, **k: None)
+    monkeypatch.setattr(script_module, "push_leg_error", lambda *a, **k: None)
+    monkeypatch.setattr(script_module, "check_pending_action", lambda *a, **k: None)
+    monkeypatch.setattr(script_module, "ack_pending_action", lambda *a, **k: None)
+    monkeypatch.setattr(script_module, "check_force_exit", lambda *a, **k: False)
+    monkeypatch.setattr(script_module, "ack_force_exit_complete", lambda *a, **k: None)
+    monkeypatch.setattr(script_module, "append_trade_log", lambda *a, **k: None)
+
+    env = script_module.Environment()
+    store = script_module.StateStore(env)
+    monkeypatch.setattr(store, "save", lambda: None)
+    client = MagicMock()
+    price_stream = MagicMock()
+    price_stream.get_ltp.return_value = None
+    eng = script_module.StrategyEngine(client, store, env, price_stream, execution_id=1, ltp_client=MagicMock())
+    yield eng
+    eng._fill_executor.shutdown(wait=False)
+    eng._bg_executor.shutdown(wait=False)
+    eng._pnl_executor.shutdown(wait=False)
+
+
+def _make_bars(rows: list) -> pd.DataFrame:
+    """rows: list of (timestamp_str, open, high, low, close). Builds the
+    lowercase-column DataFrame shape client.history() returns."""
+    idx = pd.to_datetime([r[0] for r in rows])
+    return pd.DataFrame(
+        {
+            "open": [r[1] for r in rows],
+            "high": [r[2] for r in rows],
+            "low": [r[3] for r in rows],
+            "close": [r[4] for r in rows],
+        },
+        index=idx,
+    )
+
+
+def _ts_at(day: str, start_hm: tuple, offset_idx: int) -> str:
+    h, m = start_hm
+    total_min = h * 60 + m + 2 * offset_idx
+    hh, mm = divmod(total_min, 60)
+    return f"{day} {hh:02d}:{mm:02d}:00"
+
+
+def _filler_bars(day: str, start_hm: tuple, n: int, start_idx: int = 0,
+                  close: float = 99.5) -> list:
+    """Strictly monotonically-NARROWING candles (high decreasing, low
+    increasing by a tiny amount each bar) -- guarantees every bar's own
+    High/Low is always safely inside the rolling max/min of the PRECEDING
+    bars, so these never spuriously self-trigger the Donchian band
+    regardless of how many are chained together (a genuinely flat/repeated
+    range would tie against its own rolling window and false-trigger via
+    the >=/<= comparison). `close` defaults to 99.5 (matching the OHLC
+    range) but can be raised (e.g. 100.0) so a caller can keep a bar
+    unambiguously ABOVE ema9 while still armed for CE, without introducing
+    a fresh false trigger of its own."""
+    rows = []
+    for i in range(n):
+        idx = start_idx + i
+        high = 100.0 - 0.001 * idx
+        low = 99.0 + 0.001 * idx
+        rows.append((_ts_at(day, start_hm, idx), 99.5, high, low, close))
+    return rows
+
+
+# Enough filler bars to clear compute_donchian_signal's own warmup floor
+# (donchian_period + ema_period + 2 = 10 + 9 + 2 = 21 CLOSED bars) with
+# room to spare before any test's own special candles are appended.
+WARMUP_N = 20
+
+
+# ---------------------------------------------------------------------------
+# Donchian channel fidelity: must exclude the current/trigger candle
+# ---------------------------------------------------------------------------
+class TestDonchianFidelity:
+    def test_channel_excludes_the_latest_closed_candle(self, script_module):
+        """A candle whose own High is the new all-time high of the WHOLE
+        series (including itself) must NOT count as a Donchian-upper
+        trigger purely because of its own extreme -- the channel it's
+        compared against must be built from the PRIOR 10 candles only."""
+        day = "2026-09-01"
+        rows = _filler_bars(day, (9, 15), WARMUP_N)
+        # One candle with an extreme high -- if the channel included that
+        # candle itself, donchian_upper would jump to include it and the
+        # trigger math would be internally circular.
+        rows.append((_ts_at(day, (9, 15), WARMUP_N), 99.5, 150.0, 99.5, 99.5))
+        # Still-forming bar, dropped.
+        rows.append((_ts_at(day, (9, 15), WARMUP_N + 1), 99.5, 100.0, 99.0, 99.5))
+        bars = _make_bars(rows)
+
+        state = script_module.StrategyState()
+        sig = script_module.compute_donchian_signal(bars, state, ltp=99.5)
+
+        assert sig is not None
+        # The channel for the extreme-high candle must be built from the
+        # 10 preceding filler candles only -- their own highs top out just
+        # under 100, NOT anywhere near 150.
+        assert sig.donchian_upper < 100.0
+
+    def test_first_bar_of_day_is_never_a_trigger(self, script_module):
+        """A day's first candle touching the Donchian band must not arm
+        anything, even though the indicator value itself is still computed
+        continuously (no reset)."""
+        prior_day = _filler_bars("2026-08-31", (9, 15), WARMUP_N)
+        # New day's FIRST candle spikes -- must not arm despite High>=channel.
+        new_day_first = [("2026-09-01 09:15:00", 99.5, 150.0, 99.5, 149.0)]
+        # Still-forming bar, dropped.
+        still_forming = [("2026-09-01 09:17:00", 149.0, 150.0, 149.0, 149.0)]
+        bars = _make_bars(prior_day + new_day_first + still_forming)
+
+        state = script_module.StrategyState()
+        sig = script_module.compute_donchian_signal(bars, state, ltp=149.0)
+
+        assert sig is not None
+        assert state.armed_side == "", "first candle of the day must never arm a trigger"
+
+
+# ---------------------------------------------------------------------------
+# Arm / confirm / countdown / cancel state machine
+# ---------------------------------------------------------------------------
+class TestStateMachine:
+    DAY = "2026-09-01"
+
+    def test_trigger_then_confirmation_enters(self, script_module):
+        """A trigger candle (High>=upper) followed by a LATER candle whose
+        Close < EMA9 fires a CE entry on that later candle -- and only
+        because it IS the latest closed candle in the batch."""
+        rows = _filler_bars(self.DAY, (9, 15), WARMUP_N)
+        n = WARMUP_N
+        # Trigger candle: high spikes above the established channel.
+        rows.append((_ts_at(self.DAY, (9, 15), n), 99.5, 150.0, 99.5, 99.5))
+        # One neutral candle in between (still armed, not yet confirmed).
+        # Close=100.0 is clearly ABOVE ema9 (~99.5) -- avoids a
+        # floating-point tie against ema9's recursive EWM computation that
+        # would otherwise register a spurious CE confirmation here.
+        rows.append((_ts_at(self.DAY, (9, 15), n + 1), 99.5, 100.0, 99.3, 100.0))
+        # Confirmation candle: closes below EMA9 (EMA9 is still ~99.5 after
+        # a long flat run, so a close well below it, e.g. 50, confirms).
+        rows.append((_ts_at(self.DAY, (9, 15), n + 2), 99.5, 100.0, 49.0, 50.0))
+        # Still-forming bar, dropped.
+        rows.append((_ts_at(self.DAY, (9, 15), n + 3), 50.0, 51.0, 49.0, 50.0))
+        bars = _make_bars(rows)
+
+        state = script_module.StrategyState()
+        sig = script_module.compute_donchian_signal(bars, state, ltp=50.0)
+
+        assert sig is not None
+        assert sig.pending_entry_side == "CE"
+        assert state.armed_side == "", "confirmed entry must clear the armed state"
+
+    def test_same_side_retrigger_refreshes_countdown(self, script_module):
+        rows = _filler_bars(self.DAY, (9, 15), WARMUP_N)
+        n = WARMUP_N
+        rows.append((_ts_at(self.DAY, (9, 15), n), 99.5, 150.0, 99.5, 99.5))  # CE trigger, countdown=20
+        # 15 neutral candles pass (countdown would reach 5 without a
+        # refresh). Monotonically-narrowing (via _filler_bars) so none of
+        # these self-tie their own rolling channel over such a long run;
+        # close=100.0 keeps them clearly ABOVE ema9 too, avoiding a
+        # floating-point tie that would otherwise register a spurious CE
+        # confirmation while still armed.
+        rows += _filler_bars(self.DAY, (9, 15), 15, start_idx=n + 1, close=100.0)
+        # A SECOND CE trigger candle -- must refresh the window back to 20.
+        # Close also kept at 100.0 (well above ema9) for the same reason --
+        # only its HIGH (150) is meant to matter here, not its close.
+        rows.append((_ts_at(self.DAY, (9, 15), n + 16), 99.5, 150.0, 99.5, 100.0))
+        rows.append((_ts_at(self.DAY, (9, 15), n + 17), 100.0, 101.0, 99.3, 100.0))  # still-forming, dropped
+        bars = _make_bars(rows)
+
+        state = script_module.StrategyState()
+        script_module.compute_donchian_signal(bars, state, ltp=99.5)
+
+        assert state.armed_side == "CE"
+        assert state.armed_countdown == script_module.config.confirmation_max_candles
+
+    def test_opposite_side_trigger_cancels_and_switches(self, script_module):
+        rows = _filler_bars(self.DAY, (9, 15), WARMUP_N)
+        n = WARMUP_N
+        rows.append((_ts_at(self.DAY, (9, 15), n), 99.5, 150.0, 99.5, 99.5))       # CE trigger
+        # Close=99.9, clearly ABOVE ema9 (~99.5) so this does NOT also
+        # register as a (spurious, float-precision-driven) CE confirmation
+        # -- only the Low breach (PE trigger) should fire here.
+        rows.append((_ts_at(self.DAY, (9, 15), n + 1), 99.5, 100.0, 50.0, 99.9))   # PE trigger (Low breach)
+        rows.append((_ts_at(self.DAY, (9, 15), n + 2), 99.9, 100.0, 99.0, 99.9))   # still-forming, dropped
+        bars = _make_bars(rows)
+
+        state = script_module.StrategyState()
+        script_module.compute_donchian_signal(bars, state, ltp=99.5)
+
+        assert state.armed_side == "PE", "opposite-side trigger must cancel CE and arm PE instead"
+        assert state.armed_countdown == script_module.config.confirmation_max_candles
+
+    def test_countdown_expires_and_disarms(self, script_module):
+        rows = _filler_bars(self.DAY, (9, 15), WARMUP_N)
+        n = WARMUP_N
+        rows.append((_ts_at(self.DAY, (9, 15), n), 99.5, 150.0, 99.5, 99.5))  # CE trigger, countdown=20
+        # 21 neutral candles with NO confirmation -- window must expire
+        # (the last one acts as the still-forming bar and is dropped, so
+        # only 20 of these are actually processed as closed candles).
+        # Monotonically-narrowing (via _filler_bars) so a run this long
+        # never self-ties its own rolling channel; close=100.0 keeps them
+        # clearly ABOVE ema9, avoiding a floating-point tie that would
+        # otherwise register a spurious CE confirmation.
+        rows += _filler_bars(self.DAY, (9, 15), 21, start_idx=n + 1, close=100.0)
+        bars = _make_bars(rows)
+
+        state = script_module.StrategyState()
+        script_module.compute_donchian_signal(bars, state, ltp=99.5)
+
+        assert state.armed_side == "", "20-candle confirmation window must expire without confirmation"
+
+    def test_confirmation_on_a_catchup_candle_does_not_dispatch_a_stale_entry(self, script_module):
+        """If a whole batch of candles (a restart/gap) is processed at
+        once and the confirmation candle is NOT the latest one in that
+        batch, the state machine still advances (disarms) but must NOT
+        set pending_entry_side -- entering on stale historical data would
+        be wrong for a live strategy."""
+        rows = _filler_bars(self.DAY, (9, 15), WARMUP_N)
+        n = WARMUP_N
+        rows.append((_ts_at(self.DAY, (9, 15), n), 99.5, 150.0, 99.5, 99.5))        # CE trigger
+        rows.append((_ts_at(self.DAY, (9, 15), n + 1), 99.5, 100.0, 49.0, 50.0))    # confirms CE -- but NOT latest
+        # Low kept comfortably ABOVE 49 (the confirmation candle's own low,
+        # still inside the rolling window) so this candle doesn't ALSO
+        # register a fresh, genuine PE trigger of its own.
+        rows.append((_ts_at(self.DAY, (9, 15), n + 2), 50.0, 60.0, 55.0, 57.0))     # a later closed candle exists
+        rows.append((_ts_at(self.DAY, (9, 15), n + 3), 57.0, 58.0, 56.0, 57.0))     # still-forming, dropped
+        bars = _make_bars(rows)
+
+        state = script_module.StrategyState()
+        sig = script_module.compute_donchian_signal(bars, state, ltp=55.0)
+
+        assert sig is not None
+        assert sig.pending_entry_side == "", "a stale (non-latest) confirmation must not dispatch an entry"
+        assert state.armed_side == "", "the state machine must still have advanced past the stale confirmation"
+
+
+# ---------------------------------------------------------------------------
+# ITM-floor strike selection (mirrors the corrected backtest's own fix)
+# ---------------------------------------------------------------------------
+def _make_chain(strikes_premiums: dict, option_type: str, lotsize: int = 75) -> dict:
+    key = option_type.lower()
+    return {
+        "chain": [
+            {"strike": strike, key: {"strike": strike, "ltp": premium, "lotsize": lotsize,
+                                      "symbol": f"NIFTY{strike:.0f}{option_type}"}}
+            for strike, premium in strikes_premiums.items()
+        ]
+    }
+
+
+class TestStrikeSelection:
+    def test_atm_premium_above_floor_used_directly(self, script_module):
+        chain = _make_chain({24900: 80, 25000: 150, 25100: 60}, "CE")
+        result = script_module.select_itm_floor_strike(chain, "CE", spot=25000)
+        leg, premium, stepped_itm = result
+        assert leg["strike"] == 25000
+        assert premium == 150
+        assert stepped_itm is False
+
+    def test_ce_steps_itm_lower_strikes_when_atm_too_cheap(self, script_module):
+        # ATM (25000) premium too low; CE steps to LOWER strikes (ITM).
+        chain = _make_chain({24800: 220, 24900: 130, 25000: 40, 25100: 20}, "CE")
+        result = script_module.select_itm_floor_strike(chain, "CE", spot=25000)
+        leg, premium, stepped_itm = result
+        assert leg["strike"] == 24900  # nearest ITM strike clearing the Rs100 floor
+        assert premium == 130
+        assert stepped_itm is True
+
+    def test_pe_steps_itm_higher_strikes_when_atm_too_cheap(self, script_module):
+        # ATM (25000) premium too low; PE steps to HIGHER strikes (ITM).
+        chain = _make_chain({24900: 20, 25000: 40, 25100: 130, 25200: 220}, "PE")
+        result = script_module.select_itm_floor_strike(chain, "PE", spot=25000)
+        leg, premium, stepped_itm = result
+        assert leg["strike"] == 25100
+        assert premium == 130
+        assert stepped_itm is True
+
+    def test_falls_back_to_atm_when_nothing_clears_the_floor(self, script_module):
+        chain = _make_chain({24900: 10, 25000: 20, 25100: 5}, "CE")
+        result = script_module.select_itm_floor_strike(chain, "CE", spot=25000)
+        leg, premium, stepped_itm = result
+        assert leg["strike"] == 25000  # falls back to ATM itself, never skips entirely
+        assert premium == 20
+        assert stepped_itm is False
+
+    def test_itm_walk_is_bounded_by_max_itm_steps(self, script_module):
+        # Every candidate within range is too cheap -- must not walk past
+        # config.max_itm_steps and must not raise.
+        strikes = {25000 - 50 * i: 1.0 for i in range(0, 15)}
+        chain = _make_chain(strikes, "CE")
+        result = script_module.select_itm_floor_strike(chain, "CE", spot=25000)
+        leg, premium, stepped_itm = result
+        assert leg["strike"] == 25000
+        assert stepped_itm is False
+
+
+# ---------------------------------------------------------------------------
+# SL / target premium check
+# ---------------------------------------------------------------------------
+class TestSlTarget:
+    def test_sl_hit(self, script_module, engine):
+        pos = script_module.LegPosition(entry_px=100.0)
+        assert engine._sl_or_target_hit(pos, current_premium=130.0) == "sl_hit"
+        assert engine._sl_or_target_hit(pos, current_premium=129.9) is None
+
+    def test_target_hit(self, script_module, engine):
+        pos = script_module.LegPosition(entry_px=100.0)
+        assert engine._sl_or_target_hit(pos, current_premium=70.0) == "target_hit"
+        assert engine._sl_or_target_hit(pos, current_premium=70.1) is None
+
+    def test_neither_hit_in_the_middle(self, script_module, engine):
+        pos = script_module.LegPosition(entry_px=100.0)
+        assert engine._sl_or_target_hit(pos, current_premium=100.0) is None
+
+
+# ---------------------------------------------------------------------------
+# Single shared daily cap / single-position-slot semantics (regression
+# coverage for the two bugs the backtest itself had before it was fixed)
+# ---------------------------------------------------------------------------
+class TestSharedDailyCapAndSingleSlot:
+    def test_trade_count_is_a_single_shared_counter(self, script_module):
+        """StrategyState carries ONE trade_count, not one per side --
+        confirms the shared-cap design (max 3/day combined CE+PE, since
+        only one position can ever be open at a time)."""
+        state = script_module.StrategyState()
+        assert hasattr(state, "trade_count")
+        assert not hasattr(state, "legs"), (
+            "this strategy must use a single shared position/counter, not "
+            "the per-leg LEG_KEYS dict shape some other scripts in this "
+            "project use"
+        )
+
+    def test_reset_day_clears_armed_state_and_trade_count(self, script_module, engine):
+        engine.store.state.current_day = "2026-08-31"
+        engine.store.state.trade_count = 3
+        engine.store.state.armed_side = "CE"
+        engine.store.state.armed_countdown = 5
+
+        real_today = real_datetime.now(script_module.IST).date().isoformat()
+        engine.store.state.current_day = "2026-08-31"  # force a stale day
+        engine._reset_day_if_needed()
+
+        assert engine.store.state.trade_count == 0
+        assert engine.store.state.armed_side == ""
+        assert engine.store.state.armed_countdown == 0
+        assert engine.store.state.current_day == real_today
