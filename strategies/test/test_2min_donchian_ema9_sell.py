@@ -390,14 +390,17 @@ class TestSlTarget:
 
 
 # ---------------------------------------------------------------------------
-# Single shared daily cap / single-position-slot semantics (regression
-# coverage for the two bugs the backtest itself had before it was fixed)
+# Shared daily cap (confirmed 2026-09-06, cap=6) / single-position-slot
+# semantics (regression coverage for the bugs the backtest itself had before
+# it was fixed, including the 2026-09-06 entry-cutoff-time bug)
 # ---------------------------------------------------------------------------
 class TestSharedDailyCapAndSingleSlot:
     def test_trade_count_is_a_single_shared_counter(self, script_module):
         """StrategyState carries ONE trade_count, not one per side --
-        confirms the shared-cap design (max 3/day combined CE+PE, since
-        only one position can ever be open at a time)."""
+        confirms the shared-cap design (max 6/day combined CE+PE, since
+        only one position can ever be open at a time). Of shared-3/day,
+        per-side-3-each, and shared-6/day, this variant had the best
+        net-of-cost PnL AND a shallower drawdown than per-side (2026-09-06)."""
         state = script_module.StrategyState()
         assert hasattr(state, "trade_count")
         assert not hasattr(state, "legs"), (
@@ -408,7 +411,7 @@ class TestSharedDailyCapAndSingleSlot:
 
     def test_reset_day_clears_armed_state_and_trade_count(self, script_module, engine):
         engine.store.state.current_day = "2026-08-31"
-        engine.store.state.trade_count = 3
+        engine.store.state.trade_count = 5
         engine.store.state.armed_side = "CE"
         engine.store.state.armed_countdown = 5
 
@@ -420,3 +423,53 @@ class TestSharedDailyCapAndSingleSlot:
         assert engine.store.state.armed_side == ""
         assert engine.store.state.armed_countdown == 0
         assert engine.store.state.current_day == real_today
+
+    def test_increment_trade_count_is_shared(self, script_module, engine):
+        engine._increment_trade_count("CE")
+        engine._increment_trade_count("CE")
+        engine._increment_trade_count("PE")
+        assert engine.store.state.trade_count == 3
+
+    def test_confirmation_blocked_when_shared_cap_is_reached(self, script_module):
+        """A confirmation on EITHER side must be skipped once the SHARED
+        trade_count reaches max_trades_per_day (6) -- confirms the cap is
+        a combined pool, not tracked independently per side."""
+        day = "2026-09-01"
+        rows = _filler_bars(day, (9, 15), WARMUP_N)
+        n = WARMUP_N
+        rows.append((_ts_at(day, (9, 15), n), 99.5, 150.0, 99.5, 99.5))  # CE trigger
+        rows.append((_ts_at(day, (9, 15), n + 1), 99.5, 100.0, 49.0, 50.0))  # CE confirms
+        rows.append((_ts_at(day, (9, 15), n + 2), 50.0, 51.0, 49.0, 50.0))  # still-forming, dropped
+        bars = _make_bars(rows)
+
+        state = script_module.StrategyState()
+        state.trade_count = script_module.config.max_trades_per_day  # already at cap
+        sig = script_module.compute_donchian_signal(bars, state, ltp=50.0)
+
+        assert sig is not None
+        assert sig.pending_entry_side == "", "confirmation must be skipped once the shared daily cap is reached"
+
+    def test_confirmation_blocked_at_or_after_entry_cutoff(self, script_module):
+        """2026-09-06 fix: a confirmation at/after config.entry_end must
+        never dispatch an entry -- this is what let 427/3505 backtest
+        trades fire past the 15:15 universal exit time before the fix."""
+        day = "2026-09-01"
+        entry_end = script_module.config.entry_end
+        # Build the trigger+confirmation pair landing exactly AT entry_end.
+        cutoff_minutes = entry_end.hour * 60 + entry_end.minute
+        start_minutes = cutoff_minutes - 2 * (WARMUP_N + 1)  # so the confirmation candle (index n+1) lands exactly at entry_end
+        start_hm = (start_minutes // 60, start_minutes % 60)
+        rows = _filler_bars(day, start_hm, WARMUP_N)
+        n = WARMUP_N
+        rows.append((_ts_at(day, start_hm, n), 99.5, 150.0, 99.5, 99.5))       # CE trigger
+        rows.append((_ts_at(day, start_hm, n + 1), 99.5, 100.0, 49.0, 50.0))   # CE confirms AT entry_end
+        rows.append((_ts_at(day, start_hm, n + 2), 50.0, 51.0, 49.0, 50.0))    # still-forming, dropped
+        bars = _make_bars(rows)
+        confirm_ts = pd.to_datetime(_ts_at(day, start_hm, n + 1))
+        assert confirm_ts.time() >= entry_end, "test setup must land the confirmation at/after entry_end"
+
+        state = script_module.StrategyState()
+        sig = script_module.compute_donchian_signal(bars, state, ltp=50.0)
+
+        assert sig is not None
+        assert sig.pending_entry_side == "", "a confirmation at/after entry_end must never dispatch an entry"

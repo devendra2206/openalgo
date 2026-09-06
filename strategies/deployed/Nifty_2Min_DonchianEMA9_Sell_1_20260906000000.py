@@ -7,25 +7,40 @@ Platform    : OpenAlgo Hosted Strategy
 OpenAlgo    : >= 2.0.1.5
 Python      : >= 3.11
 Ported from : data23_to_26/backtest_nifty_2min_donchian_ema9_sell.py -- full
-              2021-2026 backtest: 3,505 trades, net +Rs10,88,637.75, max
-              drawdown -Rs46,596, 57.2% win rate. Every entry/exit condition
-              below is a literal, unmodified port of that validated
-              backtest's own logic -- nothing here is new or re-derived.
+              2021-2026 backtest (corrected, 2026-09-06, shared cap=6/day):
+              3,318 trades, net +Rs9,84,497.25, max drawdown -Rs48,857.25,
+              56.5% win rate.
+              Every entry/exit condition below is a literal, unmodified port
+              of that validated backtest's own logic -- nothing here is new
+              or re-derived.
 
-              The backtest itself needed two real bug fixes during
-              verification before it was trustworthy (overlapping trades
-              from a missing position-block; a stale-price entry from a
-              missing same-day freshness guard). Both fixes are already
-              baked into the rules below -- see "single position slot" and
-              the fresh-quote requirement on strike selection.
+              The backtest needed THREE real bug fixes during verification
+              before it was trustworthy:
+              1. Overlapping trades from a missing position-block.
+              2. A stale-price entry from a missing same-day freshness guard.
+              3. (2026-09-06) NO entry cutoff at all let a confirmation fire
+                 up to 15:31 -- AFTER the 15:15 universal exit time -- which
+                 then computed an exit_ts EARLIER than its own entry_ts (a
+                 chronologically impossible negative holding period).
+                 Affected 427/3505 trades (12.2%) before the fix. The LIVE
+                 script below was NEVER affected by bug #3: run_cycle's own
+                 past_universal_exit branch returns before the entry-signal
+                 path is ever reached once past 15:15, so no new entry could
+                 structurally fire there -- but it had no explicit cutoff
+                 BEFORE 15:15 either, so entry_end below is now pinned to
+                 match the corrected backtest exactly (14:45), not left at
+                 an unconfirmed guess.
+              All three fixes are baked into the rules below.
 
 Description
 -----------
 Pure INTRADAY naked option-SELLING strategy on NIFTY. Unlike this project's
 other option-selling scripts, this one has only ONE position slot total (not
 one per side) -- at most one of {CE, PE} can be open at any time, and no new
-signal is even evaluated while a position is open. Max 3 trades/day, SHARED
-across both sides.
+signal is even evaluated while a position is open. Max 6 trades/day, SHARED
+across CE and PE combined (confirmed 2026-09-06 -- of shared-3/day,
+per-side-3-each, and shared-6/day, this variant had the highest net-of-cost
+PnL AND a shallower max drawdown than the per-side alternative).
 
 *** THIS STRATEGY SELLS NAKED (UNHEDGED) OPTIONS -- UNDEFINED RISK ***
 No hedge leg -- protected only by the premium-based SL/target below plus the
@@ -90,12 +105,15 @@ Nifty_5Min_SupertrendEMA_PivotSell_1_20260829000000.py.
 
 Shared rules
 --------------------------------
-  - Entry window: 09:17:00 - 15:00:00 IST (09:17 skips the literal first
+  - Entry window: 09:17:00 - 14:45:00 IST (09:17 skips the literal first
     2-min candle 09:15-09:17 as a valid TRIGGER candle, matching "never use
-    the first candle of the day").
+    the first candle of the day"; 14:45 is the confirmed entry cutoff --
+    see bug #3 above -- no NEW entry confirmation is accepted at/after this
+    time, though an already-armed setup can still expire/cancel normally).
   - Universal exit: >= 15:15 -- force-close the open position unconditionally.
-  - Max 3 trades/day, SHARED across CE and PE (a single counter, not one per
-    side -- this strategy can only ever hold one position anyway).
+  - Max 6 trades/day, SHARED across CE and PE (confirmed 2026-09-06 -- a
+    single counter, not one per side; beat both shared-3/day and
+    per-side-3-each on net-of-cost PnL and drawdown in the sweep).
   - Quantity: 1 lot (config.lot_multiplier). Product: MIS.
 
 Live-specific machinery (ported from this project's other live scripts, not
@@ -219,7 +237,7 @@ class Config:
     confirmation_max_candles: int = 20
 
     lot_multiplier: int = 1           # number of lots
-    max_trades_per_day: int = 3       # SHARED across CE+PE -- single position slot anyway
+    max_trades_per_day: int = 6       # SHARED across CE+PE (confirmed 2026-09-06 -- see module docstring)
 
     min_premium: float = 100.0
     max_itm_steps: int = 10           # bounded to fit inside one optionchain() response
@@ -232,7 +250,7 @@ class Config:
     price_type: str = "MARKET"
 
     entry_start: time = time(9, 17)   # skips the literal first 2-min candle (09:15-09:17) as a trigger
-    entry_end: time = time(15, 0)
+    entry_end: time = time(14, 45)    # confirmed 2026-09-06 -- matches the corrected backtest's ENTRY_END_TIME
     universal_exit_time: time = time(15, 15)   # force-close unconditionally at/after this
     market_close: time = time(15, 30)
 
@@ -328,7 +346,7 @@ class LegPosition:
 @dataclass
 class StrategyState:
     current_day: str = ""
-    trade_count: int = 0
+    trade_count: int = 0   # SHARED across CE+PE (confirmed 2026-09-06)
     position: LegPosition = field(default_factory=LegPosition)
     # Armed-state machine, persisted across restarts so a mid-window arm
     # survives a process bounce.
@@ -887,7 +905,17 @@ def compute_donchian_signal(intraday: pd.DataFrame, state: StrategyState, ltp: O
             confirmed_side = "PE"
 
         if confirmed_side:
-            if is_latest:
+            candle_time = intraday.index[i].time()
+            if candle_time >= config.entry_end:
+                # 2026-09-06 fix: without this, a confirmation could fire
+                # AFTER the universal exit time -- see module docstring's
+                # bug #3 (427/3505 backtest trades affected before the fix).
+                Log.info(f"[NIFTY] {confirmed_side} confirmation at/after entry cutoff "
+                         f"({config.entry_end}) -- skipping, not dispatching an entry.")
+            elif state.trade_count >= config.max_trades_per_day:
+                Log.info(f"[NIFTY] {confirmed_side} confirmation but the SHARED daily trade cap "
+                         f"({config.max_trades_per_day}) is already reached -- skipping.")
+            elif is_latest:
                 pending_entry_side = confirmed_side
             else:
                 Log.warning(
@@ -1439,6 +1467,14 @@ class StrategyEngine:
             self._chain_cache = None
             self._save_state()
 
+    def _increment_trade_count(self, option_type: str = ""):
+        """SHARED counter increment (confirmed 2026-09-06) -- only on a
+        CONFIRMED entry fill, never on mere placement, so a rejected/retried
+        entry doesn't consume a cap slot (same rule as every donor script).
+        `option_type` is accepted (unused) purely so every call site's
+        shape stays identical regardless of which cap design is active."""
+        self.store.state.trade_count += 1
+
     def _within_entry_window(self) -> bool:
         if config.test_mode:
             return True
@@ -1567,7 +1603,7 @@ class StrategyEngine:
                 fill_price = fill.get("average_price") or fill.get("price")
                 if fill_price:
                     pos.entry_px = float(fill_price)
-                self.store.state.trade_count += 1
+                self._increment_trade_count(pos.option_type)
                 self._save_state()
                 Log.info(f"[{LEG_KEY}] Entry filled: {symbol}@{pos.entry_px}")
         except OrderNeedsAttention as exc:
@@ -1779,7 +1815,7 @@ class StrategyEngine:
             else:
                 pos.entry_filled = True
                 pos.entry_px = fill_price
-                self.store.state.trade_count += 1
+                self._increment_trade_count(pos.option_type)
             pos.error_state = ""
             pos.error_kind = ""
             pos.error_order_id = ""
@@ -1862,7 +1898,7 @@ class StrategyEngine:
                 return
             if result is not None:
                 pos.entry_filled = True
-                self.store.state.trade_count += 1
+                self._increment_trade_count(pos.option_type)
                 pos.error_state = ""
                 pos.error_kind = ""
                 pos.error_order_id = ""
@@ -2015,8 +2051,10 @@ class StrategyEngine:
 
             if not pos.symbol:
                 # FLAT: signal drives entry. Chain is only refreshed when we
-                # could actually still enter this cycle (trade cap + entry
-                # window not exhausted) -- efficient-API-calls requirement.
+                # could actually still enter this cycle (SHARED trade cap +
+                # entry window not exhausted) -- efficient-API-calls
+                # requirement. The entry-cutoff TIME is additionally enforced
+                # inside compute_donchian_signal itself (bug #3 fix).
                 still_enterable = within_entry and self.store.state.trade_count < config.max_trades_per_day
                 signal = self.get_signal(ltp=inst_ltp, refresh_chain=still_enterable)
                 if signal is None or not still_enterable:
