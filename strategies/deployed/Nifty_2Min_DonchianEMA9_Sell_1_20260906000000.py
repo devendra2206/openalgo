@@ -123,12 +123,16 @@ machinery, nothing here is strategy-specific)
 ------------------------------------------------------------------------
   - Live price feed: WebSocket (`PriceStream`) for NIFTY spot, background
     watchdog reconnect/resubscribe.
-  - Candle/indicator state: re-fetched via `client.history(interval="2m")` on
-    each candle-boundary-triggered refresh (NOT a tick-driven in-memory
-    bucket). EFFICIENT-API-CALLS requirement (explicit ask): this fetch only
-    happens when `_current_candle_boundary(2)` has genuinely advanced past
-    the cached signal's own candle_key -- never on a plain timer, never
-    redundantly within the same still-open candle.
+  - Candle/indicator state: re-fetched via `client.history(interval="1m")`
+    (NOT "2m" -- confirmed live 2026-09-07 that "2m" is not a broker-supported
+    interval; 1m bars are bucketed into 2-min bars locally via
+    `resample_to_bars()`, anchored to 09:15) on each candle-boundary-triggered
+    refresh (NOT a tick-driven in-memory bucket). EFFICIENT-API-CALLS
+    requirement (explicit ask): this fetch only happens when
+    `_current_candle_boundary(2)` has genuinely advanced past the cached
+    signal's own candle_key (itself anchored to 09:15, matching
+    resample_to_bars' anchor -- see that function's fix note) -- never on a
+    plain timer, never redundantly within the same still-open candle.
   - `client.optionchain()` is called ONLY from inside `_enter_position`'s
     strike resolution -- never speculatively, never per-cycle. One call
     (`strike_count=15`) covers ATM lookup AND the up-to-10-step ITM
@@ -229,7 +233,9 @@ class Config:
     strategy_name: str = "NIFTY 2-Min Donchian(10)/EMA(9) Intraday Seller"
     version: str = "1.0.0"
 
-    intraday_interval: str = "2m"     # standard, documented OpenAlgo interval
+    intraday_interval: str = "2m"      # logical bucket size -- for LOGGING only, see candle_interval_fetch
+    candle_interval_fetch: str = "1m"  # "2m" is NOT a supported broker interval (confirmed 2026-09-07) --
+                                        # fetch 1m and bucket into 2-min bars locally, see resample_to_bars()
     history_lookback_days: int = 3    # 2m bars: a few days easily covers Donchian(10)/EMA(9) warmup + 20-candle window
     bar_minutes: int = 2
     donchian_period: int = 10
@@ -400,12 +406,28 @@ def _current_ws_stale_threshold() -> float:
 
 
 def _current_candle_boundary(interval_minutes: int) -> datetime:
-    """Start-of-bucket timestamp for the current wall-clock candle -- see
-    Nifty_5Min_SupertrendEMA_PivotSell's own docstring for the full
-    rationale."""
+    """Start-of-bucket timestamp for the current wall-clock candle.
+
+    2026-09-07 fix: MUST anchor to the 09:15 session open, matching
+    resample_to_bars()'s own anchor (`session_start = idx[0].normalize() +
+    Timedelta(hours=9, minutes=15)`) -- NOT midnight. 09:15 is minute 555 of
+    the day (odd), so every real 2-min bucket start (555, 557, 559, ...) is
+    an ODD minute; a midnight-anchored `(total_minutes // interval) *
+    interval` is always EVEN for interval=2, so it could never equal a real
+    bucket's start. This is the exact bug already found and fixed live in
+    Nifty_Sensex_VWAP_NoHA_Intraday_1 (2026-08-13): due_signal evaluated
+    True on essentially every scheduler tick instead of once per real
+    2-minute candle, since cached_boundary (from a real, odd-minute
+    candle_key) could never satisfy `cached_boundary >= current_boundary`
+    against a midnight-anchored value. Confirmed present here too before
+    this fix -- 5-min buckets (the donor this was copied from) don't hit
+    it, since 555 is evenly divisible by 5, but 2-min buckets do."""
     now = datetime.now(IST)
     total_minutes = now.hour * 60 + now.minute
-    bucket_start_minutes = (total_minutes // interval_minutes) * interval_minutes
+    session_open_minutes = 9 * 60 + 15  # 555 -- must match resample_to_bars' 09:15 anchor
+    minutes_since_open = total_minutes - session_open_minutes
+    bucket_offset = (minutes_since_open // interval_minutes) * interval_minutes
+    bucket_start_minutes = session_open_minutes + bucket_offset
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight + timedelta(minutes=bucket_start_minutes)
 
@@ -982,6 +1004,33 @@ def compute_donchian_signal(intraday: pd.DataFrame, state: StrategyState, ltp: O
     )
 
 
+def resample_to_bars(df: pd.DataFrame, bucket_minutes: int) -> pd.DataFrame:
+    """Buckets 1m bars into `bucket_minutes`-minute bars anchored at the
+    09:15 session start (matching _current_candle_boundary's own anchor).
+
+    2026-09-07 fix: "2m" is NOT a standard OpenAlgo interval -- confirmed
+    live, client.history(interval="2m") returns HTTP 500 ("Unsupported
+    interval '2m'. Supported intervals are: 1m, 3m, 5m, 10m, 15m, 30m, 1h,
+    2h, 4h, D"). Every history fetch was failing before this fix, so the
+    strategy could never get a signal at all. The fix fetches the
+    broker-supported "1m" interval and buckets it into 2-min bars locally
+    instead -- mirrors Nifty_Sensex_VWAP_NoHA_Intraday_1's own
+    resample_to_bars() (that script hit this exact same "2m unsupported"
+    problem first and already solved it this way).
+
+    Does NOT drop the still-forming last bucket -- compute_donchian_signal
+    already does that itself; dropping it here too would silently discard
+    one extra real candle every refresh."""
+    if df is None or df.empty:
+        return df
+    idx = pd.to_datetime(df.index)
+    session_start = idx[0].normalize() + pd.Timedelta(hours=9, minutes=15)
+    cols = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    return df.set_index(idx).resample(
+        f"{bucket_minutes}min", label="left", closed="left", origin=session_start
+    ).agg(cols).dropna()
+
+
 def fetch_chain(client, inst: InstrumentConfig, expiry: str):
     """strike_count=15 (confirmed) -- comfortably under Shoonya's 20-symbol
     batching boundary (avoids the 1s inter-batch rate-limit delay) while
@@ -1381,17 +1430,18 @@ class StrategyEngine:
         fresh = None
         try:
             end = datetime.now(IST).date()
-            intraday = self.client.history(
+            raw = self.client.history(
                 symbol=INSTRUMENT.name, exchange=INSTRUMENT.underlying_exchange,
-                interval=config.intraday_interval,
+                interval=config.candle_interval_fetch,
                 start_date=(end - timedelta(days=config.history_lookback_days)).isoformat(),
                 end_date=end.isoformat(),
             )
-            if _is_error_response(intraday):
-                Log.warning(f"[NIFTY] {config.intraday_interval} history error response: {intraday}")
-            elif intraday is None or intraday.empty:
-                Log.warning(f"[NIFTY] empty {config.intraday_interval} history.")
+            if _is_error_response(raw):
+                Log.warning(f"[NIFTY] {config.candle_interval_fetch} history error response: {raw}")
+            elif raw is None or raw.empty:
+                Log.warning(f"[NIFTY] empty {config.candle_interval_fetch} history.")
             else:
+                intraday = resample_to_bars(raw, config.bar_minutes)
                 fresh = compute_donchian_signal(intraday, self.store.state, ltp)
                 if fresh is not None:
                     self._signal_cache = fresh

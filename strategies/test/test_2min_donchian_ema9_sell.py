@@ -473,3 +473,78 @@ class TestSharedDailyCapAndSingleSlot:
 
         assert sig is not None
         assert sig.pending_entry_side == "", "a confirmation at/after entry_end must never dispatch an entry"
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-07 fixes: "2m" is not a broker-supported interval (confirmed live --
+# client.history(interval="2m") returned HTTP 500), and the candle-boundary
+# helper was anchored to midnight instead of the 09:15 session open (a bug
+# already found and fixed live in Nifty_Sensex_VWAP_NoHA_Intraday_1 for the
+# exact same reason: 09:15 = minute 555, an ODD number, so a midnight-anchored
+# `(total_minutes // 2) * 2` can never land on a real 2-min bucket's start).
+# ---------------------------------------------------------------------------
+class TestOneMinuteFetchAndBoundaryAnchor:
+    def test_resample_to_bars_buckets_1m_into_2min_anchored_at_0915(self, script_module):
+        # 6 one-minute bars starting at 09:15 -> should collapse into 3
+        # two-minute buckets: [09:15-09:17), [09:17-09:19), [09:19-09:21).
+        rows = [
+            ("2026-09-01 09:15:00", 100.0, 101.0, 99.0, 100.5),
+            ("2026-09-01 09:16:00", 100.5, 102.0, 100.0, 101.0),
+            ("2026-09-01 09:17:00", 101.0, 103.0, 100.5, 102.0),
+            ("2026-09-01 09:18:00", 102.0, 104.0, 101.5, 103.0),
+            ("2026-09-01 09:19:00", 103.0, 105.0, 102.5, 104.0),
+            ("2026-09-01 09:20:00", 104.0, 106.0, 103.5, 105.0),
+        ]
+        df = _make_bars(rows)
+        bars = script_module.resample_to_bars(df, 2)
+
+        assert list(bars.index.strftime("%H:%M")) == ["09:15", "09:17", "09:19"]
+        # First bucket (09:15-09:17): open=first(100.0), high=max(102.0), low=min(99.0), close=last(101.0)
+        first = bars.iloc[0]
+        assert first["open"] == 100.0
+        assert first["high"] == 102.0
+        assert first["low"] == 99.0
+        assert first["close"] == 101.0
+
+    def test_resample_to_bars_does_not_drop_the_last_bucket(self, script_module):
+        """resample_to_bars() itself must NOT drop the still-forming last
+        bucket -- compute_donchian_signal already does that (single source
+        of truth); dropping it in both places would silently discard one
+        extra real candle every refresh."""
+        rows = [
+            ("2026-09-01 09:15:00", 100.0, 101.0, 99.0, 100.5),
+            ("2026-09-01 09:16:00", 100.5, 102.0, 100.0, 101.0),
+        ]
+        df = _make_bars(rows)
+        bars = script_module.resample_to_bars(df, 2)
+        assert len(bars) == 1  # the single (still-forming) 09:15 bucket, NOT dropped here
+
+    def test_candle_boundary_anchors_to_0915_not_midnight(self, script_module, monkeypatch):
+        """A midnight-anchored boundary can only ever land on EVEN minutes
+        for a 2-min bucket; 09:15 is an ODD minute (555), so every genuine
+        bucket start (09:15, 09:17, 09:19, ...) is odd too -- confirming
+        the fixed helper returns odd-minute boundaries proves it's anchored
+        to 09:15, not midnight."""
+        import datetime as real_datetime_module
+
+        class _FrozenDatetime(real_datetime_module.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real_datetime_module.datetime(2026, 9, 7, 9, 18, 42, tzinfo=tz)
+
+        monkeypatch.setattr(script_module, "datetime", _FrozenDatetime)
+        boundary = script_module._current_candle_boundary(2)
+        assert boundary.hour == 9
+        assert boundary.minute == 17, "09:18:42 falls in the [09:17,09:19) bucket, which starts at :17"
+
+    def test_candle_boundary_matches_resample_to_bars_bucket_starts(self, script_module):
+        """The boundary helper and resample_to_bars() must agree on where
+        buckets start -- generate a day of 1m bars, resample them, and
+        confirm every resulting bucket's own start timestamp is achievable
+        by _current_candle_boundary (i.e. lands on an odd minute >= 555)."""
+        rows = [(_ts_at("2026-09-01", (9, 15), i), 100.0, 101.0, 99.0, 100.0) for i in range(0, 20, 1)]
+        df = _make_bars(rows)
+        bars = script_module.resample_to_bars(df, 2)
+        for ts in bars.index:
+            total_minutes = ts.hour * 60 + ts.minute
+            assert (total_minutes - 555) % 2 == 0, f"bucket start {ts} is not 09:15-anchored on an even offset"
