@@ -584,3 +584,60 @@ class TestOneMinuteFetchAndBoundaryAnchor:
         bars2 = _aware_bars(rows2)
         sig2 = script_module.compute_donchian_signal(bars2, state, ltp=99.5)
         assert sig2 is not None  # must not raise TypeError
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-08 fix (confirmed with user): an armed-but-unconfirmed setup must
+# NOT carry across a day boundary, INCLUDING inside a multi-day catch-up
+# replay batch (the scenario that actually happened live: the engine's
+# once-a-cycle _reset_day_if_needed() already cleared armed state at day
+# start, but the subsequent catch-up replay of a prior day's stale candles
+# re-armed it before today's own candles were ever reached).
+# ---------------------------------------------------------------------------
+class TestArmedStateDoesNotCarryAcrossDayBoundary:
+    def test_armed_state_from_a_prior_day_clears_when_the_next_days_first_candle_is_replayed(self, script_module):
+        day1, day2 = "2026-09-01", "2026-09-02"
+        rows = _filler_bars(day1, (9, 15), WARMUP_N)
+        n = WARMUP_N
+        # CE trigger near the end of day1 -- left UNCONFIRMED (no EMA9 cross
+        # candle follows before day1 ends).
+        rows.append((_ts_at(day1, (9, 15), n), 99.5, 150.0, 99.5, 99.5))
+        # day2's first candle, in the SAME catch-up batch/call -- must clear
+        # the carried armed_side="CE" from day1 before evaluating anything
+        # of its own (and, per the existing first-bar-of-day rule, cannot
+        # itself become a new trigger either).
+        rows.append((_ts_at(day2, (9, 15), 0), 99.5, 100.0, 99.0, 99.5))
+        # Still-forming bar, dropped.
+        rows.append((_ts_at(day2, (9, 15), 1), 99.5, 100.0, 99.0, 99.5))
+        bars = _make_bars(rows)
+
+        state = script_module.StrategyState()
+        script_module.compute_donchian_signal(bars, state, ltp=99.5)
+
+        assert state.armed_side == "", (
+            "armed state from day1's unconfirmed CE trigger must be cleared "
+            "once day2's first candle is reached, not carried into day2"
+        )
+        assert state.armed_countdown == 0
+
+    def test_a_confirmation_landing_on_day2_after_the_carried_arm_is_cleared_does_not_fire(self, script_module):
+        """Belt-and-braces: even if day2's candles would otherwise look like
+        an EMA9-cross confirmation for the CE armed on day1, the day-boundary
+        reset must have already cleared armed_side by the time they're
+        evaluated, so no entry is dispatched."""
+        day1, day2 = "2026-09-01", "2026-09-02"
+        rows = _filler_bars(day1, (9, 15), WARMUP_N)
+        n = WARMUP_N
+        rows.append((_ts_at(day1, (9, 15), n), 99.5, 150.0, 99.5, 99.5))  # CE trigger, unconfirmed
+        # day2 candle 0 (first of day, never a trigger) -- close well below
+        # ema9, i.e. exactly what WOULD confirm CE if armed_side had
+        # survived the day boundary.
+        rows.append((_ts_at(day2, (9, 15), 0), 99.5, 100.0, 49.0, 50.0))
+        rows.append((_ts_at(day2, (9, 15), 1), 50.0, 51.0, 49.0, 50.0))  # still-forming, dropped
+        bars = _make_bars(rows)
+
+        state = script_module.StrategyState()
+        sig = script_module.compute_donchian_signal(bars, state, ltp=50.0)
+
+        assert sig is not None
+        assert sig.pending_entry_side == "", "a carried-over arm must not confirm on the next day's candles"

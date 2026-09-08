@@ -7,9 +7,9 @@ Platform    : OpenAlgo Hosted Strategy
 OpenAlgo    : >= 2.0.1.5
 Python      : >= 3.11
 Ported from : data23_to_26/backtest_nifty_2min_donchian_ema9_sell.py -- full
-              2021-2026 backtest (corrected, 2026-09-06, shared cap=6/day):
-              3,318 trades, net +Rs9,84,497.25, max drawdown -Rs48,857.25,
-              56.5% win rate.
+              2021-2026 backtest (corrected, 2026-09-08, shared cap=6/day,
+              armed state resets at day boundary): 3,191 trades, net
+              +Rs9,92,508.75, max drawdown -Rs44,677.25, 56.8% win rate.
               Every entry/exit condition below is a literal, unmodified port
               of that validated backtest's own logic -- nothing here is new
               or re-derived.
@@ -82,6 +82,17 @@ Trigger validity / state machine (verbatim from the backtest):
     side and arms the new one instead.
   - The FIRST candle of the trading day is never a valid TRIGGER (the
     indicators themselves are still computed continuously, no reset).
+  - An ARMED (unconfirmed) setup does NOT carry across a day boundary
+    (confirmed 2026-09-08): if a candle's date differs from the previous
+    candle's, any pending armed_side is cleared before that candle's own
+    trigger/confirm logic runs. Indicators (Donchian/EMA9) stay CONTINUOUS
+    across days -- only the ARMED state resets. This applies even inside a
+    multi-candle catch-up replay after a restart/outage, not just once at
+    the top of a new day -- see compute_donchian_signal's own fix note.
+    Backtest impact of this change: 3,318 -> 3,191 trades, but HIGHER win
+    rate (56.5% -> 56.8%), HIGHER total PnL (Rs9,84,497 -> Rs9,92,509), and
+    a SHALLOWER max drawdown (-Rs48,857 -> -Rs44,677) -- a clean win on
+    every metric, not a tradeoff.
   - No arming/confirmation is evaluated AT ALL while a position is open --
     this alone satisfies "no overlapping trades" / "opposite-side only
     after close" (this is also the fix for the overlapping-trade bug the
@@ -933,6 +944,28 @@ def compute_donchian_signal(intraday: pd.DataFrame, state: StrategyState, ltp: O
 
     pending_entry_side = ""
     for i in new_bar_idxs:
+        if i > 0 and intraday.index[i].date() != intraday.index[i - 1].date():
+            # 2026-09-08 confirmed with user: an armed-but-unconfirmed setup
+            # must NOT carry across a day boundary -- indicators (Donchian/
+            # EMA9) stay CONTINUOUS (unchanged), only the ARMED state
+            # resets. This check must live HERE, inside the per-candle
+            # replay loop, not just in the engine's once-a-cycle
+            # _reset_day_if_needed() -- a multi-day catch-up batch (e.g.
+            # after an outage) replays PRIOR days' candles through this
+            # same loop, and without this check their trigger/confirm
+            # events would re-arm state.armed_side from stale, previous-day
+            # price action, silently undoing the fresh reset that already
+            # ran before this replay started (confirmed live 2026-09-08:
+            # exactly this sequence left the strategy armed=CE at today's
+            # open from a trigger on 2026-09-07's candles).
+            if state.armed_side:
+                Log.info(f"[NIFTY] Day boundary crossed ({intraday.index[i-1].date()} -> "
+                         f"{intraday.index[i].date()}) -- clearing carried-over armed state "
+                         f"({state.armed_side}).")
+            state.armed_side = ""
+            state.armed_countdown = 0
+            state.armed_since_candle_key = ""
+
         up, low_band, ema_val = donch_upper_arr[i], donch_lower_arr[i], ema_arr[i]
         close_px, high_px, low_px = float(closes[i]), float(highs[i]), float(lows[i])
         is_latest = (i == n - 1)
