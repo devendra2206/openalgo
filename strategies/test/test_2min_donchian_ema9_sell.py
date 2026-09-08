@@ -548,3 +548,39 @@ class TestOneMinuteFetchAndBoundaryAnchor:
         for ts in bars.index:
             total_minutes = ts.hour * 60 + ts.minute
             assert (total_minutes - 555) % 2 == 0, f"bucket start {ts} is not 09:15-anchored on an even offset"
+
+    def test_compute_donchian_signal_handles_tz_aware_broker_timestamps(self, script_module):
+        """2026-09-08 fix: confirmed live -- `TypeError: can't compare
+        offset-naive and offset-aware datetimes`. client.history() returns
+        tz-AWARE (+05:30) timestamps in production; this test builds bars
+        with that same tz-aware index (unlike every other test in this file,
+        which uses naive fixtures and so never exercised the mismatch) and
+        confirms a second call -- simulating the next scheduler cycle,
+        with state.last_processed_candle_key already set from the first
+        call -- does not raise."""
+        import pytz
+        ist = pytz.timezone("Asia/Kolkata")
+
+        def _aware_bars(rows):
+            idx = pd.to_datetime([r[0] for r in rows]).tz_localize(ist)
+            return pd.DataFrame(
+                {"open": [r[1] for r in rows], "high": [r[2] for r in rows],
+                 "low": [r[3] for r in rows], "close": [r[4] for r in rows]},
+                index=idx,
+            )
+
+        rows = _filler_bars("2026-09-01", (9, 15), WARMUP_N + 3)
+        bars = _aware_bars(rows)
+
+        state = script_module.StrategyState()
+        sig1 = script_module.compute_donchian_signal(bars, state, ltp=99.5)
+        assert sig1 is not None
+        assert state.last_processed_candle_key  # confirms candle_key round-trips through the aware index
+
+        # Second call, one more closed candle appended -- this is exactly
+        # where the bug fired live: comparing the new tz-aware bar against
+        # the now-set (tz-aware, parsed back from candle_key) last_processed_boundary.
+        rows2 = rows + [(_ts_at("2026-09-01", (9, 15), WARMUP_N + 3), 99.5, 100.0, 99.3, 99.5)]
+        bars2 = _aware_bars(rows2)
+        sig2 = script_module.compute_donchian_signal(bars2, state, ltp=99.5)
+        assert sig2 is not None  # must not raise TypeError

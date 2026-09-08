@@ -439,6 +439,16 @@ def _candle_key_boundary(candle_key: str) -> Optional[datetime]:
         return None
 
 
+def _strip_tz(dt: datetime) -> datetime:
+    """Normalizes to a naive datetime regardless of whether `dt` came in
+    tz-aware or tz-naive -- see compute_donchian_signal's own fix note
+    (2026-09-08): client.history() returns tz-aware (+05:30) timestamps in
+    production, which unit-test fixtures (built from naive pd.to_datetime())
+    never exercised, so an asymmetric aware-vs-naive comparison only
+    surfaced live."""
+    return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+
 ###############################################################################
 # BROKER
 ###############################################################################
@@ -896,9 +906,18 @@ def compute_donchian_signal(intraday: pd.DataFrame, state: StrategyState, ltp: O
     last_processed_boundary = _candle_key_boundary(last_processed_key) if last_processed_key else None
 
     n = len(intraday)
+    # 2026-09-08 fix: confirmed live -- `TypeError: can't compare
+    # offset-naive and offset-aware datetimes`. intraday.index[i] came back
+    # from client.history() as tz-AWARE (+05:30), while ONLY the left side
+    # was being stripped to naive via .replace(tzinfo=None) -- an
+    # asymmetric strip that never surfaced in unit tests (whose fixtures
+    # build naive timestamps on both sides). Normalize BOTH sides to naive
+    # before comparing so this holds regardless of which convention
+    # client.history() happens to use.
     new_bar_idxs = [
         i for i in range(n)
-        if last_processed_boundary is None or intraday.index[i].to_pydatetime().replace(tzinfo=None) > last_processed_boundary
+        if last_processed_boundary is None
+        or _strip_tz(intraday.index[i].to_pydatetime()) > _strip_tz(last_processed_boundary)
     ]
     if not new_bar_idxs:
         # No genuinely new closed candle since last time -- return the
