@@ -910,8 +910,19 @@ def compute_donchian_signal(intraday: pd.DataFrame, state: StrategyState, ltp: O
     donch_upper_arr = np.asarray(donch_upper_arr)
     donch_lower_arr = np.asarray(donch_lower_arr)
 
-    day_of_bar = np.array([ts.date() for ts in intraday.index])
-    is_first_bar_of_day = np.concatenate(([True], day_of_bar[1:] != day_of_bar[:-1]))
+    # 2026-09-09 fix: confirmed live -- the "never a trigger" exemption
+    # must protect the SESSION-OPEN candle specifically (its own timestamp
+    # == 09:15, matching resample_to_bars'/_current_candle_boundary's own
+    # anchor), NOT "whichever row happens to be first for that calendar
+    # date". A stray pre-open broker tick (confirmed live: real 1-min
+    # prints at 09:13/09:14, before NSE's 09:15 open -- practically absent
+    # from the historical backtest dataset, 1 row in ~1.5M) becomes its own
+    # earlier same-day row, so a date-groupby "first row" check silently
+    # hands the exemption to THAT spurious bar instead of the real 09:15
+    # candle -- exactly what happened: a PE trigger fired on the actual
+    # 09:15 opening candle and a live trade was placed from it, the one
+    # candle this rule exists specifically to exclude.
+    is_first_bar_of_day = np.array([ts.time() == time(9, 15) for ts in intraday.index])
 
     last_processed_key = state.last_processed_candle_key
     last_processed_boundary = _candle_key_boundary(last_processed_key) if last_processed_key else None

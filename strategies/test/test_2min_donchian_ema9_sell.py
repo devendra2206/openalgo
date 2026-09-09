@@ -641,3 +641,54 @@ class TestArmedStateDoesNotCarryAcrossDayBoundary:
 
         assert sig is not None
         assert sig.pending_entry_side == "", "a carried-over arm must not confirm on the next day's candles"
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-09 fix: a stray pre-open broker tick (real 1-min prints at
+# 09:13/09:14, before NSE's 09:15 open -- confirmed live, essentially absent
+# from the historical backtest dataset) must not steal the "first candle of
+# the day is never a trigger" exemption from the REAL 09:15 session-open
+# candle. Before this fix, a date-groupby "first row" check handed the
+# exemption to the spurious early bar instead, letting 09:15 itself trigger
+# -- exactly what happened live, producing a real trade.
+# ---------------------------------------------------------------------------
+class TestSessionOpenExemptionSurvivesAPreOpenTick:
+    def test_a_stray_pre_open_bar_does_not_steal_the_0915_exemption(self, script_module):
+        day = "2026-09-01"
+        # Prior day's warmup, ending normally.
+        rows = _filler_bars("2026-08-31", (9, 15), WARMUP_N)
+        # A stray pre-open tick at 09:13 on the NEW day, before the real
+        # 09:15 session open -- confirmed live (2026-09-09), the broker can
+        # emit one. Deliberately harmless range so it can't itself trigger.
+        rows.append((_ts_at(day, (9, 13), 0), 99.5, 100.0, 99.3, 99.5))
+        # The REAL 09:15 session-open candle -- High breaches the Donchian
+        # band, exactly like the live incident. This must NOT arm anything.
+        rows.append((_ts_at(day, (9, 15), 0), 99.5, 150.0, 99.5, 99.5))
+        # A later same-day candle, still-forming, dropped.
+        rows.append((_ts_at(day, (9, 15), 1), 99.5, 100.0, 99.0, 99.5))
+        bars = _make_bars(rows)
+
+        state = script_module.StrategyState()
+        script_module.compute_donchian_signal(bars, state, ltp=99.5)
+
+        assert state.armed_side == "", (
+            "the real 09:15 session-open candle must stay exempt from "
+            "triggering even when a stray pre-open bar precedes it"
+        )
+
+    def test_the_stray_pre_open_bar_itself_is_still_evaluated_normally(self, script_module):
+        """The fix only protects the 09:15 candle specifically -- a stray
+        pre-open bar is NOT itself granted any special exemption (it's
+        just an ordinary candle that happens to sit before 09:15)."""
+        day = "2026-09-01"
+        rows = _filler_bars("2026-08-31", (9, 15), WARMUP_N)
+        # The stray pre-open candle itself spikes -- SHOULD be free to
+        # trigger, since it is not the 09:15 session-open candle.
+        rows.append((_ts_at(day, (9, 13), 0), 99.5, 150.0, 99.5, 99.5))
+        rows.append((_ts_at(day, (9, 15), 0), 99.5, 100.0, 99.3, 99.5))  # still-forming, dropped
+        bars = _make_bars(rows)
+
+        state = script_module.StrategyState()
+        script_module.compute_donchian_signal(bars, state, ltp=99.5)
+
+        assert state.armed_side == "CE", "a pre-open bar is an ordinary candle, not itself exempt"
