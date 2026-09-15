@@ -230,6 +230,19 @@ class Config:
     rsi_bear_threshold: float = 32.0       # RSI < 32 -> sell OTM CE
     history_lookback_days: int = 40        # RSI(14) warm-up without reset artifacts
 
+    # Bounded retry for the hourly RSI candle read: the broker can lag
+    # publishing the just-closed candle by anywhere from a couple of
+    # minutes (normal) to, confirmed live 2026-09-15, well over an hour
+    # (history() kept serving the PRIOR trading day's candles well past
+    # 10:15 on a Tuesday). Retry a few times before giving up -- and unlike
+    # a couple of minutes' lag being tolerable to just wait out, giving up
+    # here means SKIPPING this cycle's decision entirely (see
+    # _rsi_signal_worker), never falling back to whatever stale candle is
+    # available, since that stale candle is exactly what caused a real
+    # RSI-driven trade to fire on four-day-old data that day.
+    rsi_freshness_max_retries: int = 6
+    rsi_freshness_retry_delay_sec: float = 20.0
+
     main_strike_round: int = 500
     premium_target: float = 350.0
     premium_band_low: float = 300.0
@@ -1123,6 +1136,15 @@ def select_hedge_strike(client, expiry_compact: str, side: str, sold_strike: flo
 ###############################################################################
 # RSI SIGNAL -- 1-hour NIFTY spot candles
 ###############################################################################
+class CandleNotYetFresh(Exception):
+    """Raised by _get_rsi_signal when the latest CLOSED candle it can find
+    doesn't reach the caller's require_fresh_by boundary -- i.e. the broker
+    hasn't published the candle that should exist by now. Mirrors the OI
+    Positional sibling script's identical-purpose exception; see
+    _rsi_signal_worker's retry loop for why this one does NOT fall back to
+    stale data on retry exhaustion the way that script's does."""
+
+
 def _current_hourly_candle_boundary() -> datetime:
     """Start-of-bucket timestamp for the current wall-clock 1-hour candle,
     anchored to the SESSION OPEN (09:15 IST), not midnight. See
@@ -1143,7 +1165,7 @@ def _current_hourly_candle_boundary() -> datetime:
     return session_start + buckets * interval
 
 
-def _get_rsi_signal(client) -> tuple[Optional[float], Optional[float], Optional[str]]:
+def _get_rsi_signal(client, require_fresh_by: Optional[datetime] = None) -> tuple[Optional[float], Optional[float], Optional[str]]:
     """Fetch client.history(interval="1h") for NIFTY spot, unconditionally
     drop the still-forming last bar, compute RSI(14) over the closed bars.
     Returns (cur_rsi, prev_rsi, candle_key) -- prev_rsi is the PREVIOUS
@@ -1152,7 +1174,13 @@ def _get_rsi_signal(client) -> tuple[Optional[float], Optional[float], Optional[
     below), read directly off the same freshly-fetched array rather than
     trusting a persisted value across a restart. One call per new candle --
     never re-fetched mid-hour (gated by _new_candle_closed() in the
-    caller)."""
+    caller).
+
+    `require_fresh_by`: raises CandleNotYetFresh if the latest closed bar's
+    own implied END time (bar start + 1h) doesn't reach this boundary --
+    i.e. the broker hasn't published the candle that should exist by now.
+    Caller (_rsi_signal_worker) owns the bounded retry loop. None (the
+    default) skips this check entirely."""
     end = datetime.now(IST).date()
     start = end - timedelta(days=config.history_lookback_days)
     try:
@@ -1170,6 +1198,15 @@ def _get_rsi_signal(client) -> tuple[Optional[float], Optional[float], Optional[
         return None, None, None
     if len(bars) >= 2:
         bars = bars.iloc[:-1]
+    if bars.empty:
+        Log.warning("Only a still-forming candle available for RSI signal -- no closed candle yet.")
+        return None, None, None
+    candle_interval = timedelta(hours=1)
+    if require_fresh_by is not None and bars.index[-1] + candle_interval < require_fresh_by:
+        raise CandleNotYetFresh(
+            f"latest closed candle ends {bars.index[-1] + candle_interval} -- broker hasn't "
+            f"published a candle reaching {require_fresh_by} yet"
+        )
     if len(bars) < config.rsi_period + 2:
         Log.warning(f"Only {len(bars)} closed {config.intraday_interval} bars after dropping the "
                     f"still-forming one (need >= {config.rsi_period + 2} for a stable RSI) -- no signal.")
@@ -2068,7 +2105,46 @@ class StrategyEngine:
     # -------------------------------------------------------------------
     def _rsi_signal_worker(self):
         try:
-            cur_rsi, prev_rsi, candle_key = _get_rsi_signal(self.client)
+            import time as _time_mod
+            trigger_boundary = _current_hourly_candle_boundary()
+            # The freshness requirement is meaningless at the SESSION'S OWN
+            # opening boundary (09:15) -- today's own first candle cannot
+            # possibly close until 10:15, so demanding a closed candle
+            # reaching 09:15 would always fail even on a completely normal
+            # day. Only require freshness from the second boundary of the
+            # day onward (10:15+), where today's own prior-hour candle
+            # genuinely should already exist. This also correctly applies
+            # immediately on a mid-day restart (trigger_boundary would then
+            # already be well past session_start).
+            session_start_today = datetime.now(IST).replace(hour=9, minute=15, second=0, microsecond=0)
+            fresh_gate = trigger_boundary if trigger_boundary > session_start_today else None
+            cur_rsi = prev_rsi = candle_key = None
+            max_attempts = config.rsi_freshness_max_retries
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    cur_rsi, prev_rsi, candle_key = _get_rsi_signal(self.client, require_fresh_by=fresh_gate)
+                    break
+                except CandleNotYetFresh as exc:
+                    if attempt < max_attempts:
+                        Log.info(f"[RSI] latest closed candle not yet published by broker "
+                                  f"(attempt {attempt}/{max_attempts}) -- retrying in "
+                                  f"{config.rsi_freshness_retry_delay_sec:.0f}s: {exc}")
+                        _time_mod.sleep(config.rsi_freshness_retry_delay_sec)
+                    else:
+                        # Exhausted retries -- UNLIKE the OI Positional
+                        # script's equivalent pattern, do NOT fall back to
+                        # whatever's available on the final attempt. That
+                        # fallback is fine for a few-minutes broker publish
+                        # lag, but confirmed live 2026-09-15 this can
+                        # instead be a genuine hours-long staleness (the
+                        # broker served Friday's candles well past 10:15 on
+                        # a Tuesday) -- acting on that is exactly the bug
+                        # this guards against. Skip this cycle entirely;
+                        # the next hourly boundary retries fresh from zero.
+                        Log.warning(f"[RSI] latest closed candle still not fresh after {max_attempts} "
+                                    f"attempts ({exc}) -- broker history() appears to be genuinely stale, "
+                                    f"not just a brief publish lag. Skipping this signal, will retry next "
+                                    f"hourly boundary.")
             if cur_rsi is not None:
                 self.state.last_rsi_prev = cur_rsi
                 self.state.last_candle_key = candle_key or ""
