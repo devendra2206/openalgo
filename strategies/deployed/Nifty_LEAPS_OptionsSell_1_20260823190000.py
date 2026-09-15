@@ -234,14 +234,16 @@ class Config:
     # publishing the just-closed candle by anywhere from a couple of
     # minutes (normal) to, confirmed live 2026-09-15, well over an hour
     # (history() kept serving the PRIOR trading day's candles well past
-    # 10:15 on a Tuesday). Retry a few times before giving up -- and unlike
-    # a couple of minutes' lag being tolerable to just wait out, giving up
-    # here means SKIPPING this cycle's decision entirely (see
+    # 10:15 on a Tuesday, and again well past 12:15 the same day). Retry
+    # for up to 15 minutes past the hourly mark (6 attempts, 3 minutes
+    # apart: checkpoints at 0/3/6/9/12/15 min) before giving up -- and
+    # unlike a couple of minutes' lag being tolerable to just wait out,
+    # giving up here means SKIPPING this cycle's decision entirely (see
     # _rsi_signal_worker), never falling back to whatever stale candle is
     # available, since that stale candle is exactly what caused a real
     # RSI-driven trade to fire on four-day-old data that day.
     rsi_freshness_max_retries: int = 6
-    rsi_freshness_retry_delay_sec: float = 20.0
+    rsi_freshness_retry_delay_sec: float = 180.0
 
     main_strike_round: int = 500
     premium_target: float = 350.0
