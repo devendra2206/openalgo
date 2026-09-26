@@ -111,6 +111,33 @@ git push origin custom-strategies
 ```
 
 **Sync log:**
+- **2026-09-26**: 310 commits from upstream; 212 conflicts, only 27 outside
+  `frontend/dist/`. **Root cause of that unusual volume: `711221cb1`
+  ("chore: merge upstream/main...", 2026-09-03) has only ONE parent** — it
+  was squashed rather than merged, so git had no ancestry link to upstream
+  at that point. The merge-base stayed pinned at `7444559874`, making all
+  316 files that sync brought in look like fork changes and re-conflict
+  against upstream's newer versions. Diagnostic: `git rev-list --parents
+  -n 1 <commit>` — a real merge on this branch shows two parents.
+  **The trick that resolved it:** for a conflicted file, compare our blob
+  against the *previous upstream tip* (`git rev-parse <oldtip>:<file>`). If
+  identical, the file is pure inherited content and upstream's version can
+  be taken safely — that classified 19 of the 27 immediately. For
+  `websocket_proxy/server.py`, re-running the three-way merge with the true
+  content ancestor instead of the broken merge-base
+  (`git merge-file ours <oldtip-version> <main-version>`) produced **zero**
+  conflicts where git had reported six. This commit is a proper two-parent
+  merge, so content merged from here on has correct ancestry.
+- **NOTE (2026-09-26): this document is out of date in places.** It
+  describes `websocket_proxy/server.py` as "+15 / -3 lines"; the fork's
+  actual delta there is **632 added / 201 removed** (staleness-bypass
+  constants, never-ticked fast bypass, mode-switch escalation,
+  ADAPTER-LOCK). 21 of the 27 real conflicts were in files this document
+  does not mention at all — including `broker/kotak/*`, `broker/upstox/*`,
+  `frontend/src/lib/trading/*` and several `test/` files (those turned out
+  to be inherited, not customized, but the doc could not tell us that).
+  Treat the per-file line counts here as indicative, not authoritative, and
+  verify against git before relying on them.
 - **2026-09-03**: 87 commits pulled from upstream, including issue #1737's
   fix for the exact `PROCESS_LOCK`/strategies-list-view hang this fork had
   independently diagnosed and partially patched the same day (`bcc8907aa`) —
