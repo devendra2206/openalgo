@@ -853,6 +853,36 @@ describe('collapseToUnderlyings', () => {
       collapseToUnderlyings([{ symbol: '', name: '', exchange: 'NFO', instrumenttype: '' }], 'X')
     ).toEqual([])
   })
+
+  it('names a cash row by its symbol, not the company behind it', () => {
+    // NSE rows carry the company name in `name`, so collapsing on `name` put
+    // "RELIANCE INDUSTRIES LTD" in the picker and stored it as the underlying.
+    const results = collapseToUnderlyings(
+      [
+        { symbol: 'RELIANCE', name: 'RELIANCE INDUSTRIES LTD', exchange: 'NSE', instrumenttype: 'EQ' },
+        { symbol: 'RELINFRA', name: 'RELIANCE INFRASTRUCTU LTD', exchange: 'NSE', instrumenttype: 'EQ' },
+      ],
+      'RELIANCE'
+    )
+    expect(results.map((result) => result.symbol)).toEqual(['RELIANCE', 'RELINFRA'])
+    expect(results[0].instruments).toBe('EQ')
+  })
+
+  it('names an index row by its symbol, not its description', () => {
+    const results = collapseToUnderlyings(
+      [{ symbol: 'NIFTY', name: 'NIFTY 50', exchange: 'NSE_INDEX', instrumenttype: 'INDEX' }],
+      'NIFTY'
+    )
+    expect(results[0].symbol).toBe('NIFTY')
+  })
+
+  it('still collapses derivative contracts onto their root', () => {
+    const results = collapseToUnderlyings(
+      [{ symbol: 'CRUDEOIL25SEPFUT', name: 'CRUDEOIL', exchange: 'MCX', instrumenttype: 'FUT' }],
+      'CRUDEOIL'
+    )
+    expect(results[0].symbol).toBe('CRUDEOIL')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1383,6 +1413,156 @@ describe('lotSizeFromRows', () => {
       )
     ).toBeNull()
     expect(lotSizeFromRows([], 'NIFTY')).toBeNull()
+  })
+
+  it('matches a cash row on its symbol, where the name is the company', () => {
+    expect(
+      lotSizeFromRows(
+        [
+          {
+            symbol: 'RELIANCE',
+            name: 'RELIANCE INDUSTRIES LTD',
+            exchange: 'NSE',
+            instrumenttype: 'EQ',
+            lotsize: 1,
+          },
+        ],
+        'RELIANCE'
+      )
+    ).toBe(1)
+  })
+})
+
+describe('cash and derivative quantities are not the same number', () => {
+  it('caps a batch cash leg at the share ceiling, not the lot one', () => {
+    expect(maxBatchQuantityFor('cash')).toBe(MAX_CASH_QUANTITY)
+    expect(maxBatchQuantityFor('futures')).toBe(MAX_LOTS)
+    expect(maxBatchQuantityFor('options')).toBe(MAX_LOTS)
+  })
+
+  it('labels a cash count as shares, because a lot size of 1 is what makes it one', () => {
+    expect(batchQuantityLabelFor('cash')).toBe('Quantity (shares)')
+    expect(batchQuantityLabelFor('futures')).toBe('Lots')
+  })
+})
+
+describe('a segment and an exchange have to describe the same instrument', () => {
+  it('refuses cash on a derivative venue, which used to validate and be ignored', () => {
+    expect(segmentSuitsExchange('cash', 'NFO')).toBe(false)
+    expect(segmentSuitsExchange('cash', 'MCX')).toBe(false)
+    expect(segmentSuitsExchange('cash', 'NSE')).toBe(true)
+    expect(segmentSuitsExchange('cash', 'BSE')).toBe(true)
+  })
+
+  it('refuses futures on a cash venue', () => {
+    expect(segmentSuitsExchange('futures', 'NSE')).toBe(false)
+    expect(segmentSuitsExchange('futures', 'NFO')).toBe(true)
+  })
+
+  it('says nothing about a leg with no exchange yet', () => {
+    expect(segmentSuitsExchange('cash', '')).toBe(true)
+    expect(segmentSuitsExchange('cash', null)).toBe(true)
+  })
+})
+
+describe('a tab only offers the segments it trades', () => {
+  it('keeps cash off the commodity tab, where there is no spot', () => {
+    expect(signalSegmentsForTab('mcx')).toEqual(['futures'])
+  })
+
+  it('offers cash on the stocks tab', () => {
+    expect(signalSegmentsForTab('stocks_fno')).toEqual(['cash', 'futures'])
+  })
+})
+
+describe('the product a mixed basket is allowed to carry', () => {
+  const cash: Leg = { id: 1, segment: 'cash' }
+  const option: Leg = { id: 2, segment: 'options' }
+
+  it('offers carry on a mixed basket, because the engine translates per venue', () => {
+    expect(allowedProductsForLegs([cash, option])).toEqual(['MIS', 'NRML'])
+  })
+
+  it('says what each venue is actually sent', () => {
+    expect(productHintForLegs([cash, option], 'NRML')).toBe(
+      'Carried: the derivative legs are sent as NRML and the cash legs as CNC.'
+    )
+    expect(productHintForLegs([cash], 'CNC')).toBe(
+      'Cash equity: CNC takes delivery, MIS is intraday.'
+    )
+    expect(productHintForLegs([option], 'MIS')).toBe(
+      'Intraday on every leg, squared off the same day.'
+    )
+  })
+
+  it('still restricts a cash-only basket to the two products cash accepts', () => {
+    expect(allowedProductsForLegs([cash])).toEqual(['MIS', 'CNC'])
+  })
+})
+
+describe('a direction and a leg side cannot contradict each other', () => {
+  it('mirrors the server, so the form refuses what the save would', () => {
+    expect(DIRECTION_ACCEPTS.long_only).toEqual(['long', 'both'])
+    expect(DIRECTION_ACCEPTS.short_only).toEqual(['short', 'both'])
+    expect(DIRECTION_ACCEPTS.both).toEqual(['long', 'short', 'both'])
+  })
+})
+
+describe('the stocks tab trades any listed equity, on either venue', () => {
+  it('offers NSE and BSE on the stocks tab and one venue elsewhere', () => {
+    expect(TAB_UNDERLYING_EXCHANGES.stocks_fno).toEqual(['NSE', 'BSE'])
+    expect(TAB_UNDERLYING_EXCHANGES.mcx).toEqual(['MCX'])
+  })
+
+  it('does not promise a NIFTY 500 universe it does not enforce', () => {
+    // The engine resolves any listed equity, so the hint said something the
+    // product does not do. It was inherited from a stocks list built out of
+    // NFO futures contracts, which this one is not.
+    expect(UNIVERSE_TAB_HINT.stocks_fno).toBe('Any NSE or BSE stock')
+  })
+
+  it('keeps the stocks universe open, so a typed symbol is accepted', () => {
+    expect(TAB_UNDERLYING_IS_CLOSED_SET.stocks_fno).toBe(false)
+    expect(TAB_UNDERLYING_IS_CLOSED_SET.weekly_monthly).toBe(true)
+  })
+})
+
+describe('withQtyMode converts once the lot size is known', () => {
+  it('turns lots into the shares they stand for', () => {
+    // One lot of RELIANCE is 500 shares. Leaving "1" on the toggle offered a
+    // quantity that cannot be traded and read as though nothing happened.
+    const leg: Leg = { id: 1, segment: 'futures', exchange: 'NFO', qty: 1, qty_mode: 'lots' }
+    expect(withQtyMode(leg, 'units', 500).qty).toBe(500)
+  })
+
+  it('scales a multi-lot quantity', () => {
+    const leg: Leg = { id: 1, segment: 'futures', exchange: 'NFO', qty: 3, qty_mode: 'lots' }
+    expect(withQtyMode(leg, 'units', 500).qty).toBe(1500)
+  })
+
+  it('divides on the way back, floored to whole lots', () => {
+    const leg: Leg = { id: 1, segment: 'futures', exchange: 'NFO', qty: 1500, qty_mode: 'units' }
+    expect(withQtyMode(leg, 'lots', 500).qty).toBe(3)
+  })
+
+  it('never floors a part lot to zero', () => {
+    const leg: Leg = { id: 1, segment: 'futures', exchange: 'NFO', qty: 300, qty_mode: 'units' }
+    expect(withQtyMode(leg, 'lots', 500).qty).toBe(1)
+  })
+
+  it('does not convert when the mode is unchanged', () => {
+    const leg: Leg = { id: 1, segment: 'futures', exchange: 'NFO', qty: 2, qty_mode: 'lots' }
+    expect(withQtyMode(leg, 'lots', 500).qty).toBe(2)
+  })
+
+  it('leaves a cash leg alone, because lots is refused there', () => {
+    const leg: Leg = { id: 1, segment: 'cash', exchange: 'NSE', qty: 137, qty_mode: 'units' }
+    expect(withQtyMode(leg, 'lots', 500)).toEqual(leg)
+  })
+
+  it('still keeps the number when the lot size is unknown', () => {
+    const leg: Leg = { id: 1, segment: 'futures', exchange: 'NFO', qty: 4, qty_mode: 'lots' }
+    expect(withQtyMode(leg, 'units', null).qty).toBe(4)
   })
 })
 

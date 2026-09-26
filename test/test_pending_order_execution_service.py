@@ -252,8 +252,9 @@ def test_only_pilot_brokers_ship_gtt_modules():
     brokers = {
         path.parent.parent.name for path in (repository_root / "broker").glob("*/api/gtt_api.py")
     }
-    # 2026-08-29 upstream sync: GTT support broadened from the original
-    # Dhan/Zerodha pilot to also cover angel, fyers, and upstox.
+    # Angel, Fyers and Upstox joined the Dhan and Zerodha pilot in 6d7f2552.
+    # The set is exhaustive on purpose: a broker gaining a gtt_api module by
+    # accident should fail here rather than silently start routing GTTs.
     assert brokers == {"angel", "dhan", "fyers", "upstox", "zerodha"}
 
 
