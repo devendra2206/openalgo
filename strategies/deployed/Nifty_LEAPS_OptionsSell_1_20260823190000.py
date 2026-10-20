@@ -230,20 +230,25 @@ class Config:
     rsi_bear_threshold: float = 32.0       # RSI < 32 -> sell OTM CE
     history_lookback_days: int = 40        # RSI(14) warm-up without reset artifacts
 
-    # Bounded retry for the hourly RSI candle read: the broker can lag
-    # publishing the just-closed candle by anywhere from a couple of
-    # minutes (normal) to, confirmed live 2026-09-15, well over an hour
-    # (history() kept serving the PRIOR trading day's candles well past
-    # 10:15 on a Tuesday, and again well past 12:15 the same day). Retry
-    # for up to 15 minutes past the hourly mark (6 attempts, 3 minutes
-    # apart: checkpoints at 0/3/6/9/12/15 min) before giving up -- and
-    # unlike a couple of minutes' lag being tolerable to just wait out,
-    # giving up here means SKIPPING this cycle's decision entirely (see
-    # _rsi_signal_worker), never falling back to whatever stale candle is
-    # available, since that stale candle is exactly what caused a real
-    # RSI-driven trade to fire on four-day-old data that day.
+    # Bounded retry for the candle read. The first read is deliberately LATE,
+    # candle_settle_sec after the boundary, because the broker publishes a
+    # just-closed candle with a lag and reading at the instant of close is the
+    # most likely moment to be served the PRIOR candle. If the candle still is
+    # not published, retry every freshness_retry_delay_sec for
+    # max_retries attempts -- author 2026-10-20: "if on 2 mins, if this new
+    # candle close is not done then wait for 1 min, repeat this for 5 mins".
+    # So the checkpoints are T+2, T+3, T+4, T+5, T+6, T+7 minutes past the
+    # boundary: one settled read plus a five-minute retry window.
+    #
+    # Giving up means SKIPPING this cycle's decision entirely, never falling
+    # back to whatever stale candle is available. Confirmed live 2026-09-15
+    # the broker served the PRIOR TRADING DAY's candles well past 10:15 on a
+    # Tuesday, and again past 12:15 the same day -- acting on that is exactly
+    # what this guards against, and it once fired a real RSI-driven trade on
+    # four-day-old data.
+    candle_settle_sec: float = 120.0
     rsi_freshness_max_retries: int = 6
-    rsi_freshness_retry_delay_sec: float = 180.0
+    rsi_freshness_retry_delay_sec: float = 60.0
 
     main_strike_round: int = 500
     premium_target: float = 350.0
@@ -1594,6 +1599,13 @@ class StrategyEngine:
 
     def _new_candle_closed(self) -> bool:
         boundary = _current_hourly_candle_boundary()
+        # Do not read the candle at the instant it closes -- wait
+        # candle_settle_sec (2 min) for the broker to publish it. Reading on
+        # the boundary is the single most likely moment to be served the PRIOR
+        # candle. The worker's retry loop then covers a longer lag at 1-minute
+        # intervals for 5 minutes. Author 2026-10-20.
+        if (datetime.now(IST) - boundary).total_seconds() < config.candle_settle_sec:
+            return False
         if self._last_candle_boundary is None:
             self._last_candle_boundary = boundary
             # Restart recovery: a persisted last_candle_key means this
@@ -1889,6 +1901,19 @@ class StrategyEngine:
             hedge_px = float(hedge_fill.get("average_price") or hedge_fill.get("price") or 0.0)
             pos.hedge_entry_px = hedge_px
             pos.hedge_entry_filled = True
+            # A hedge just bought is ALREADY in the right month, because
+            # resolve_hedge_monthly_expiry() applied the same day>15 rule the
+            # 18th-of-month roll would apply. Without this stamp,
+            # _check_hedge_roll_due() sells the brand-new hedge and buys the
+            # identical contract straight back -- two orders and two spreads
+            # for no change in position. Observed live by the author on
+            # 2026-10-20 for a position entered ON the 18th.
+            #
+            # The validated backtest has always guarded this:
+            # backtest_leaps_live_rules.py stamps
+            # pos["hedge_rolled_months"].add((day.year, day.month)) at BOTH
+            # entry sites. This live script was the one missing it.
+            pos.last_hedge_roll_date = datetime.now(IST).date().isoformat()
             self.price_stream.add_instruments([{"symbol": hedge_symbol, "exchange": OPTIONS_EXCHANGE}])
             self.save_state()
             Log.info(f"Hedge entry filled: {hedge_symbol}@{hedge_px} qty={config.quantity} -- position fully open.")
@@ -2190,12 +2215,31 @@ class StrategyEngine:
         pos = self.state.position
         if not pos.side or pos.error_state:
             return
-        today = datetime.now(IST).date()
+        now = datetime.now(IST)
+        today = now.date()
         roll_date = hedge_roll_date_for_month(today.year, today.month)
         if today != roll_date:
             return
+        # Not if a trade was taken today -- see the stamp written when the
+        # hedge entry fills (author 2026-10-20).
         if pos.last_hedge_roll_date == today.isoformat():
             return
+        # NO ROLL AT 09:15. Wait until the session's first candle has closed
+        # and settled, so the earliest roll is 10:17 on this 1h strategy
+        # (11:17 on the 2h variant) -- author 2026-10-20: "no decision to be
+        # taken at 9:15 ... it should be taken after one candle close".
+        #
+        # Execution reason, not tidiness: 09:15 is the widest-spread minute of
+        # the session and the roll pays that spread twice, closing the old
+        # hedge and buying the new one. The backtest prices the roll at the
+        # 09:15 print with zero slippage, so a roll that looks free there is
+        # not free live.
+        boundary = _current_hourly_candle_boundary()
+        session_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        if boundary <= session_start:
+            return   # still inside the session's first, unclosed candle
+        if (now - boundary).total_seconds() < config.candle_settle_sec:
+            return   # candle has closed but not yet settled
         # Check-then-set must be atomic -- an RSI-triggered _exit_position()
         # (on _rsi_executor's thread) could otherwise pass its own
         # _pending_fills check at the same moment as this one, and both
@@ -2218,6 +2262,25 @@ class StrategyEngine:
         try:
             if not pos.side:
                 return
+            # Independent of the entry-time stamp: if the hedge already sits in
+            # the expiry this roll would resolve to, there is nothing to roll.
+            # Catches a restart that lost the stamp, or a manual intervention.
+            # Done here rather than in _check_hedge_roll_due() because it needs
+            # a client.expiry() call, which must stay off the 15-second tick.
+            if pos.hedge_symbol and pos.hedge_expiry:
+                try:
+                    _, target_raw = resolve_hedge_monthly_expiry(self.client, today)
+                    target_iso = datetime.strptime(target_raw, "%d-%b-%y").date().isoformat()
+                except Exception as exc:
+                    Log.warning(f"Hedge roll: could not pre-check the target expiry ({exc}) -- "
+                                f"continuing with the roll.")
+                    target_iso = None
+                if target_iso is not None and target_iso == pos.hedge_expiry:
+                    Log.info(f"Hedge roll due but the hedge is already in {pos.hedge_expiry} "
+                             f"-- nothing to roll, marking today as handled.")
+                    pos.last_hedge_roll_date = today.isoformat()
+                    self.save_state()
+                    return
             if not pos.hedge_symbol:
                 # Already unhedged (a prior roll failure) -- mark today's
                 # roll as handled regardless, or _check_hedge_roll_due()
