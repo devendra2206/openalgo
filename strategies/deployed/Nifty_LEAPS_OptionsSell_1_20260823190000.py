@@ -1419,9 +1419,28 @@ def _post_json_local(env: "Environment", path: str, payload: bytes, timeout: flo
             req = urllib.request.Request(f"{base}{path}", data=payload, method="POST", headers=headers)
             urllib.request.urlopen(req, timeout=attempt_timeout).close()
             return
+        except urllib.error.HTTPError as exc:
+            # Read the BODY, not just the status line. str(HTTPError) is only
+            # "HTTP Error 404: NOT FOUND" -- byte-identical whether the 404 came
+            # from the handler's own {"message": "Strategy not found"} JSON or
+            # from Flask never matching the route at all. On 2026-10-21 both
+            # LEAPS strategies logged a continuous 404 from 10:11 to past 15:02
+            # and five hours of logs could not distinguish those two cases, so
+            # the cause had to be inferred from static code and ten separate
+            # hypotheses were falsified one by one. The URL is logged for the
+            # same reason: it is the other half of what identifies a 404.
+            body = ""
+            try:
+                body = exc.read().decode(errors="replace")[:300]
+            except Exception:
+                pass
+            last_exc = exc
+            Log.warning(f"_post_json_local POST {base}{path} (timeout={attempt_timeout}s) "
+                        f"-> HTTP {exc.code} {exc.reason}: {body}")
         except Exception as exc:
             last_exc = exc
-            Log.warning(f"_post_json_local: attempt (timeout={attempt_timeout}s) failed: {exc}")
+            Log.warning(f"_post_json_local POST {base}{path} "
+                        f"(timeout={attempt_timeout}s) failed: {exc}")
     raise last_exc
 
 
@@ -1432,9 +1451,28 @@ def _get_json_local(env: "Environment", path: str, timeout: float = 3.0) -> dict
         try:
             with urllib.request.urlopen(f"{base}{path}", timeout=attempt_timeout) as resp:
                 return json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            # Read the BODY, not just the status line. str(HTTPError) is only
+            # "HTTP Error 404: NOT FOUND" -- byte-identical whether the 404 came
+            # from the handler's own {"message": "Strategy not found"} JSON or
+            # from Flask never matching the route at all. On 2026-10-21 both
+            # LEAPS strategies logged a continuous 404 from 10:11 to past 15:02
+            # and five hours of logs could not distinguish those two cases, so
+            # the cause had to be inferred from static code and ten separate
+            # hypotheses were falsified one by one. The URL is logged for the
+            # same reason: it is the other half of what identifies a 404.
+            body = ""
+            try:
+                body = exc.read().decode(errors="replace")[:300]
+            except Exception:
+                pass
+            last_exc = exc
+            Log.warning(f"_get_json_local GET {base}{path} (timeout={attempt_timeout}s) "
+                        f"-> HTTP {exc.code} {exc.reason}: {body}")
         except Exception as exc:
             last_exc = exc
-            Log.warning(f"_get_json_local: attempt (timeout={attempt_timeout}s) failed: {exc}")
+            Log.warning(f"_get_json_local GET {base}{path} "
+                        f"(timeout={attempt_timeout}s) failed: {exc}")
     raise last_exc
 
 
