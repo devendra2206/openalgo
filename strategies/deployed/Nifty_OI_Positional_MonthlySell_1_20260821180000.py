@@ -22,9 +22,13 @@ Strike qualification (both required)
 ------------------------------------------------------------------------
   1. Delta closest to 0.27 among round-100 strikes (0.22-0.32 is only a
      "stop widening the scan" heuristic, never a hard filter).
-  2. That exact strike's own OI signal classifies "accumulation" (short
-     covering or long unwinding) via classify_oi_premium(premium_change,
-     oi_change), computed against the day's Reference Snapshot (same
+  2. That exact strike's own OI signal classifies config.short_verdict --
+     "weakening", i.e. short build-up or long unwinding, meaning the
+     premium has FALLEN since the reference (author 2026-11-01). The
+     original rule here was "accumulation"; see config.short_verdict for
+     the measured reason it was reversed. Computed by
+     classify_oi_premium(premium_change, oi_change) against the day's
+     Reference Snapshot (same
      _ensure_reference()/gap-threshold mechanism as
      Nifty_OI_WeeklyBuy_MonthlySell, but reading 15-minute candles here,
      not 5-minute).
@@ -58,7 +62,7 @@ closest observed premium to that target (never carried forward as a fixed
 strike -- re-selected fresh every time the short leg is (re-)selected).
 Modeled on Nifty_Sensex_Expiry_Batman's pick_leg_by_target_ltp pattern.
 
-Monthly rollover / expiry-day safety
+Cycle-end square-off / monthly rollover
 ------------------------------------------------------------------------
 resolve_monthly_expiry() (day > 15 -> next month's contract) feeds ONLY
 new-entry strike search -- it never force-closes an already-open position.
@@ -66,16 +70,28 @@ Separately, if an open position's OWN contract expires today, it is
 force-closed (short then hedge) unconditionally at the 3:15 daily
 decision -- terminal for the day, no new-position search follows.
 
-3:15 PM daily decision (every day that is NOT the 9:30 entry day)
+Position checks at 11:30, 1:30 and 3:30 PM (every day that is NOT the
+9:30 entry day) -- three slots since 2026-11-01, shifted fifteen minutes
+later than the original single 3:15 PM decision for the closing call
+auction. Each slot runs all three branches below.
 ------------------------------------------------------------------------
   - Resolve the active expiry (informational for whatever fires below).
   - Position open and its contract expires today -> force-close, stop.
   - Position open (not expiring today) -> fetch a FRESH OI verdict right
-    now (never reuse anything cached earlier): still "accumulation" ->
-    hold; no longer -> close short, then hedge, then search for a fresh
-    qualifying strike and re-enter if one qualifies.
+    now (never reuse anything cached earlier): still config.hold_verdict
+    ("weakening") -> hold; no longer -> close short, then hedge, then
+    search for a fresh qualifying strike and re-enter if one qualifies.
   - No position open (closed earlier today by a WS-driven SL hit) ->
     search for a new qualifying strike, re-enter if one qualifies.
+
+Order sequence
+------------------------------------------------------------------------
+ENTRY  hedge BUY -> (on fill) short SELL
+EXIT   short BUY -> (on fill) hedge SELL
+Buying the long leg first reduces the margin the short blocks, and means a
+failure part-way through leaves a long option rather than a naked short.
+The close is the reverse for the same reason: selling the hedge first
+would leave the short unhedged for those seconds.
 
 Data sources, WebSocket reliability, order placement, exception handling,
 PnL reporting -- identical conventions to every other deployed script in
@@ -118,7 +134,6 @@ from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from openalgo import api
-from opengreeks import black76
 
 # See MCX_CrudeOil_EMA9_RSI_Intraday's identical comment -- several
 # always-on threads (fill-watchers, trade-log writer, PriceStream's own
@@ -167,7 +182,15 @@ class Config:
 
     gap_threshold_pct: float = 0.5      # Reference Engine gap threshold, reused verbatim
     reference_check_time: time = time(9, 30)
-    reference_wait_time: time = time(9, 35)   # large-gap case waits for this candle to close
+    reference_wait_time: time = time(9, 45)   # large-gap case waits for this candle to close
+    # 09:45, not 09:35, since the closing call auction moved every decision
+    # fifteen minutes later (author 2026-11-01: "take OI data at 9:30 and if
+    # gap or gap down then take OI data at 9:45"). The reference and the
+    # first 'current' read must still land on DIFFERENT candles; at the
+    # 5-minute bootstrap interval 09:30 and 09:45 are three buckets apart, so
+    # the collision this file documents below -- both resolving to the same
+    # 09:15-09:30 15-minute bucket, every verdict forced to "flat", the day's
+    # entry permanently lost -- cannot occur.
 
     # On a gap day, the reference (09:30 baseline) and the very first
     # entry-evaluation "current" read (fired once reference.computed flips
@@ -180,7 +203,8 @@ class Config:
     # Fix: capture the reference AND that one bootstrap "current" read at
     # 5-minute granularity (matching Nifty_OI_WeeklyBuy_MonthlySell's own
     # native interval) so 09:30 and 09:35 are genuinely different candles.
-    # Everything else (15:15 daily decision, later days) stays on the
+    # Everything else (the 11:30/13:30/15:30 position checks, later days)
+    # stays on the
     # regular 15m interval -- already far enough from 09:30 to never collide.
     reference_gap_bootstrap_interval: str = "5m"
 
@@ -189,6 +213,24 @@ class Config:
     monthly_delta_low: float = 0.22     # widen-scan-stop heuristic only, never a hard filter
     monthly_delta_high: float = 0.32
     monthly_strike_round: int = 100
+    # Which OI verdict qualifies a strike to be SHORTED, and which keeps an
+    # open short alive at a position check (author 2026-11-01: "it should be
+    # OI verdict should be weakening , then we will short option" and "you
+    # will hold position till it in weakninig state").
+    #
+    # This reverses the original rule, and the reason is the payoff shape it
+    # produced. "accumulation" requires premium_change > 0, so the old entry
+    # sold a premium that had RISEN since the reference and then held while it
+    # kept rising -- the hold condition coincided with the position LOSING.
+    # Measured over 679 trades, the daily decision closed winners (429 exits,
+    # mean +31.9 short points, 93% in profit) and left every loser to the stop
+    # (245 exits, mean -57.6 points, 0% in profit): it cut winners at ~35
+    # points and held losers to a ~53-point stop, for -Rs 98 a trade.
+    # Shorting on "weakening" instead sells a falling premium and holds while
+    # it keeps falling, so holding now coincides with being in profit:
+    # wins averaged +54.8 short points against losses of -35.3.
+    short_verdict: str = "weakening"
+    hold_verdict: str = "weakening"
     monthly_expiry_roll_day_of_month: int = 15   # today.day > 15 resolves to next month's contract
 
     # Tiered, permanently-ratcheting stop-loss (checked continuously via WS LTP).
@@ -199,7 +241,78 @@ class Config:
     hedge_premium_pct_of_short: float = 20.0
     hedge_strike_scan_count: int = 30    # mirrors Batman's repair_chain_strike_count
 
-    daily_decision_time: time = time(15, 15)      # fresh OI re-check / rollover-search, non-entry days
+    # Position-check times (author 2026-11-01). Was ONE decision at 15:15;
+    # now three, each shifted fifteen minutes later for the closing call
+    # auction: "treade check at 11:30 , 1:30 and 3:30". Every slot runs the
+    # same three branches (expiry force-close / fresh verdict / flat search),
+    # so a signal flip is acted on within ~2 hours instead of waiting for the
+    # close -- measured, that cut the tier-1 stop rate from 32% of trades to
+    # 14% and the stop bill from -Rs 482,754 to -Rs 363,840.
+    #
+    # The 15:30 slot now sits AT the close rather than fifteen minutes before
+    # it, so its fill is the closing price. The last complete 15-minute candle
+    # at 15:30 is the 15:15-15:29 bucket.
+    daily_decision_times: tuple = (time(11, 30), time(13, 30), time(15, 30))
+    # The last slot, kept under the old single-decision name so any reader of
+    # it resolves to a sane value instead of raising.
+    daily_decision_time: time = time(15, 30)
+    # Wait this long after a scheduled time before acting on it (author
+    # 2026-11-01: "since api may not give candle close at 11:30 / 1:30 or 3:30
+    # extraclty , pls add one minth buffer"). The broker publishes a candle a
+    # moment after its boundary, so asking at exactly 11:30:00 can return the
+    # 11:15 candle instead -- a whole slot stale.
+    #
+    # The buffer shifts only WHEN a check fires, never WHICH candle it wants:
+    # the freshness gate still measures against the slot time itself, so an
+    # 11:30 check firing at 11:31 still demands the candle that closed at
+    # 11:30 and retries if the broker has not published it yet. Slot keys also
+    # stay on the slot time, so a restart cannot replay a slot.
+    decision_buffer_min: int = 1
+
+    # Take the verdict's CURRENT premium/OI from the live quote instead of the
+    # last closed candle (author 2026-11-02). The strike scan already holds it
+    # in the optionchain response it fetched, and the hold check gets it in one
+    # quotes() call rather than five days of 15-minute candles.
+    #
+    # It is a rule change as well as a speed-up: "current" becomes a live
+    # reading at ~11:31 rather than the candle that closed at 11:30. The
+    # reference side is untouched. It also makes the candle-freshness retry
+    # redundant for the current side, which removes up to 75s of _eval_pending
+    # being held per check -- the window the stop loss was blind in.
+    #
+    # A 0 or missing oi falls back to the candle path, so a broker that does
+    # not publish OI in quotes still works rather than silently classifying
+    # every candidate "flat".
+    use_live_oi_for_current: bool = True
+
+    # CYCLE-END SQUARE-OFF (author 2026-11-01: "on expiry at 3:30 PM , you
+    # cloase all position" and "you will close all postion at current calendar
+    # month expiry not trade position expiry"). On the CALENDAR month's expiry
+    # date every open position is closed at this time, whatever contract it
+    # holds -- past day 15 a new entry sits in next month's contract, and it is
+    # still squared off on this month's expiry.
+    #
+    # Earlier checks that day are ORDINARY: the verdict branch runs on an open
+    # position, and a flat leg may take a fresh entry -- past day 15 that lands
+    # in next month's contract, and it is squared off here the same day along
+    # with everything else. Entries stop only AT/AFTER this time.
+    #
+    # It must be one of daily_decision_times, because the check that performs
+    # it is what runs -- asserted at startup rather than trusted.
+    expiry_close_time: time = time(15, 30)
+
+    # The continuous tiered SL acts only inside this window (author: "at 9:30
+    # SL check and reference data check", "SL check timing ends at 3:30").
+    # Outside it an LTP tick is ignored. Before 09:30 that is also necessary:
+    # the day's Reference Snapshot is not yet fixed.
+    #
+    # The session runs to 15:40, so the last ten minutes are deliberately
+    # unwatched -- a breach there is first seen at the next day's 09:30 scan,
+    # at the next morning's price. That window is also when the 15:30 check
+    # places its orders, so anything it opens is unwatched until tomorrow.
+    # Stated because it is a consequence of the given times, not an oversight.
+    sl_check_start_time: time = time(9, 30)
+    sl_check_end_time: time = time(15, 30)
     entry_evaluation_time: time = time(9, 30)     # fires only on a cycle's own start day
 
     quantity: int = 65                  # NIFTY's current lot size == 1 lot
@@ -212,7 +325,21 @@ class Config:
     price_type: str = "MARKET"
 
     market_open: time = time(9, 15)
-    market_close: time = time(15, 30)
+    # 15:40, not 15:30 (author 2026-11-01: "market session end at 3:40 PM").
+    # This is what makes the 15:30 position check able to TRADE: dispatching
+    # at 15:30 with a 15:30 close meant any order it placed landed after the
+    # regular session and would have been rejected. With the close at 15:40
+    # the slot has ten minutes of live session to work in.
+    market_close: time = time(15, 40)
+    # No grace past the session end -- the given times are the times. It
+    # stays configurable only because the LAST position check must remain
+    # reachable: _within_market_hours() bounds on max(market_close, last
+    # slot), and with the close at 15:40 and the last slot at 15:30 there are
+    # ten live minutes to act in, so 0 is correct here. Were a slot ever moved
+    # onto the close itself, a `time` comparison would hold for the single
+    # instant 15:40:00.000000 and that check would never fire -- which is the
+    # defect this field was added for.
+    post_close_grace_min: int = 0
     # Kept for parity with the sibling script's Config shape -- this
     # strategy's own exits (SL / daily-decision / expiry-day close) all
     # fire well before this; there is no separate "universal exit time"
@@ -222,7 +349,7 @@ class Config:
     scheduler_interval: int = 10
     pnl_tick_interval: float = 0.8
 
-    # Bounded retry for the 9:30/15:15 OI candle read: the broker can lag a
+    # Bounded retry for the 9:30 and position-check OI candle reads: the broker can lag a
     # couple of minutes publishing the just-closed 15m candle (confirmed on
     # MCX/Shoonya, commit 9618fe65a). Since this strategy only evaluates
     # once a day at each of those times, a single stale read has a full
@@ -341,7 +468,7 @@ class ShortHedgePosition:
 
     reference_oi: float = 0.0
     reference_premium: float = 0.0
-    entry_trigger_verdict: str = ""     # "accumulation" at entry, always
+    entry_trigger_verdict: str = ""     # config.short_verdict at entry, always
     delta_at_entry: float = 0.0
     sl_tier2_locked: bool = False       # permanent ratchet flag -- never unset once True
     expiry_date: str = ""               # ISO date of the contract this position was actually entered on
@@ -354,6 +481,14 @@ class ShortHedgePosition:
     # closes leave it False -- no immediate same-day re-search).
     pending_exit_reason: str = ""
     pending_reentry_search: bool = False
+    # The position check that ordered this close ("HH:MM"), carried so the
+    # re-entry search dispatched after the hedge exit confirms is anchored to
+    # THAT slot. This strategy is time-anchored: the candle-freshness gate
+    # measures against the slot that fired, and defaulting to the last slot of
+    # the day would hand an 11:30 re-entry a 15:30 boundary -- a time in the
+    # future, which no candle can be fresher than, so the search would burn
+    # its retries and the re-entry would be lost.
+    reentry_slot_hm: str = ""
 
     execution_id: int = 0
 
@@ -378,9 +513,34 @@ class LegState:
     # entry-evaluation dispatch to at most once per calendar day, resolved
     # regardless of outcome (found nothing, errored, a genuine entry).
     last_entry_eval_date: str = ""
-    # ISO date string -- guards the 15:15 daily-decision dispatch to at
+    # "<ISO date> <HH:MM>" slot key -- guards each position-check dispatch to at
     # most once per calendar day, same resolved-regardless-of-outcome rule.
     last_daily_decision_date: str = ""
+    # The CYCLE's expiry, as an ISO date ("2026-06-30"), captured ONCE on the
+    # cycle's first fresh trade and NOT rewritten for the rest of the cycle.
+    # THIS IS THE SQUARE-OFF KEY: at config.expiry_close_time on this date,
+    # every open position is closed, whatever contract it holds.
+    #
+    # It is NOT the contract traded -- after the 15th a new entry goes into
+    # next month's contract (pos.expiry_date), while this stays on the cycle's
+    # own expiry. A trade taken 20-Jun holds the July contract and is still
+    # closed on 30-Jun.
+    #
+    # "Already captured for this cycle" is read from this value itself: a date
+    # still in the future belongs to the running cycle; empty, unreadable or
+    # past means the next fresh trade captures again. It survives the position
+    # object being reset, so the square-off still fires after a leg goes flat
+    # mid-cycle.
+    marked_expiry: str = ""
+    # ISO date on which this leg's own contract was force-closed at expiry.
+    # The force-close is "terminal for today, no new-position search
+    # follows" -- with ONE check a day that was implicit in returning from
+    # it, but with three checks the leg is simply flat when 13:30 arrives
+    # and the flat branch would open a fresh short+hedge in NEXT month's
+    # contract on expiry day: a day before resolve_cycle_start_date allows
+    # the cycle to start, which then suppresses the real cycle-start day's
+    # own entry evaluation. This field makes the terminality explicit.
+    expiry_closed_date: str = ""
 
 
 @dataclass
@@ -433,11 +593,31 @@ class Environment:
             raise ValueError("OPENALGO_API_KEY environment variable not found.")
 
 
+def _with_buffer(t: time) -> time:
+    """A scheduled time plus config.decision_buffer_min, for comparing against
+    the clock. Built via datetime.combine because `time` has no arithmetic."""
+    if not config.decision_buffer_min:
+        return t
+    base = datetime.combine(datetime.now(IST).date(), t)
+    return (base + timedelta(minutes=config.decision_buffer_min)).time()
+
+
 def _within_market_hours() -> bool:
+    """True while run_cycle should keep ticking.
+
+    The upper bound is the LATER of market_close and the last position
+    check, plus post_close_grace_min. Bounding it at market_close alone
+    made the 15:30 check unreachable, since a `time` comparison only holds
+    for the instant 15:30:00.000000 -- the slot existed and never ran.
+    """
     if config.test_mode:
         return True
-    now = datetime.now(IST).time()
-    return config.market_open <= now <= config.market_close
+    now = datetime.now(IST)
+    last_slot = max(config.daily_decision_times)
+    # Naive on purpose -- only .time() is read back, and a pytz tzinfo= here
+    # would resolve to LMT (+05:53) as it does everywhere else in this file.
+    end = datetime.combine(now.date(), max(config.market_close, last_slot))         + timedelta(minutes=config.post_close_grace_min)
+    return config.market_open <= now.time() <= end.time()
 
 
 ###############################################################################
@@ -768,6 +948,8 @@ class StateStore:
             leg.trade_count = leg_raw.get("trade_count", 0)
             leg.last_entry_eval_date = leg_raw.get("last_entry_eval_date", "")
             leg.last_daily_decision_date = leg_raw.get("last_daily_decision_date", "")
+            leg.expiry_closed_date = leg_raw.get("expiry_closed_date", "")
+            leg.marked_expiry = leg_raw.get("marked_expiry", "")
             pos_raw = leg_raw.get("position", {})
             leg.position = ShortHedgePosition(
                 **{**asdict(ShortHedgePosition()), **filter_known_fields(ShortHedgePosition, pos_raw)}
@@ -789,6 +971,8 @@ class StateStore:
                     "trade_count": v.trade_count,
                     "last_entry_eval_date": v.last_entry_eval_date,
                     "last_daily_decision_date": v.last_daily_decision_date,
+                    "expiry_closed_date": v.expiry_closed_date,
+                    "marked_expiry": v.marked_expiry,
                     "position": asdict(v.position),
                 }
                 for k, v in self.state.legs.items()
@@ -934,6 +1118,80 @@ def resolve_monthly_expiry(client) -> tuple[str, str]:
     return _compact_expiry(raw), raw
 
 
+def resolve_cycle_expiry_date(client) -> Optional["datetime.date"]:
+    """The expiry the CURRENT CYCLE runs to: the earliest month-end expiry at
+    or after today.
+
+    This is what gets captured on a cycle's first fresh trade and what the
+    square-off then fires on. It is none of the other three dates:
+
+      - resolve_monthly_expiry() applies the day>15 roll, so from the 16th it
+        names NEXT month's contract -- a 20-Nov trade would capture December
+        and the cycle would never end.
+      - resolve_current_month_expiry_date() is the CALENDAR month's own expiry,
+        which on a cycle-start day like 27-May has already passed (26-May).
+      - pos.expiry_date is the contract a given position holds, which after the
+        15th is next month's.
+
+    On 27-May it returns 30-Jun; on 20-Nov, 24-Nov; on the expiry day itself,
+    that day. Returns None if the broker lists no month-end expiry at or after
+    today, which callers must treat as unknown and never guess.
+    """
+    resp = client.expiry(symbol=UNDERLYING_SYMBOL, exchange=OPTIONS_EXCHANGE, instrumenttype="options")
+    if resp.get("status") != "success" or not resp.get("data"):
+        raise RuntimeError(f"Could not resolve options expiry calendar: {resp}")
+    today = datetime.now(IST).date()
+    all_dates = sorted(datetime.strptime(raw, "%d-%b-%y").date() for raw in resp["data"])
+    month_ends: dict[tuple, "datetime.date"] = {}
+    for d in all_dates:
+        key = (d.year, d.month)
+        if key not in month_ends or d > month_ends[key]:
+            month_ends[key] = d
+    upcoming = sorted(d for d in month_ends.values() if d >= today)
+    return upcoming[0] if upcoming else None
+
+
+def resolve_current_month_expiry_date(client) -> Optional["datetime.date"]:
+    """The CURRENT CALENDAR month's own month-end expiry date, with no roll
+    rule applied.
+
+    Distinct from the two expiries either side of it, and the distinction is
+    the point:
+      - resolve_monthly_expiry() applies the day>15 roll and names the
+        contract a NEW ENTRY searches -- next month's, late in the month.
+      - pos.expiry_date is the contract a position was
+        actually opened in, and is what the cycle-end square-off keys on.
+      - THIS is the calendar month's own expiry, which from day 16 onward is
+        neither of those.
+
+    Returns None when the broker's calendar lists no expiry in the current
+    month (it has already passed and been dropped); callers must read that as
+    "unknown", never guess a date.
+    """
+    resp = client.expiry(symbol=UNDERLYING_SYMBOL, exchange=OPTIONS_EXCHANGE, instrumenttype="options")
+    if resp.get("status") != "success" or not resp.get("data"):
+        raise RuntimeError(f"Could not resolve options expiry calendar: {resp}")
+    today = datetime.now(IST).date()
+    all_dates = sorted(datetime.strptime(raw, "%d-%b-%y").date() for raw in resp["data"])
+    this_month = [d for d in all_dates if (d.year, d.month) == (today.year, today.month)]
+    if not this_month:
+        return None
+    latest = max(this_month)
+    if latest < today:
+        # The broker's list no longer carries this month's month-end expiry --
+        # it has passed and been dropped. Returning the newest WEEKLY still in
+        # the list would be wrong, and returning a past date means the
+        # square-off comparison silently never matches today. Say so loudly
+        # and return None, so the caller treats it as unknown rather than as
+        # "not an expiry day".
+        Log.warning(f"[Expiry] the current month's month-end expiry is no longer in the "
+                    f"broker's calendar (newest listed in {today.year}-{today.month:02d} is "
+                    f"{latest}, which is in the past) -- the calendar-month square-off cannot "
+                    f"be evaluated today.")
+        return None
+    return latest
+
+
 def resolve_cycle_start_date(client) -> Optional["datetime.date"]:
     """The first trading day this strategy can enter the CURRENT monthly
     contract -- the day after the PRIOR contract's own expiry (spec item 3).
@@ -983,20 +1241,6 @@ def resolve_previous_trading_day(today) -> "datetime.date":
     return d
 
 
-def _years_to_expiry(expiry_raw: str) -> float:
-    """Time to expiry in years, for the Black-76 model -- replicates
-    services/option_greeks_service.py's calculate_time_to_expiry() exactly
-    (same NFO 15:30 expiry time, same IST 'now', same 0.0001-year floor).
-    Copied unchanged from Nifty_OI_WeeklyBuy_MonthlySell."""
-    expiry_date = datetime.strptime(expiry_raw, "%d-%b-%y")
-    expiry_dt = IST.localize(
-        expiry_date.replace(hour=15, minute=30, second=0, microsecond=0)
-    )
-    now = datetime.now(IST)
-    years = (expiry_dt - now).total_seconds() / (60 * 60 * 24) / 365.0
-    return max(years, 0.0001)
-
-
 def _legs_with_strike(chain: dict, option_type: str) -> list:
     """Flattens optionchain()'s per-strike-row shape into a flat list of leg
     dicts, each carrying its own `strike` -- copied from
@@ -1021,8 +1265,8 @@ def select_qualifying_monthly_strike(client, spot: float, expiry_raw: str, optio
     PURE delta-closeness ranking to config.monthly_delta_target (0.27), no
     premium filter anywhere. Keeps that function's expanding-band-scan
     skeleton (band_step_count=8, max_bands=2, ONE batched
-    optionchain(with_quotes=True) call per band, local opengreeks.black76
-    IV+delta computed from that single response) but:
+    optionchain(with_quotes=True, with_greeks=True) call per band, delta read
+    straight off that single response) but:
 
       1. Ranks ALL scanned round-100-strike candidates by delta-closeness
          to monthly_delta_target (not just tracking a single "best so far").
@@ -1031,7 +1275,7 @@ def select_qualifying_monthly_strike(client, spot: float, expiry_raw: str, optio
          using `reference` for that candidate's own premium/OI deltas --
          the one necessarily per-candidate, non-batched step in this chain,
          since OI history isn't part of the optionchain() response) and
-         returns the first candidate whose verdict is "accumulation".
+         returns the first candidate whose verdict is config.short_verdict.
       3. Returns None if nothing across both bands passes the accumulation
          filter -- never falls back to "closest delta regardless of OI"
          the way the sibling script's delta-only selector does.
@@ -1060,24 +1304,46 @@ def select_qualifying_monthly_strike(client, spot: float, expiry_raw: str, optio
     band_step_count = 8
     max_bands = 2
 
-    years_to_expiry = _years_to_expiry(expiry_raw)
-    flag = "c" if option_type == "CE" else "p"
 
     scanned: list[dict] = []   # each: {"strike", "delta", "premium", "diff"}
     last_chain_response: Optional[dict] = None
 
     for band in range(1, max_bands + 1):
         strike_count = band_step_count * band * 2
+        # with_greeks=True so the server supplies delta (author 2026-11-02).
+        # It is the platform's own Black-76, fed by _resolve_forward_price()'s
+        # per-expiry SYNTHETIC FORWARD -- "the single source of truth for the
+        # forward rule" (services/option_greeks_service.py).
+        #
+        # This script used to solve IV and delta itself from the chain's ltp,
+        # which was both unnecessary work and slightly WRONG: it passed
+        # `underlying_ltp` as the forward where the server passes
+        # `forward_price`. Measured on a live response (underlying_ltp
+        # 23440.80 vs forward_price 23419.85, a 21-point gap), that biased
+        # every delta HIGH by +0.004 to +0.012 -- up to 12% of the 0.22-0.32
+        # band's width. Feeding the right forward reproduced the server's
+        # delta to four decimals on all 13 strikes, which is why taking the
+        # server's value directly is the simpler fix.
         resp = client.optionchain(
             underlying=UNDERLYING_SYMBOL, exchange=UNDERLYING_SPOT_EXCHANGE,
-            expiry_date=_compact_expiry(expiry_raw), strike_count=strike_count, with_quotes=True,
+            expiry_date=_compact_expiry(expiry_raw), strike_count=strike_count,
+            with_quotes=True, with_greeks=True,
         )
         if resp.get("status") != "success" or not resp.get("chain"):
             raise RuntimeError(f"optionchain() failed for expiry {expiry_raw}: {resp}")
         last_chain_response = resp
 
-        forward = float(resp.get("underlying_ltp") or spot)
         premium_by_strike: dict[float, float] = {}
+        # Per-leg delta straight from the response. A leg whose delta is absent
+        # or zero is skipped rather than guessed at -- the same treatment the
+        # local solve gave an unsolvable IV.
+        delta_by_strike: dict[float, float] = {}
+        # The chain carries a real per-leg `oi` (verified against a live
+        # Shoonya response: 177515, 5239455, ...), so the CURRENT side of the
+        # verdict is already in this one batched call -- no per-candidate
+        # history pull. Collected here alongside the premium it must be
+        # consistent with: both come from the same snapshot.
+        oi_by_strike: dict[float, float] = {}
         for row in resp["chain"]:
             leg = row.get(side_key)
             if not leg or not leg.get("ltp"):
@@ -1085,17 +1351,28 @@ def select_qualifying_monthly_strike(client, spot: float, expiry_raw: str, optio
             if not leg.get("bid") or not leg.get("ask"):
                 continue  # no genuine two-sided market -- see sibling script's identical guard
             premium_by_strike[float(row["strike"])] = float(leg["ltp"])
+            if leg.get("oi"):
+                oi_by_strike[float(row["strike"])] = float(leg["oi"])
+            if leg.get("delta") is not None:
+                delta_by_strike[float(row["strike"])] = float(leg["delta"])
 
         def _delta_at(strike: float) -> Optional[float]:
-            premium = premium_by_strike.get(strike)
-            if premium is None:
+            """The server's delta for this strike, or None.
+
+            None when the chain gave no premium, no delta, or a delta of
+            exactly 0 -- the last of which is what an illiquid or unpriceable
+            leg comes back as, and ranking it as "delta 0.0" would make it
+            look like the furthest possible strike from 0.27 rather than
+            unusable. All three are skipped, as an unsolvable IV used to be.
+            """
+            if premium_by_strike.get(strike) is None:
                 return None
-            try:
-                iv = black76.implied_volatility(premium, forward, strike, 0.0, years_to_expiry, flag)
-                return float(black76.delta(flag, forward, strike, years_to_expiry, 0.0, iv))
-            except Exception as exc:
-                Log.warning(f"Local Greeks computation failed for strike {strike}: {exc}")
+            d = delta_by_strike.get(strike)
+            if d is None or d == 0.0:
+                Log.warning(f"[MONTHLY_{option_type}] no usable delta from the chain for "
+                            f"strike {strike} -- skipping it.")
                 return None
+            return d
 
         band_start = band_step_count * (band - 1) + 1
         band_end = band_step_count * band
@@ -1106,7 +1383,8 @@ def select_qualifying_monthly_strike(client, spot: float, expiry_raw: str, optio
                 continue
             premium = premium_by_strike[strike]
             diff = abs(abs(delta) - config.monthly_delta_target)
-            scanned.append({"strike": strike, "delta": delta, "premium": premium, "diff": diff})
+            scanned.append({"strike": strike, "delta": delta, "premium": premium,
+                            "diff": diff, "oi": oi_by_strike.get(strike)})
 
         best_diff_so_far = min((c["diff"] for c in scanned), default=float("inf"))
         if best_diff_so_far != float("inf"):
@@ -1128,8 +1406,17 @@ def select_qualifying_monthly_strike(client, spot: float, expiry_raw: str, optio
     for candidate in ranked:
         strike = candidate["strike"]
         symbol = f"{UNDERLYING_SYMBOL}{_compact_expiry(expiry_raw)}{int(strike)}{option_type}"
-        current = fetch_candle_oi_premium(client, symbol, OPTIONS_EXCHANGE, require_fresh_by=require_fresh_by,
-                                           interval=current_interval)
+        # CURRENT side: the chain's own snapshot when it carried an oi for this
+        # strike, else the candle path. The fallback is what keeps a broker
+        # without OI in its chain working.
+        current = None
+        if config.use_live_oi_for_current and candidate.get("oi"):
+            current = {"premium": candidate["premium"], "oi": candidate["oi"],
+                       "timestamp": "chain"}
+        if current is None:
+            current = fetch_candle_oi_premium(client, symbol, OPTIONS_EXCHANGE,
+                                               require_fresh_by=require_fresh_by,
+                                               interval=current_interval)
         ref_reading = fetch_reference_oi_premium(client, symbol, OPTIONS_EXCHANGE, reference)
         if current is None or ref_reading is None:
             Log.warning(f"[MONTHLY_{option_type}] OI/premium unavailable for candidate strike "
@@ -1140,11 +1427,11 @@ def select_qualifying_monthly_strike(client, spot: float, expiry_raw: str, optio
         verdict = classify_oi_premium(premium_change, oi_change)
         Log.info(f"[MONTHLY_{option_type}] candidate strike={strike} delta={candidate['delta']:.4f} "
                   f"(diff={candidate['diff']:.4f}) premium={candidate['premium']:.2f} verdict={verdict}")
-        if verdict == "accumulation":
+        if verdict == config.short_verdict:
             return strike, candidate["delta"], candidate["premium"], verdict, last_chain_response
 
     Log.info(f"[MONTHLY_{option_type}] no candidate (of {len(ranked)} scanned) passed the "
-              f"OI-accumulation filter -- no qualifying strike this cycle.")
+              f"OI filter (need {config.short_verdict}) -- no qualifying strike this cycle.")
     return None
 
 
@@ -1278,6 +1565,47 @@ def fetch_candle_oi_premium(client, symbol: str, exchange: str,
     }
 
 
+# Reference readings for the day, keyed (symbol, exchange, reference identity).
+# The Reference Snapshot is fixed at 09:30, so a strike's reference premium/OI
+# cannot change during the day -- without this, every candidate at every check
+# re-pulled the identical previous-day candle. Keyed by the reference's own
+# date/mode/time so a re-computed reference is never served a stale reading,
+# and cleared by _reset_day_if_needed.
+_REFERENCE_CACHE: dict = {}
+_REFERENCE_CACHE_LOCK = threading.Lock()
+
+
+def clear_reference_cache():
+    with _REFERENCE_CACHE_LOCK:
+        _REFERENCE_CACHE.clear()
+
+
+def fetch_live_oi_premium(client, symbol: str, exchange: str) -> Optional[dict]:
+    """Current premium + OI from the live quote, for config.use_live_oi_for_current.
+
+    Returns None when the quote fails OR when oi is absent/zero -- the caller
+    then falls back to the candle path. That guard matters: a broker whose
+    quotes carry no OI would otherwise report oi_change == 0 for every
+    candidate, which classify_oi_premium reads as "flat", and nothing would
+    ever qualify. (Shoonya's quotes DO carry oi -- broker/shoonya/api/data.py
+    -- but get_depth() deliberately returns 0, so the distinction is real.)
+    """
+    try:
+        resp = client.quotes(symbol=symbol, exchange=exchange)
+    except Exception as exc:
+        Log.warning(f"quotes() failed for {symbol}.{exchange}: {exc}")
+        return None
+    if not isinstance(resp, dict) or resp.get("status") != "success":
+        Log.warning(f"quotes() error response for {symbol}.{exchange}: {resp}")
+        return None
+    data = resp.get("data") or {}
+    ltp = data.get("ltp")
+    oi = data.get("oi")
+    if not ltp or not oi:
+        return None
+    return {"premium": float(ltp), "oi": float(oi), "timestamp": "live"}
+
+
 def fetch_reference_oi_premium(client, symbol: str, exchange: str,
                                 reference: "ReferenceSnapshot") -> Optional[dict]:
     """OI + premium at the day's fixed Reference Time -- either the previous
@@ -1286,6 +1614,24 @@ def fetch_reference_oi_premium(client, symbol: str, exchange: str,
     bootstrap interval -- see config.reference_gap_bootstrap_interval's own
     comment for why: the regular 15m interval would collapse 09:30 and the
     first 09:35 "current" read onto the identical candle)."""
+    cache_key = (symbol, exchange, reference.reference_date, reference.mode,
+                 reference.reference_time_iso)
+    with _REFERENCE_CACHE_LOCK:
+        hit = _REFERENCE_CACHE.get(cache_key)
+    if hit is not None:
+        return hit
+
+    reading = _fetch_reference_oi_premium_uncached(client, symbol, exchange, reference)
+    if reading is not None:
+        with _REFERENCE_CACHE_LOCK:
+            _REFERENCE_CACHE[cache_key] = reading
+    return reading
+
+
+def _fetch_reference_oi_premium_uncached(client, symbol: str, exchange: str,
+                                          reference: "ReferenceSnapshot") -> Optional[dict]:
+    """The actual fetch. Only a SUCCESSFUL reading is cached -- a None is a
+    transient failure and must be retried on the next check, not remembered."""
     if reference.mode == "prev_close":
         ref_date = datetime.fromisoformat(reference.reference_time_iso).date()
         try:
@@ -1683,6 +2029,13 @@ class MonthlyShortEngine:
             return
 
         if pos.short_symbol:
+            # Finalize FIRST, before the "still entering" guard. An abandoned
+            # half-built leg has its exits satisfied but never both entries
+            # filled, so gating finalize behind that guard left it stuck at
+            # "still entering" forever -- no trade log, no PnL, never flat.
+            if pos.short_exit_filled and pos.hedge_exit_filled:
+                self._finalize_exit(pos, pos.pending_exit_reason)
+                return
             if not (pos.entry_filled and pos.hedge_entry_filled):
                 return  # still entering (short and/or hedge fill unconfirmed) -- watcher owns it
             if (pos.short_exit_order_id and pos.short_exit_filled
@@ -1697,12 +2050,13 @@ class MonthlyShortEngine:
             # Continuous tiered-SL check -- every tick, not gated to a
             # candle boundary (spec item 5).
             self._manage_open_position_bg()
-            # 15:15 daily decision -- only on days that are NOT this cycle's
-            # own 9:30 entry day (spec item 10).
+            # position checks (config.daily_decision_times) -- every day,
+            # including this cycle's own entry day.
             self._maybe_daily_decision_bg()
         else:
-            # Flat -- either the 15:15 daily decision (re-entry search) or
-            # the 9:30 entry evaluation can apply, on mutually exclusive days.
+            # Flat -- a position check's search and the 9:30 entry evaluation
+            # can BOTH apply on an entry day now; see
+            # _maybe_daily_decision_bg for why they cannot double-enter.
             self._maybe_daily_decision_bg()
             self._maybe_evaluate_entry_bg()
 
@@ -1725,14 +2079,166 @@ class MonthlyShortEngine:
 
         self.engine._fill_executor.submit(_run)
 
+    def _place_and_watch_short(self, symbol):
+        """Place the short SELL and confirm it. Assumes the hedge is ALREADY
+        filled -- that is the only state this is ever called from.
+
+        Shared by the entry chain and by every recovery path that ends with a
+        filled hedge and no short (Retry on entry_failed, a hedge that fills
+        during Cancel's final chance, a manually-completed hedge). One copy
+        means the chain cannot differ between the normal path and a repair,
+        which is exactly how the recovery layer fell out of step with the
+        entry order in the first place.
+
+        Does NOT touch _pending_fills -- the caller owns that for its whole
+        chain, so nothing can evaluate the leg mid-repair."""
+        try:
+            order_id = place(self.engine.client, self.engine.env.strategy_tag, symbol,
+                             OPTIONS_EXCHANGE, "SELL", config.quantity)
+        except Exception as exc:
+            Log.exception(f"[MONTHLY_{self.option_type}] short entry placeorder failed for "
+                          f"{symbol}: {exc}")
+            self._enter_error_mode("", "entry_failed", "terminal", "", str(exc))
+            return
+
+        pos = self.leg.position
+        pos.entry_order_id = order_id
+        self.engine.save_state()
+
+        try:
+            fill = poll_fill(self.engine.client, order_id, self.engine.env.strategy_tag, symbol,
+                             OPTIONS_EXCHANGE, "SELL", config.quantity)
+        except OrderNeedsAttention as exc:
+            self._enter_error_mode(order_id, "entry_failed", "resting", exc.order_id, str(exc))
+            return
+        except (RuntimeError, TimeoutError) as exc:
+            self._enter_error_mode(order_id, "entry_failed", "terminal", "", str(exc))
+            return
+        except Exception as exc:
+            Log.exception(f"[MONTHLY_{self.option_type}] short entry fill-poll failed for "
+                          f"{symbol}: {exc}")
+            self._enter_error_mode(order_id, "entry_failed", "resting", order_id, str(exc))
+            return
+
+        pos = self.leg.position
+        if pos.entry_order_id != order_id:
+            return
+        entry_px = float(fill.get("average_price") or fill.get("price") or 0.0)
+        pos.entry_px = entry_px
+        pos.entry_filled = True
+        self.engine.price_stream.add_instruments([{"symbol": symbol, "exchange": OPTIONS_EXCHANGE}])
+        self.engine.save_state()
+        Log.info(f"[MONTHLY_{self.option_type}] Short entry filled: {symbol}@{entry_px} "
+                 f"qty={config.quantity} verdict={pos.entry_trigger_verdict} "
+                 f"delta={pos.delta_at_entry:.3f} -- position fully open.")
+
+    def _abandon_attempt(self, why, user_initiated=False):
+        """Give up on a half-built entry.
+
+        Author 2026-11-02: "any failuer on trade placing, it should be handled
+        manully ... why are you seleling headeg?" -- so this places NO order.
+        An earlier revision sold a live lone hedge automatically; that was an
+        order on the operator's behalf that nobody asked for.
+
+        Three cases, decided from the FILL FLAGS rather than from the error
+        state's name (hedge-first inverted that mapping once already):
+
+        * Nothing filled -> reset the leg to flat. Safe: there is no position.
+        * Something filled, not user initiated -> leave the position EXACTLY
+          as it is, in a terminal error state, and push it to the platform so
+          a human resolves it. Critically it is NOT reset: the filled leg stays
+          recorded, so it keeps its PnL row, keeps its WebSocket subscription,
+          and error_state stops evaluate() entering again and buying a second
+          hedge on top of the live one.
+        * Something filled, user initiated -> the operator pressed Cancel,
+          which is them saying they have dealt with it at the broker. Clear the
+          leg, loudly, because the local record is being discarded while a
+          position may still exist.
+        """
+        pos = self.leg.position
+        short_live = bool(pos.short_symbol) and pos.entry_filled
+        hedge_live = bool(pos.hedge_symbol) and pos.hedge_entry_filled
+
+        if not short_live and not hedge_live:
+            syms = [{"symbol": sym, "exchange": OPTIONS_EXCHANGE}
+                    for sym in (pos.short_symbol, pos.hedge_symbol) if sym]
+            if syms:
+                self.engine.price_stream.remove_instruments(syms)
+            self.leg.position = ShortHedgePosition()
+            self.engine.save_state()
+            Log.info(f"[MONTHLY_{self.option_type}] attempt abandoned ({why}) -- nothing was "
+                     f"filled, leg is flat.")
+            return
+
+        held = ("a short and a hedge" if short_live and hedge_live
+                else ("a short" if short_live else "a hedge"))
+
+        if user_initiated:
+            syms = [{"symbol": sym, "exchange": OPTIONS_EXCHANGE}
+                    for sym in (pos.short_symbol, pos.hedge_symbol) if sym]
+            if syms:
+                self.engine.price_stream.remove_instruments(syms)
+            self.leg.position = ShortHedgePosition()
+            self.engine.save_state()
+            Log.warning(f"[MONTHLY_{self.option_type}] Cancel on a leg that HOLDS {held} "
+                        f"({why}) -- clearing the local record as instructed. The position "
+                        f"itself is NOT closed by this; close it at the broker if it is "
+                        f"still open.")
+            return
+
+        # Not user initiated: stop and ask for a human, through the SAME
+        # mechanism every other failure in this file uses. _enter_error_mode
+        # owns the whole convention -- it writes error_state/kind/order_id/
+        # message/since, derives the action direction from the state, pushes
+        # the leg to the platform so the Retry / Cancel / Manually Completed
+        # buttons appear, logs at error level and notifies Telegram. Writing
+        # those fields by hand here duplicated it and would drift from it.
+        pos.pending_reentry_search = False
+        pos.reentry_slot_hm = ""
+        self._enter_error_mode(
+            "",
+            "entry_failed" if hedge_live and not short_live else "exit_failed",
+            "terminal",
+            "",
+            f"Order placement failed ({why}) while this leg HOLDS {held} at the broker. "
+            f"Nothing was closed automatically. Decide at the broker, then resolve here: "
+            f"Manually Completed with the real fill price if the missing leg did go "
+            f"through, or Cancel once you have closed the position yourself.",
+        )
+
     def _manage_open_position_bg(self):
         self._dispatch_bg(self._manage_open_position)
+
+    def manage_sl_only(self):
+        """The stop-loss path alone, for ticks where the day's Reference
+        Snapshot is not yet fixed (a gap day before 09:45).
+
+        It repeats evaluate()'s guards rather than calling it, because
+        everything else evaluate() reaches -- the entry search and the
+        verdict re-check -- genuinely needs the reference. The SL does not:
+        it compares the live LTP to entry_px, and the OI line
+        _manage_open_position logs uses the position's OWN stored
+        reference_premium/reference_oi, captured at entry.
+        """
+        if self.leg_key in self.engine._pending_fills:
+            return
+        pos = self.leg.position
+        if pos.error_state or not pos.short_symbol:
+            return
+        if not (pos.entry_filled and pos.hedge_entry_filled):
+            return
+        if pos.short_exit_order_id or pos.hedge_exit_order_id:
+            return  # an exit is already in flight -- its watcher owns the leg
+        self._manage_open_position_bg()
 
     def _maybe_evaluate_entry_bg(self):
         """Fires only on this cycle's own start day (the day after the
         prior contract's own expiry), at/after entry_evaluation_time
         (9:30), at most once per calendar day regardless of outcome."""
-        if datetime.now(IST).time() < config.entry_evaluation_time:
+        # Same one-minute buffer as the position checks -- the 09:15-09:30
+        # candle this reads is published a moment after 09:30. The gap-day
+        # path waits for 09:45 separately, via reference_wait_time.
+        if datetime.now(IST).time() < _with_buffer(config.entry_evaluation_time):
             return
         today = datetime.now(IST).date()
         cycle_start = self.engine.get_cycle_start_date()
@@ -1758,17 +2264,43 @@ class MonthlyShortEngine:
         self.engine._fill_executor.submit(_run)
 
     def _maybe_daily_decision_bg(self):
-        """Fires once per calendar day at/after daily_decision_time
-        (15:15), on every day that is NOT this cycle's own 9:30 entry day
-        (spec item 10 -- the two are mutually exclusive per day)."""
-        if datetime.now(IST).time() < config.daily_decision_time:
+        """Fires once per SLOT in config.daily_decision_times (11:30 / 13:30 /
+        15:30), on every day that is NOT this cycle's own 9:30 entry day
+        (spec item 10 -- the two are mutually exclusive per day).
+
+        Was once per calendar day at 15:15. The guard is now keyed on
+        "<date> <HH:MM>" rather than the date alone, so three checks a day
+        each run exactly once and a restart mid-session does not replay the
+        slots already done. A state file written by the previous version
+        holds a bare date, which matches no slot key -- so the first slot
+        after an upgrade simply runs, which is the safe direction.
+
+        Only the LATEST elapsed slot is run. If the process was down over
+        11:30 and 13:30 and starts at 14:00, replaying 11:30 would act on a
+        verdict that is two hours stale; the 13:30 check is the current view
+        of the same position, so that is the one that fires."""
+        now = datetime.now(IST)
+        elapsed = [t for t in config.daily_decision_times
+                   if now.time() >= _with_buffer(t)]
+        if not elapsed:
             return
-        today = datetime.now(IST).date()
-        cycle_start = self.engine.get_cycle_start_date()
-        if cycle_start is not None and today == cycle_start:
-            return  # entry day handles itself via _maybe_evaluate_entry_bg
-        today_key = today.isoformat()
-        if self.leg.last_daily_decision_date == today_key:
+        slot_time = elapsed[-1]
+        today = now.date()
+        # The expiry-day force-close is terminal for the day: no further
+        # check may search or enter, or this leg opens next month's contract
+        # a day before the cycle starts.
+        if self.leg.expiry_closed_date == today.isoformat():
+            return
+        # The entry day is NOT excluded (author 2026-11-01: "trade can be
+        # taken at 9:30 AM or other timing at first day of new expiry"). The
+        # two paths cannot double-enter: _maybe_evaluate_entry_bg marks
+        # last_entry_eval_date once per day whatever the outcome, both paths
+        # dispatch through the same per-leg _eval_pending guard so they
+        # serialise, and _maybe_evaluate_entry_bg is only reached from
+        # evaluate()'s FLAT branch -- so once either has opened a position
+        # the other sees it and takes the verdict path instead.
+        slot_key = f"{today.isoformat()} {slot_time.strftime('%H:%M')}"
+        if self.leg.last_daily_decision_date == slot_key:
             return
         if self.leg_key in self.engine._eval_pending:
             return
@@ -1776,11 +2308,12 @@ class MonthlyShortEngine:
 
         def _run():
             try:
-                self._daily_decision()
+                self._daily_decision(slot_time)
             except Exception as exc:
-                Log.exception(f"[{self.leg_key}] Background daily decision failed: {exc}")
+                Log.exception(f"[{self.leg_key}] Background position check "
+                              f"({slot_key}) failed: {exc}")
             finally:
-                self.leg.last_daily_decision_date = today_key
+                self.leg.last_daily_decision_date = slot_key
                 self.engine.save_state()
                 self.engine._eval_pending.discard(self.leg_key)
 
@@ -1808,7 +2341,13 @@ class MonthlyShortEngine:
         unchanged -- set by _evaluate_entry on a gap day (see
         config.reference_gap_bootstrap_interval), None everywhere else."""
         import time as _time
-        trigger_boundary = datetime.combine(datetime.now(IST).date(), trigger_time, tzinfo=IST)
+        # IST.localize(), never tzinfo=IST: pytz resolves a tzinfo= argument to
+        # the zone's LMT entry, +05:53, which puts this boundary 23 minutes
+        # EARLY -- so a candle a whole slot stale satisfies require_fresh_by and
+        # the freshness gate (and the decision buffer that depends on it) does
+        # nothing. Measured: 11:30 became 11:30+05:53 instead of +05:30.
+        trigger_boundary = IST.localize(
+            datetime.combine(datetime.now(IST).date(), trigger_time))
         max_attempts = config.oi_freshness_max_retries
         for attempt in range(1, max_attempts + 1):
             is_last = attempt == max_attempts
@@ -1883,70 +2422,76 @@ class MonthlyShortEngine:
             entry_trigger_verdict=verdict, delta_at_entry=delta,
             expiry_date=expiry_date_iso,
         )
+        # CAPTURE the cycle's expiry, ONCE, on the first fresh trade of the
+        # cycle. That date is what the 15:30 square-off fires on, and it does
+        # NOT change for the rest of the cycle -- so a position opened after
+        # the 15th in NEXT month's contract is still closed on it.
+        #
+        # Already captured for this cycle is decided from the stored value: a
+        # stored date still in the future belongs to the running cycle and is
+        # left alone; an empty, unreadable or past date means the next capture
+        # is due. No extra flag, and it self-corrects across a restart.
+        today = datetime.now(IST).date()
+        captured = None
+        if leg.marked_expiry:
+            try:
+                captured = datetime.strptime(leg.marked_expiry, "%Y-%m-%d").date()
+            except ValueError:
+                captured = None
+        if captured is not None and captured >= today:
+            Log.info(f"[MONTHLY_{self.option_type}] cycle expiry already captured as "
+                     f"{leg.marked_expiry} -- not rewritten by this trade "
+                     f"(contract traded: {expiry_date_iso}).")
+        else:
+            cycle_expiry = self.engine.get_cycle_expiry_date()
+            if cycle_expiry is None:
+                Log.warning(f"[MONTHLY_{self.option_type}] cycle expiry unavailable -- "
+                            f"NOT captured. The square-off cannot fire until it is, so "
+                            f"this leg must be watched manually.")
+            else:
+                leg.marked_expiry = cycle_expiry.isoformat()
+                Log.info(f"[MONTHLY_{self.option_type}] CAPTURED cycle expiry "
+                         f"{leg.marked_expiry} on this cycle's first fresh trade "
+                         f"(contract traded: {expiry_date_iso}; square-off at "
+                         f"{config.expiry_close_time.strftime('%H:%M')} on the captured "
+                         f"date).")
         self.engine.save_state()
 
+        # HEDGE FIRST, then the short (author 2026-11-01: "headges are bought
+        # first then short position"). The long leg reduces the margin the
+        # short then blocks, and a failure here leaves NO position rather than
+        # the naked short the previous order could leave behind.
         try:
-            order_id = place(self.engine.client, self.engine.env.strategy_tag, symbol,
-                              OPTIONS_EXCHANGE, "SELL", config.quantity)
+            hedge_order_id = place(self.engine.client, self.engine.env.strategy_tag, hedge_symbol,
+                                   OPTIONS_EXCHANGE, "BUY", config.quantity)
         except Exception as exc:
-            Log.exception(f"[MONTHLY_{self.option_type}] short entry placeorder failed for {symbol}: {exc}")
-            self._enter_error_mode("", "entry_failed", "terminal", "", str(exc))
+            Log.exception(f"[MONTHLY_{self.option_type}] hedge entry placeorder failed for "
+                          f"{hedge_symbol}: {exc}")
+            self._enter_error_mode("", "hedge_entry_failed", "terminal", "", str(exc))
             return
 
         leg.trade_count += 1
-        leg.position.entry_order_id = order_id
+        leg.position.hedge_entry_order_id = hedge_order_id
         self.engine.save_state()
 
         self.engine._pending_fills.add(self.leg_key)
-        self.engine._fill_executor.submit(self._watch_entry_fill, order_id, symbol, hedge_symbol)
+        self.engine._fill_executor.submit(self._watch_entry_fill, hedge_order_id, symbol, hedge_symbol)
 
-    def _watch_entry_fill(self, order_id, symbol, hedge_symbol):
-        """Runs on _fill_executor. Confirms the SHORT leg's fill, then --
+    def _watch_entry_fill(self, hedge_order_id, symbol, hedge_symbol):
+        """Runs on _fill_executor. Confirms the HEDGE leg's fill, then --
         still on this same background thread -- places and confirms the
-        HEDGE leg's fill immediately after. _pending_fills is held for the
-        WHOLE chain (short + hedge), released only in the outer `finally`,
-        so evaluate() never touches this leg mid-chain."""
+        SHORT leg's fill immediately after. _pending_fills is held for the
+        WHOLE chain (hedge + short), released only in the outer `finally`,
+        so evaluate() never touches this leg mid-chain.
+
+        Hedge-before-short (author 2026-11-01). If the short cannot be placed
+        or filled after the hedge is in, the leg is left holding a LONG option
+        and routed to error recovery -- a bounded loss, unlike the naked short
+        the previous order left behind when the hedge failed."""
         try:
             try:
-                fill = poll_fill(self.engine.client, order_id, self.engine.env.strategy_tag, symbol,
-                                  OPTIONS_EXCHANGE, "SELL", config.quantity)
-            except OrderNeedsAttention as exc:
-                self._enter_error_mode(order_id, "entry_failed", "resting", exc.order_id, str(exc))
-                return
-            except (RuntimeError, TimeoutError) as exc:
-                self._enter_error_mode(order_id, "entry_failed", "terminal", "", str(exc))
-                return
-            except Exception as exc:
-                Log.exception(f"[MONTHLY_{self.option_type}] short entry fill-poll failed for {symbol}: {exc}")
-                self._enter_error_mode(order_id, "entry_failed", "resting", order_id, str(exc))
-                return
-
-            pos = self.leg.position
-            if pos.entry_order_id != order_id:
-                return  # guard vs. a superseded/stale order
-            entry_px = float(fill.get("average_price") or fill.get("price") or 0.0)
-            pos.entry_px = entry_px
-            pos.entry_filled = True
-            self.engine.price_stream.add_instruments([{"symbol": symbol, "exchange": OPTIONS_EXCHANGE}])
-            self.engine.save_state()
-            Log.info(f"[MONTHLY_{self.option_type}] Short entry filled: {symbol}@{entry_px} "
-                     f"qty={config.quantity} verdict={pos.entry_trigger_verdict} delta={pos.delta_at_entry:.3f}")
-
-            try:
-                hedge_order_id = place(self.engine.client, self.engine.env.strategy_tag, hedge_symbol,
-                                        OPTIONS_EXCHANGE, "BUY", config.quantity)
-            except Exception as exc:
-                Log.exception(f"[MONTHLY_{self.option_type}] hedge entry placeorder failed for "
-                              f"{hedge_symbol}: {exc}")
-                self._enter_error_mode("", "hedge_entry_failed", "terminal", "", str(exc))
-                return
-
-            pos.hedge_entry_order_id = hedge_order_id
-            self.engine.save_state()
-
-            try:
                 hedge_fill = poll_fill(self.engine.client, hedge_order_id, self.engine.env.strategy_tag,
-                                        hedge_symbol, OPTIONS_EXCHANGE, "BUY", config.quantity)
+                                       hedge_symbol, OPTIONS_EXCHANGE, "BUY", config.quantity)
             except OrderNeedsAttention as exc:
                 self._enter_error_mode(hedge_order_id, "hedge_entry_failed", "resting", exc.order_id, str(exc))
                 return
@@ -1956,19 +2501,22 @@ class MonthlyShortEngine:
             except Exception as exc:
                 Log.exception(f"[MONTHLY_{self.option_type}] hedge entry fill-poll failed for "
                               f"{hedge_symbol}: {exc}")
-                self._enter_error_mode(hedge_order_id, "hedge_entry_failed", "resting", hedge_order_id, str(exc))
+                self._enter_error_mode(hedge_order_id, "hedge_entry_failed", "resting",
+                                       hedge_order_id, str(exc))
                 return
 
             pos = self.leg.position
             if pos.hedge_entry_order_id != hedge_order_id:
-                return
+                return  # guard vs. a superseded/stale order
             hedge_px = float(hedge_fill.get("average_price") or hedge_fill.get("price") or 0.0)
             pos.hedge_entry_px = hedge_px
             pos.hedge_entry_filled = True
             self.engine.price_stream.add_instruments([{"symbol": hedge_symbol, "exchange": OPTIONS_EXCHANGE}])
             self.engine.save_state()
             Log.info(f"[MONTHLY_{self.option_type}] Hedge entry filled: {hedge_symbol}@{hedge_px} "
-                     f"qty={config.quantity} -- position fully open.")
+                     f"qty={config.quantity} -- margin benefit in place, selling the short now.")
+
+            self._place_and_watch_short(symbol)
         finally:
             self.engine._pending_fills.discard(self.leg_key)
 
@@ -1977,6 +2525,18 @@ class MonthlyShortEngine:
     # -------------------------------------------------------------------
     def _manage_open_position(self):
         pos = self.leg.position
+
+        # The SL acts only between sl_check_start_time and sl_check_end_time
+        # (author 2026-11-01: "at 9:30 SL check"). Before 09:30 the day's
+        # Reference Snapshot is not yet fixed, so a stop taken then would be
+        # measured against a reference that does not exist; after the close
+        # there is nothing to act on. An overnight gap is therefore judged on
+        # where the premium sits at 09:30, not at the open -- measured over
+        # 679 trades that was worth +Rs 563 and cut the worst single trade
+        # from -Rs 27,430 to -Rs 18,255.
+        now_t = datetime.now(IST).time()
+        if now_t < config.sl_check_start_time or now_t > config.sl_check_end_time:
+            return
 
         ltp = self.engine.price_stream.get_ltp(pos.short_symbol, OPTIONS_EXCHANGE, config.ws_stale_seconds)
         if ltp is None:
@@ -2000,7 +2560,8 @@ class MonthlyShortEngine:
             return
 
         # OI-verdict LOGGING only, once per closed candle -- no action taken
-        # on a signal change here (that's the 15:15 daily decision's job).
+        # on a signal change here (that is a position check's job: 11:30,
+        # 13:30 or 15:30, per config.daily_decision_times).
         boundary = self.engine._last_candle_boundary
         boundary_key = boundary.isoformat() if boundary is not None else None
         if boundary_key is not None and boundary_key != self._last_logged_boundary:
@@ -2016,9 +2577,12 @@ class MonthlyShortEngine:
                 self._last_logged_boundary = boundary_key
 
     # -------------------------------------------------------------------
-    # 15:15 daily decision
+    # Position checks (config.daily_decision_times)
     # -------------------------------------------------------------------
-    def _daily_decision(self):
+    def _daily_decision(self, slot_time: Optional[time] = None):
+        """One position check. `slot_time` is the scheduled time this run
+        belongs to (11:30 / 13:30 / 15:30) and is what the candle-freshness
+        retry measures against; None falls back to the last slot."""
         try:
             self.engine.get_monthly_expiry()  # informational -- feeds whichever entry search fires below
         except RuntimeError as exc:
@@ -2027,32 +2591,125 @@ class MonthlyShortEngine:
         pos = self.leg.position
         today_key = datetime.now(IST).date().isoformat()
 
-        if pos.short_symbol:
-            if pos.expiry_date and pos.expiry_date == today_key:
-                Log.info(f"[MONTHLY_{self.option_type}] open position's own contract expires today -- "
-                         f"force-closing (expiry-day safety close, terminal for today).")
+        # EVERY position is closed on the CURRENT CALENDAR MONTH's expiry date,
+        # whatever contract it is actually holding (author 2026-11-01: "you
+        # will close all postion at current calendar month expiry not trade
+        # position expiry").
+        #
+        # From day 16 these are different dates and the difference is
+        # deliberate. resolve_monthly_expiry rolls a new entry to NEXT month's
+        # contract, so a trade opened on 20-Jun holds the JULY contract and is
+        # MARKED July (leg.marked_expiry, for the audit trail) -- but it is
+        # still squared off on the 30-Jun calendar expiry, after ten days,
+        # rather than being carried to late July.
+        #
+        # The held contract's own expiry stays as a safety net below it: if the
+        # calendar square-off somehow did not happen, a position must still
+        # never be carried past the expiry of the contract it holds.
+        # The square-off fires on the CAPTURED cycle expiry -- the date stored
+        # on this leg by its cycle's first fresh trade -- not on a calendar
+        # lookup made fresh each day. Those differ: on a cycle-start day like
+        # 27-May the calendar month's own expiry (26-May) has already passed.
+        captured_expiry = self.leg.marked_expiry
+        calendar_expiry_today = bool(captured_expiry) and captured_expiry == today_key
+        cm_expiry = captured_expiry or "uncaptured"
+        own_expiry_today = bool(pos.expiry_date) and pos.expiry_date == today_key
+
+        # On the calendar expiry date the day runs NORMALLY until the
+        # square-off (author 2026-11-02: "any new postion taken on current
+        # expiry last day, it will take position on next month, but at 3:30
+        # all position will be closed" / "it hsould follow the rule").
+        #
+        # So an 11:30 or 13:30 entry IS taken, and past day 15 it lands in
+        # next month's contract -- which is then squared off at 15:30 the same
+        # day along with everything else. Entries stop only AT/AFTER the
+        # square-off slot, where opening a position in the same breath as
+        # closing them all would defeat it. An earlier revision refused
+        # entries for the whole of that date, which was more than the rule.
+        slot_now = slot_time or datetime.now(IST).time()
+        entries_blocked = calendar_expiry_today and slot_now >= config.expiry_close_time
+
+        if pos.short_symbol and (calendar_expiry_today or own_expiry_today):
+            # Square off at config.expiry_close_time, not at the first check
+            # that notices. slot_time is None only when something calls
+            # _daily_decision directly; treat that as "now" rather than as the
+            # square-off slot, so a stray call cannot close a position hours
+            # early. The held contract's OWN expiry is the one exception and is
+            # closed immediately -- carrying it past that is not a choice.
+            # Defer to config.expiry_close_time. The only exception is a held
+            # contract expiring today when today is NOT a calendar expiry --
+            # then it is closed at once, because carrying it past its own
+            # expiry is not a choice. An earlier revision wrote this as
+            # "calendar and not own", which never deferred in the NORMAL case
+            # (a position holding the current month's contract on its own
+            # expiry day satisfies BOTH), so the square-off fired at 11:30
+            # instead of 15:30 -- the opposite of the config's own comment.
+            if slot_now < config.expiry_close_time and not (
+                    own_expiry_today and not calendar_expiry_today):
+                # Before the square-off slot the 11:30 and 13:30 checks are
+                # ordinary: the verdict branch runs, a flip closes the
+                # position, and a re-entry may follow. Only at/after
+                # expiry_close_time do entries stop. Two earlier revisions
+                # over-reached here -- one suppressed the verdict check for the
+                # whole day, the other kept the check but refused all entries.
+                pass
+            else:
+                why = ("held contract's own expiry" if own_expiry_today
+                       else f"calendar month expiry {cm_expiry}")
+                Log.info(f"[MONTHLY_{self.option_type}] square-off ({why}) at "
+                         f"{config.expiry_close_time.strftime('%H:%M')} -- closing short "
+                         f"then hedge, terminal for today. Marked expiry of the closed "
+                         f"trade: {pos.expiry_date or self.leg.marked_expiry or 'unknown'}.")
                 pos.pending_reentry_search = False
+                pos.reentry_slot_hm = ""
+                self.leg.expiry_closed_date = today_key
+                self.engine.save_state()
                 self._exit(pos, "expiry_day_close")
                 return  # terminal -- no new-position search follows today
 
-            verdict = self._reclassify_with_retry(pos, config.daily_decision_time)
+        if pos.short_symbol:
+            verdict = self._reclassify_with_retry(pos, slot_time or config.daily_decision_time)
             if verdict is None:
-                Log.warning(f"[MONTHLY_{self.option_type}] fresh OI re-check unavailable this cycle -- "
-                            f"holding, will retry the daily decision tomorrow.")
+                Log.warning(f"[MONTHLY_{self.option_type}] fresh OI re-check unavailable this slot -- "
+                            f"holding, will retry at the next position check.")
                 return
-            if verdict == "accumulation":
-                Log.info(f"[MONTHLY_{self.option_type}] daily decision: still accumulation -- holding.")
+            if verdict == config.hold_verdict:
+                Log.info(f"[MONTHLY_{self.option_type}] position check: still "
+                         f"{config.hold_verdict} -- holding.")
                 return
-            Log.info(f"[MONTHLY_{self.option_type}] daily decision: no longer accumulation "
-                     f"(verdict={verdict}) -- closing short then hedge, will search for a fresh "
-                     f"qualifying strike once closed.")
-            pos.pending_reentry_search = True
+            Log.info(f"[MONTHLY_{self.option_type}] position check: no longer "
+                     f"{config.hold_verdict} (verdict={verdict}) -- closing short then hedge, "
+                     f"will search for a fresh qualifying strike once closed.")
+            # A re-entry is armed unless entries are blocked -- i.e. unless we
+            # are at/after the square-off slot on the calendar expiry date.
+            pos.pending_reentry_search = not entries_blocked
+            pos.reentry_slot_hm = ("" if entries_blocked
+                                   else (slot_time or config.daily_decision_time).strftime("%H:%M"))
+            if entries_blocked:
+                self.leg.expiry_closed_date = today_key
             self._exit(pos, "opposite_signal")
             return
 
         # Flat -- closed earlier today by a WS-driven SL hit, or simply
-        # never entered -- search for a fresh qualifying strike.
-        self._search_and_enter_fresh()
+        # never entered -- search for a fresh qualifying strike, anchored to
+        # this slot.
+        #
+        # Except on the calendar expiry date: no FRESH entry that day. The
+        # day's whole purpose is to close the cycle out at
+        # config.expiry_close_time, and past day 15 a search resolves to NEXT
+        # month's contract -- so an 11:30 entry would open a position that is
+        # squared off at 15:30 the same day, paying both ways for nothing.
+        # This guard belongs HERE, in the flat branch: an earlier revision put
+        # it above the position-held branch, which silently stopped 11:30 and
+        # 13:30 re-checking an OPEN position's verdict on that date -- the
+        # opposite of what its own comment claimed.
+        if entries_blocked:
+            Log.info(f"[MONTHLY_{self.option_type}] calendar month expiry ({cm_expiry}) "
+                     f"square-off slot -- flat and taking no fresh entry.")
+            self.leg.expiry_closed_date = today_key
+            self.engine.save_state()
+            return
+        self._search_and_enter_fresh(slot_time)
 
     def _fresh_oi_reclassify(self, pos, require_fresh_by: Optional[datetime] = None) -> Optional[str]:
         """Always re-fetched, NEVER cached -- fetch_candle_oi_premium's own
@@ -2060,8 +2717,17 @@ class MonthlyShortEngine:
         per AUTHORING_CHECKLIST.md's preferred pattern. May raise
         CandleNotYetFresh (propagated, not caught here) when require_fresh_by
         is given -- caller (_reclassify_with_retry) owns the retry loop."""
-        current = fetch_candle_oi_premium(self.engine.client, pos.short_symbol, OPTIONS_EXCHANGE,
-                                           require_fresh_by=require_fresh_by)
+        # Same basis as the entry verdict: a live reading when the broker gives
+        # one, else the candle. Keeping the two sides on different bases would
+        # mean a position entered on a live verdict is judged on a candle one.
+        current = None
+        if config.use_live_oi_for_current:
+            current = fetch_live_oi_premium(self.engine.client, pos.short_symbol,
+                                            OPTIONS_EXCHANGE)
+        if current is None:
+            current = fetch_candle_oi_premium(self.engine.client, pos.short_symbol,
+                                               OPTIONS_EXCHANGE,
+                                               require_fresh_by=require_fresh_by)
         ref_reading = fetch_reference_oi_premium(
             self.engine.client, pos.short_symbol, OPTIONS_EXCHANGE, self.engine.state.reference
         )
@@ -2076,7 +2742,13 @@ class MonthlyShortEngine:
         the daily-decision's fresh re-check of an already-open position's
         own OI verdict."""
         import time as _time
-        trigger_boundary = datetime.combine(datetime.now(IST).date(), trigger_time, tzinfo=IST)
+        # IST.localize(), never tzinfo=IST: pytz resolves a tzinfo= argument to
+        # the zone's LMT entry, +05:53, which puts this boundary 23 minutes
+        # EARLY -- so a candle a whole slot stale satisfies require_fresh_by and
+        # the freshness gate (and the decision buffer that depends on it) does
+        # nothing. Measured: 11:30 became 11:30+05:53 instead of +05:30.
+        trigger_boundary = IST.localize(
+            datetime.combine(datetime.now(IST).date(), trigger_time))
         max_attempts = config.oi_freshness_max_retries
         for attempt in range(1, max_attempts + 1):
             is_last = attempt == max_attempts
@@ -2090,7 +2762,7 @@ class MonthlyShortEngine:
                 _time.sleep(config.oi_freshness_retry_delay_sec)
         return None  # unreachable in practice -- the last attempt's fresh_gate is None
 
-    def _search_and_enter_fresh(self):
+    def _search_and_enter_fresh(self, slot_time: Optional[time] = None):
         spot = self.engine.get_spot_ltp()
         if spot is None:
             Log.warning(f"[MONTHLY_{self.option_type}] spot LTP unavailable for daily-decision "
@@ -2102,7 +2774,8 @@ class MonthlyShortEngine:
             Log.warning(f"[MONTHLY_{self.option_type}] expiry resolution failed: {exc}")
             return
         try:
-            result = self._select_qualifying_strike_with_retry(spot, expiry_raw, config.daily_decision_time)
+            result = self._select_qualifying_strike_with_retry(
+                spot, expiry_raw, slot_time or config.daily_decision_time)
         except RuntimeError as exc:
             Log.warning(f"[MONTHLY_{self.option_type}] daily-decision strike selection failed: {exc}")
             return
@@ -2129,6 +2802,31 @@ class MonthlyShortEngine:
     def _exit(self, pos, reason):
         if pos.short_exit_order_id and not pos.short_exit_filled:
             return  # already in flight
+
+        # A leg can be HALF BUILT -- under hedge-first, an entry_failed leaves
+        # the hedge filled and the short never placed. Buying short_symbol then
+        # would OPEN a new unmanaged long at the short strike rather than close
+        # anything, and _finalize_exit would book (0 - exit_px) * qty because
+        # entry_px is still 0.0. An unfilled leg is marked exit-satisfied so
+        # the chain and _finalize_exit see one consistent picture.
+        pos.pending_exit_reason = reason
+        if not pos.entry_filled:
+            Log.warning(f"[MONTHLY_{self.option_type}] exit ({reason}): the short was never "
+                        f"filled -- nothing to buy back, going straight to the hedge.")
+            pos.short_exit_order_id = ""
+            pos.short_exit_filled = True
+            pos.short_exit_fill_px = None
+            self.engine.save_state()
+            self.engine._pending_fills.add(self.leg_key)
+            self.engine._fill_executor.submit(self._exit_hedge_leg)
+            return
+        if not pos.hedge_entry_filled:
+            Log.warning(f"[MONTHLY_{self.option_type}] exit ({reason}): the hedge was never "
+                        f"filled -- the short alone will be bought back.")
+            pos.hedge_exit_order_id = ""
+            pos.hedge_exit_filled = True
+            pos.hedge_exit_fill_px = None
+
         try:
             order_id = place(self.engine.client, self.engine.env.strategy_tag, pos.short_symbol,
                               OPTIONS_EXCHANGE, "BUY", pos.quantity)
@@ -2210,6 +2908,64 @@ class MonthlyShortEngine:
         finally:
             self.engine._pending_fills.discard(self.leg_key)
 
+    def _exit_hedge_leg(self):
+        """Sell the hedge and confirm it, without a short to buy back first.
+
+        Used when the short was never filled -- _exit marks that leg's exit
+        satisfied and comes straight here. Holds _pending_fills for its own
+        chain and finalizes when both exit flags are set, so an abandoned
+        half-built leg still produces a trade-log row, a PnL entry and a flat
+        leg, instead of sitting at evaluate()'s "still entering" guard
+        forever."""
+        try:
+            pos = self.leg.position
+            if not pos.hedge_entry_filled:
+                # Nothing was filled at all -- there is no order to place.
+                pos.hedge_exit_order_id = ""
+                pos.hedge_exit_filled = True
+                pos.hedge_exit_fill_px = None
+                self.engine.save_state()
+                self._finalize_exit(pos, pos.pending_exit_reason)
+                return
+            try:
+                hedge_order_id = place(self.engine.client, self.engine.env.strategy_tag,
+                                       pos.hedge_symbol, OPTIONS_EXCHANGE, "SELL", pos.quantity)
+            except Exception as exc:
+                Log.exception(f"[MONTHLY_{self.option_type}] hedge-only exit placeorder failed for "
+                              f"{pos.hedge_symbol}: {exc}")
+                self._enter_error_mode("", "hedge_exit_failed", "terminal", "", str(exc))
+                return
+            pos.hedge_exit_order_id = hedge_order_id
+            pos.hedge_exit_filled = False
+            self.engine.save_state()
+            try:
+                hedge_fill = poll_fill(self.engine.client, hedge_order_id,
+                                       self.engine.env.strategy_tag, pos.hedge_symbol,
+                                       OPTIONS_EXCHANGE, "SELL", pos.quantity)
+            except OrderNeedsAttention as exc:
+                self._enter_error_mode(hedge_order_id, "hedge_exit_failed", "resting",
+                                       exc.order_id, str(exc))
+                return
+            except (RuntimeError, TimeoutError) as exc:
+                self._enter_error_mode(hedge_order_id, "hedge_exit_failed", "terminal", "", str(exc))
+                return
+            except Exception as exc:
+                Log.exception(f"[MONTHLY_{self.option_type}] hedge-only exit fill-poll failed: {exc}")
+                self._enter_error_mode(hedge_order_id, "hedge_exit_failed", "resting",
+                                       hedge_order_id, str(exc))
+                return
+            pos = self.leg.position
+            if pos.hedge_exit_order_id != hedge_order_id:
+                return
+            pos.hedge_exit_fill_px = float(hedge_fill.get("average_price")
+                                           or hedge_fill.get("price") or 0.0)
+            pos.hedge_exit_filled = True
+            self.engine.save_state()
+            if pos.short_exit_filled:
+                self._finalize_exit(pos, pos.pending_exit_reason)
+        finally:
+            self.engine._pending_fills.discard(self.leg_key)
+
     def _finalize_exit(self, pos, reason):
         leg = self.leg
         # NOTE: manual_exit_px is a single field shared across both
@@ -2221,22 +2977,33 @@ class MonthlyShortEngine:
         # read here (it would misapply one leg's override to the other).
         short_exit_px = pos.short_exit_fill_px if pos.short_exit_fill_px is not None else pos.entry_px
         hedge_exit_px = pos.hedge_exit_fill_px if pos.hedge_exit_fill_px is not None else pos.hedge_entry_px
+        # A leg that never filled contributes nothing. Without this an
+        # abandoned half-built position books (0 - exit_px) * qty against the
+        # leg that was never opened, because entry_px is still 0.0.
+        short_was_open = pos.entry_filled
+        hedge_was_open = pos.hedge_entry_filled
 
         # Short: sold high (entry_px), bought back (short_exit_px) -- profit
         # when short_exit_px < entry_px. Hedge: bought (hedge_entry_px),
         # sold (hedge_exit_px) -- profit when hedge_exit_px > hedge_entry_px.
-        short_pnl_rupees = (pos.entry_px - short_exit_px) * pos.quantity
-        hedge_pnl_rupees = (hedge_exit_px - pos.hedge_entry_px) * pos.quantity
+        short_pnl_rupees = ((pos.entry_px - short_exit_px) * pos.quantity
+                            if short_was_open else 0.0)
+        hedge_pnl_rupees = ((hedge_exit_px - pos.hedge_entry_px) * pos.quantity
+                            if hedge_was_open else 0.0)
         total_pnl_rupees = short_pnl_rupees + hedge_pnl_rupees
         self.engine.state.today_realized_pnl += total_pnl_rupees
 
         now_iso = datetime.now(IST).isoformat()
-        append_trade_log(self.engine.env.strategy_tag, self.leg_key, pos.short_symbol, pos.quantity,
-                          pos.entry_time, pos.entry_px, now_iso, short_exit_px, reason,
-                          pos.execution_id, is_short=True)
-        append_trade_log(self.engine.env.strategy_tag, f"{self.leg_key}_HEDGE", pos.hedge_symbol, pos.quantity,
-                          pos.entry_time, pos.hedge_entry_px, now_iso, hedge_exit_px, reason,
-                          pos.execution_id, is_short=False)
+        # One row per leg that was genuinely OPEN. Logging a leg that never
+        # filled would put a phantom trade in the platform's trade book.
+        if short_was_open:
+            append_trade_log(self.engine.env.strategy_tag, self.leg_key, pos.short_symbol, pos.quantity,
+                              pos.entry_time, pos.entry_px, now_iso, short_exit_px, reason,
+                              pos.execution_id, is_short=True)
+        if hedge_was_open:
+            append_trade_log(self.engine.env.strategy_tag, f"{self.leg_key}_HEDGE", pos.hedge_symbol,
+                              pos.quantity, pos.entry_time, pos.hedge_entry_px, now_iso, hedge_exit_px,
+                              reason, pos.execution_id, is_short=False)
         Log.info(f"[MONTHLY_{self.option_type}] Position closed: short={pos.short_symbol} "
                  f"hedge={pos.hedge_symbol} reason={reason} short_pnl={short_pnl_rupees:.2f} "
                  f"hedge_pnl={hedge_pnl_rupees:.2f} total_pnl={total_pnl_rupees:.2f}")
@@ -2247,15 +3014,59 @@ class MonthlyShortEngine:
         ])
         self.engine._notify_trade_closed_bg()
         reentry_search = pos.pending_reentry_search
+        reentry_slot_hm = pos.reentry_slot_hm
+        # ANY exit on the held contract's own expiry day makes the day
+        # terminal for this leg, not just the scheduled square-off. Without
+        # this, a stop loss at 12:00 on expiry day leaves the leg flat and the
+        # next check's flat branch searches -- and resolve_monthly_expiry's
+        # day>15 rule hands it NEXT month's contract, opening a position a day
+        # before that cycle is allowed to start, which then suppresses the
+        # cycle-start day's own entry evaluation.
+        today_iso = datetime.now(IST).date().isoformat()
+        # The captured cycle expiry, for the same reason as the square-off.
+        on_an_expiry_date = (pos.expiry_date and pos.expiry_date == today_iso) or (
+            leg.marked_expiry == today_iso)
+        # Terminal only for the SQUARE-OFF itself, or for an exit at/after its
+        # slot. A stop loss at 12:00 on the calendar expiry date must NOT
+        # block the 13:30 re-entry, because entries are allowed that day right
+        # up to the square-off.
+        if on_an_expiry_date and (reason == "expiry_day_close"
+                                  or datetime.now(IST).time() >= config.expiry_close_time):
+            # ANY exit on the marked expiry's own date makes the day terminal
+            # for this leg, not just the scheduled square-off. Without this a
+            # stop loss at 12:00 on that date leaves the leg flat, and the next
+            # check's flat branch searches -- past day 15 that search resolves
+            # to the FOLLOWING month's contract, opening a position a day
+            # before its cycle starts and then suppressing that cycle-start
+            # day's own entry evaluation.
+            leg.expiry_closed_date = today_iso
+            Log.info(f"[MONTHLY_{self.option_type}] exit fell on an expiry date "
+                     f"({today_iso}) -- no further search or entry today.")
         leg.position = ShortHedgePosition()
         self.engine.save_state()
+
+        # An exit that fell on an expiry date already marked the day terminal
+        # above; honour that here too. Otherwise the leg logs "no further
+        # search or entry today" and then immediately dispatches one.
+        if reentry_search and leg.expiry_closed_date == today_iso:
+            Log.info(f"[MONTHLY_{self.option_type}] re-entry suppressed -- the day is "
+                     f"terminal for this leg ({today_iso}).")
+            reentry_search = False
 
         if reentry_search:
             # Spec item 10's "close short, then hedge, then search for a
             # new qualifying strike and re-enter if one qualifies" --
             # backgrounded like every other entry-eval call (see
             # _maybe_evaluate_entry_bg's identical rationale).
-            self._dispatch_bg(self._search_and_enter_fresh)
+            slot = None
+            if reentry_slot_hm:
+                try:
+                    hh, mm = (int(x) for x in reentry_slot_hm.split(":"))
+                    slot = time(hh, mm)
+                except ValueError:
+                    Log.warning(f"[{self.leg_key}] unreadable reentry slot "
+                                f"{reentry_slot_hm!r} -- anchoring to the last check.")
+            self._dispatch_bg(lambda: self._search_and_enter_fresh(slot))
 
     # -------------------------------------------------------------------
     # Error recovery -- Retry/Cancel/Manually-Completed, per
@@ -2323,28 +3134,15 @@ class MonthlyShortEngine:
                 ack_pending_action(self.engine.env, self.leg_key)
                 return
             if kind == "terminal":
-                if error_state == "entry_failed":
-                    # The short leg never entered -- the whole attempted
-                    # position is abandoned (no hedge was ever placed yet).
-                    self.engine.price_stream.remove_instruments(
-                        [{"symbol": pos.short_symbol, "exchange": OPTIONS_EXCHANGE}]
-                    )
-                    self.leg.position = ShortHedgePosition()
-                else:
-                    # Hedge entry failed terminally -- the short leg is
-                    # already live and naked; leave it open (don't discard
-                    # the whole position) and just clear this error so the
-                    # daily-decision/SL logic keeps managing the short leg.
-                    # A human should re-hedge manually via the broker if
-                    # desired -- Cancel here means "give up trying to place
-                    # this specific hedge order automatically."
-                    pos.hedge_entry_order_id = ""
-                    pos.error_state = ""
-                    pos.error_kind = ""
-                    pos.error_order_id = ""
-                self.engine.save_state()
+                # Cancel on a terminal ENTRY-side error: give up on this
+                # attempt. _abandon_attempt reads what is actually filled --
+                # under hedge-first, entry_failed means a LONG is live and
+                # must be closed, not discarded, and hedge_entry_failed means
+                # nothing is live and the leg resets. Deciding that from the
+                # error state's NAME is what broke when the order reversed.
                 self.engine._push_leg_error_bg(self.leg_key, self.leg.position, clear=True)
                 ack_pending_action(self.engine.env, self.leg_key)
+                self._abandon_attempt("cancelled", user_initiated=True)
                 return
             ack_pending_action(self.engine.env, self.leg_key)
             self.engine._pending_fills.add(self.leg_key)
@@ -2378,6 +3176,20 @@ class MonthlyShortEngine:
                 self.engine.price_stream.add_instruments(
                     [{"symbol": pos.hedge_symbol, "exchange": OPTIONS_EXCHANGE}]
                 )
+                # Hedge-first: a manually-completed HEDGE leaves the position
+                # half built, so the short still has to be placed. Backgrounded
+                # under _pending_fills like every other order chain.
+                if pos.short_symbol and not pos.entry_filled and not pos.entry_order_id:
+                    short_symbol = pos.short_symbol
+                    self.engine._pending_fills.add(self.leg_key)
+
+                    def _continue_into_short():
+                        try:
+                            self._place_and_watch_short(short_symbol)
+                        finally:
+                            self.engine._pending_fills.discard(self.leg_key)
+
+                    self.engine._fill_executor.submit(_continue_into_short)
             else:
                 pos.entry_filled = True
                 pos.entry_px = fill_price
@@ -2461,33 +3273,50 @@ class MonthlyShortEngine:
             self.engine.save_state()
             self.engine._push_leg_error_bg(self.leg_key, pos, clear=True)
             if error_state == "hedge_entry_failed":
-                # Resume the hedge-fill leg only -- the short leg is
-                # already confirmed filled.
-                def _watch_hedge_only():
+                # The hedge is the FIRST leg now, so resuming it must carry on
+                # into the short afterwards -- _watch_entry_fill is exactly
+                # that chain, starting from a hedge order id. Resuming the
+                # hedge alone would leave short_symbol set with nothing filled,
+                # which evaluate()'s "still entering" guard freezes forever.
+                self.engine._fill_executor.submit(
+                    self._watch_entry_fill, resume_order_id, pos.short_symbol, symbol
+                )
+            else:
+                # entry_failed: the HEDGE is already filled and only the short
+                # needs confirming, so resume the short alone. Handing this
+                # order id to _watch_entry_fill would poll it as a BUY on the
+                # hedge symbol, and the hedge_entry_order_id guard inside would
+                # then return silently -- a live short whose fill is never
+                # recorded.
+                def _watch_short_only():
                     try:
-                        hedge_fill = poll_fill(self.engine.client, resume_order_id, self.engine.env.strategy_tag,
-                                                symbol, OPTIONS_EXCHANGE, "BUY", quantity)
+                        fill = poll_fill(self.engine.client, resume_order_id,
+                                         self.engine.env.strategy_tag, symbol,
+                                         OPTIONS_EXCHANGE, "SELL", quantity)
                         p = self.leg.position
-                        if p.hedge_entry_order_id != resume_order_id:
+                        if p.entry_order_id != resume_order_id:
                             return
-                        p.hedge_entry_px = float(hedge_fill.get("average_price") or hedge_fill.get("price") or 0.0)
-                        p.hedge_entry_filled = True
+                        p.entry_px = float(fill.get("average_price") or fill.get("price") or 0.0)
+                        p.entry_filled = True
                         self.engine.price_stream.add_instruments(
                             [{"symbol": symbol, "exchange": OPTIONS_EXCHANGE}]
                         )
                         self.engine.save_state()
+                        Log.info(f"[MONTHLY_{self.option_type}] Retry-resumed short filled: "
+                                 f"{symbol}@{p.entry_px} -- position fully open.")
                     except OrderNeedsAttention as exc:
-                        self._enter_error_mode(resume_order_id, "hedge_entry_failed", "resting", exc.order_id, str(exc))
+                        self._enter_error_mode(resume_order_id, "entry_failed", "resting",
+                                               exc.order_id, str(exc))
                     except (RuntimeError, TimeoutError) as exc:
-                        self._enter_error_mode(resume_order_id, "hedge_entry_failed", "terminal", "", str(exc))
+                        self._enter_error_mode(resume_order_id, "entry_failed", "terminal", "", str(exc))
                     except Exception as exc:
-                        Log.exception(f"[MONTHLY_{self.option_type}] Retry-resumed hedge fill-poll failed: {exc}")
-                        self._enter_error_mode(resume_order_id, "hedge_entry_failed", "resting", resume_order_id, str(exc))
+                        Log.exception(f"[MONTHLY_{self.option_type}] Retry-resumed short fill-poll "
+                                      f"failed: {exc}")
+                        self._enter_error_mode(resume_order_id, "entry_failed", "resting",
+                                               resume_order_id, str(exc))
                     finally:
                         self.engine._pending_fills.discard(self.leg_key)
-                self.engine._fill_executor.submit(_watch_hedge_only)
-            else:
-                self.engine._fill_executor.submit(self._watch_entry_fill, resume_order_id, symbol, pos.hedge_symbol)
+                self.engine._fill_executor.submit(_watch_short_only)
         except Exception as exc:
             Log.exception(f"[MONTHLY_{self.option_type}] Retry resolution failed unexpectedly: {exc}")
             self.engine._pending_fills.discard(self.leg_key)
@@ -2517,19 +3346,38 @@ class MonthlyShortEngine:
                 self.engine.price_stream.add_instruments([{"symbol": symbol, "exchange": OPTIONS_EXCHANGE}])
                 self.engine.save_state()
                 Log.info(f"[MONTHLY_{self.option_type}] Entry filled during Cancel's final chance: {symbol}")
+                if is_hedge:
+                    # The hedge is the FIRST leg: it filling means the position
+                    # is only half built, so the chain must carry on into the
+                    # short. Clearing the error here and stopping (which is
+                    # what this did) left short_symbol set with nothing filled
+                    # -- frozen by evaluate()'s "still entering" guard, with no
+                    # stop loss and no exit.
+                    Log.info(f"[MONTHLY_{self.option_type}] hedge filled on the final chance -- "
+                             f"continuing into the short leg.")
+                    self._place_and_watch_short(pos.short_symbol)
             else:
                 try:
                     self.engine.client.cancelorder(order_id=order_id, strategy=self.engine.env.strategy_tag)
                 except Exception as exc:
                     Log.warning(f"[MONTHLY_{self.option_type}] cancelorder failed while abandoning entry "
-                                f"({exc}) -- clearing local position anyway; verify manually at the broker.")
-                self.engine.price_stream.remove_instruments([{"symbol": symbol, "exchange": OPTIONS_EXCHANGE}])
+                                f"({exc}) -- proceeding; verify manually at the broker.")
                 if is_hedge:
                     pos.hedge_entry_order_id = ""
-                else:
-                    self.leg.position = ShortHedgePosition()
+                pos.error_state = ""
+                pos.error_kind = ""
+                pos.error_order_id = ""
                 self.engine.save_state()
-            self.engine._push_leg_error_bg(self.leg_key, self.leg.position, clear=True)
+                # Closes whatever is genuinely filled before resetting -- under
+                # hedge-first, an unfilled SHORT order leaves a live long that
+                # a blind reset would have erased.
+                self._abandon_attempt("cancel_final_chance", user_initiated=True)
+            # Only clear the UI error if nothing raised a NEW one in between --
+            # _place_and_watch_short and _abandon_attempt can both fail, and
+            # clearing then hid the error locally with nothing shown to the
+            # operator to resolve.
+            if not self.leg.position.error_state:
+                self.engine._push_leg_error_bg(self.leg_key, self.leg.position, clear=True)
         except Exception as exc:
             Log.exception(f"[MONTHLY_{self.option_type}] Unexpected error during Cancel's final chance: {exc}")
             self._enter_error_mode(order_id, error_state, "resting", order_id, str(exc))
@@ -2554,6 +3402,9 @@ class StrategyEngine:
         self.monthly = {ot: MonthlyShortEngine(ot, self) for ot in OPTION_TYPES}
 
         self._monthly_expiry_cache: Optional[tuple] = None
+
+        self._cm_expiry_date_cache: Optional[tuple] = None
+        self._cycle_expiry_date_cache: Optional[tuple] = None
         self._cycle_start_date_cache: Optional[tuple] = None
         self._last_candle_boundary: Optional[datetime] = None
 
@@ -2616,6 +3467,41 @@ class StrategyEngine:
         Log.info(f"Monthly expiry resolved: {raw} ({compact})")
         return compact, raw
 
+    def get_cycle_expiry_date(self) -> Optional["datetime.date"]:
+        """Cached per calendar day. Any failure returns None and is logged --
+        a None here means "unknown", never "not an expiry day"."""
+        today = datetime.now(IST).date().isoformat()
+        if self._cycle_expiry_date_cache and self._cycle_expiry_date_cache[0] == today:
+            return self._cycle_expiry_date_cache[1]
+        try:
+            d = resolve_cycle_expiry_date(self.client)
+        except Exception as exc:
+            Log.warning(f"resolve_cycle_expiry_date failed: {exc}")
+            return None
+        self._cycle_expiry_date_cache = (today, d)
+        Log.info(f"Cycle expiry date resolved: {d}")
+        return d
+
+    def get_current_month_expiry_date(self) -> Optional["datetime.date"]:
+        """Cached per calendar day, like get_cycle_start_date. A resolution
+        failure returns None and is logged, never guessed."""
+        today = datetime.now(IST).date().isoformat()
+        if self._cm_expiry_date_cache and self._cm_expiry_date_cache[0] == today:
+            return self._cm_expiry_date_cache[1]
+        try:
+            d = resolve_current_month_expiry_date(self.client)
+        except Exception as exc:
+            # Any failure, not just RuntimeError. This is called from
+            # run_cycle and from _finalize_exit, so a transport error escaping
+            # here aborted the whole cycle -- the continuous stop loss with it
+            # -- on every tick, and could abort startup via
+            # reconcile_pending_orders.
+            Log.warning(f"resolve_current_month_expiry_date failed: {exc}")
+            return None
+        self._cm_expiry_date_cache = (today, d)
+        Log.info(f"Current calendar month expiry resolved: {d}")
+        return d
+
     def get_cycle_start_date(self) -> Optional["datetime.date"]:
         today = datetime.now(IST).date().isoformat()
         if self._cycle_start_date_cache and self._cycle_start_date_cache[0] == today:
@@ -2644,6 +3530,9 @@ class StrategyEngine:
             # makes them stale without needing an explicit reset).
             self._monthly_expiry_cache = None
             self._cycle_start_date_cache = None
+            self._cm_expiry_date_cache = None
+            self._cycle_expiry_date_cache = None
+            clear_reference_cache()
             self.save_state()
 
     def _ensure_reference(self):
@@ -2655,8 +3544,11 @@ class StrategyEngine:
             return
 
         now = datetime.now(IST).time()
-        if now < config.reference_check_time:
-            return  # too early, wait for 09:30
+        # +config.decision_buffer_min, same as every other scheduled read: the
+        # previous day's closing candle is long published, but the gap test
+        # also needs today's spot and the broker can lag a moment at the open.
+        if now < _with_buffer(config.reference_check_time):
+            return  # too early, wait for 09:30 (+buffer)
 
         spot_now = self.get_spot_ltp()
         if spot_now is None:
@@ -2667,7 +3559,12 @@ class StrategyEngine:
         # pytz timezones must be applied via .localize(), never passed as a
         # naive tzinfo= argument -- see Nifty_OI_WeeklyBuy_MonthlySell's
         # identical comment for the LMT-offset corruption this avoids.
-        prev_close_at = IST.localize(datetime.combine(prev_day, time(15, 30)))
+        # Derived from config.market_close, not a literal 15:30: the session
+        # ends at 15:40, and asking for the candle at-or-before 15:30 would
+        # take a reference that ignores the last ten minutes of the previous
+        # day -- every premium_change and oi_change all day is measured from
+        # this one number.
+        prev_close_at = IST.localize(datetime.combine(prev_day, config.market_close))
         prev_close_data = fetch_candle_oi_premium(
             self.client, UNDERLYING_SYMBOL, UNDERLYING_SPOT_EXCHANGE,
             at_or_before=prev_close_at,
@@ -2689,9 +3586,14 @@ class StrategyEngine:
                      f"Reference Time = previous day's close ({prev_day})")
             return
 
-        if now < config.reference_wait_time:
+        # The gap path's 09:45 read is a CANDLE read, so it takes the buffer
+        # too -- asking at exactly 09:45:00 can return the 09:40 bucket.
+        # ref.reference_time_iso below stays anchored at 09:30: the buffer
+        # moves when we look, never which candle we want.
+        if now < _with_buffer(config.reference_wait_time):
             Log.info(f"[Reference] gap={gap_pct:+.3f}% (> {config.gap_threshold_pct}%) -- "
-                     f"waiting for 09:35 candle to close.")
+                     f"waiting for the {config.reference_wait_time.strftime('%H:%M')} "
+                     f"candle to close.")
             return
 
         ref.reference_date = today_key
@@ -2826,6 +3728,15 @@ class StrategyEngine:
 
             self._ensure_reference()
             if not self.state.reference.computed:
+                # The SL needs no reference -- it compares LTP to entry_px --
+                # and on a gap day the reference is not fixed until 09:45.
+                # Returning outright here left an open position unwatched for
+                # that whole window, which moving reference_wait_time from
+                # 09:35 to 09:45 made ten minutes longer. Everything that DOES
+                # need the reference (entry search, verdict re-check) still
+                # waits for it.
+                for ot in OPTION_TYPES:
+                    self.monthly[ot].manage_sl_only()
                 return
 
             new_candle = self._new_candle_closed()
@@ -2854,22 +3765,27 @@ class StrategyEngine:
             pos = leg.position
             if pos.error_state:
                 continue
-            if pos.entry_order_id and not pos.entry_filled:
-                self._reconcile_one(leg_key, leg, pos, pos.entry_order_id, "entry_failed", pos.short_symbol, "SELL")
-            elif pos.hedge_entry_order_id and not pos.hedge_entry_filled:
+            # Walked in the order the legs are PLACED -- hedge first since
+            # 2026-11-01. Reversing the entry without reversing this chain
+            # would misread where a crash landed.
+            if pos.hedge_entry_order_id and not pos.hedge_entry_filled:
                 self._reconcile_one(leg_key, leg, pos, pos.hedge_entry_order_id, "hedge_entry_failed",
                                      pos.hedge_symbol, "BUY")
+            elif pos.entry_order_id and not pos.entry_filled:
+                self._reconcile_one(leg_key, leg, pos, pos.entry_order_id, "entry_failed", pos.short_symbol, "SELL")
             elif pos.short_exit_order_id and not pos.short_exit_filled:
                 self._reconcile_one(leg_key, leg, pos, pos.short_exit_order_id, "exit_failed", pos.short_symbol, "BUY")
             elif pos.hedge_exit_order_id and not pos.hedge_exit_filled:
                 self._reconcile_one(leg_key, leg, pos, pos.hedge_exit_order_id, "hedge_exit_failed",
                                      pos.hedge_symbol, "SELL")
-            elif pos.short_symbol and not pos.entry_order_id and not pos.entry_filled:
+            elif pos.hedge_symbol and not pos.hedge_entry_order_id and not pos.hedge_entry_filled:
                 # The narrow crash window: _enter() persists the leg as
-                # "attempting entry" (short_symbol set, entry_order_id
-                # empty) BEFORE calling place(). Never guess -- flag for a
-                # human to verify against the broker directly.
-                pos.error_state = "entry_failed"
+                # "attempting entry" (both symbols set, no order id yet)
+                # BEFORE calling place(). Since 2026-11-01 the FIRST order
+                # placed is the hedge BUY, so this is the window that one
+                # opens. Never guess -- flag for a human to verify against
+                # the broker directly.
+                pos.error_state = "hedge_entry_failed"
                 pos.error_kind = "terminal"
                 pos.error_order_id = ""
                 pos.error_message = (
@@ -2880,10 +3796,34 @@ class StrategyEngine:
                     "placed, or Manually Completed with the real fill price if it was."
                 )
                 pos.error_since = datetime.now(IST).isoformat()
-                push_leg_error(self.env, leg_key, pos, action="SELL")
+                push_leg_error(self.env, leg_key, pos, action="BUY")
                 self.save_state()
                 Log.error(f"[{leg_key}] reconcile: ambiguous pre-placeorder crash window -- "
                           f"flagged for manual verification against the broker.")
+            elif pos.hedge_entry_filled and not pos.entry_order_id and not pos.entry_filled:
+                # Hedge filled, then the process stopped before the short's
+                # order id was recorded. The leg holds a LONG option and
+                # nothing else; evaluate() would freeze it forever on its
+                # "still entering" guard, with no stop loss and no exit.
+                # (The mirror of this existed under the old short-first order
+                # too -- a filled short with no hedge order id -- and was not
+                # handled; it is covered by the same branch shape now.)
+                pos.error_state = "entry_failed"
+                pos.error_kind = "terminal"
+                pos.error_order_id = ""
+                pos.error_message = (
+                    "Restart interrupted this leg after the HEDGE filled but before the "
+                    "short's order was recorded -- the account may hold a long option with "
+                    "no short against it, and an order for that short may or may not exist. "
+                    "Verify against the broker before choosing Retry (risks a duplicate "
+                    "short) -- prefer Manually Completed with the real fill price if the "
+                    "short did go through, or Cancel to close the hedge out."
+                )
+                pos.error_since = datetime.now(IST).isoformat()
+                push_leg_error(self.env, leg_key, pos, action="SELL")
+                self.save_state()
+                Log.error(f"[{leg_key}] reconcile: hedge filled but the short was never "
+                          f"recorded -- flagged for manual verification.")
 
     def _reconcile_one(self, leg_key, leg, pos, order_id, error_state, symbol, action):
         try:
@@ -2930,15 +3870,34 @@ class StrategyEngine:
             return
 
         if status in {"rejected", "cancelled", "canceled"}:
-            if error_state == "entry_failed":
-                leg.trade_count = max(0, leg.trade_count - 1)
-                leg.position = ShortHedgePosition()
-                Log.info(f"[{leg_key}] reconcile: short entry {order_id} was genuinely rejected/cancelled -- "
-                         f"clearing the leg, safe to re-evaluate fresh.")
-            elif error_state == "hedge_entry_failed":
-                pos.hedge_entry_order_id = ""
-                Log.info(f"[{leg_key}] reconcile: hedge entry {order_id} was genuinely rejected/cancelled -- "
-                         f"short leg remains open and naked, will retry the hedge next cycle.")
+            if error_state in ("entry_failed", "hedge_entry_failed"):
+                # An ENTRY-side order that genuinely never filled. What to do
+                # depends on what the leg actually HOLDS, not on which of the
+                # two states it is -- hedge-first inverted that mapping, and
+                # the previous code's "short leg remains open and naked, will
+                # retry the hedge next cycle" was wrong twice over: the short
+                # had never been placed, and nothing retries it, because
+                # evaluate()'s "still entering" guard freezes a leg whose
+                # symbols are set with nothing filled.
+                side = self.monthly[leg_key.split("_")[1]]
+                if not pos.entry_filled and not pos.hedge_entry_filled:
+                    leg.trade_count = max(0, leg.trade_count - 1)
+                    syms = [{"symbol": sym, "exchange": OPTIONS_EXCHANGE}
+                            for sym in (pos.short_symbol, pos.hedge_symbol) if sym]
+                    if syms:
+                        self.price_stream.remove_instruments(syms)
+                    leg.position = ShortHedgePosition()
+                    Log.info(f"[{leg_key}] reconcile: entry order {order_id} genuinely "
+                             f"rejected/cancelled and nothing is filled -- clearing the leg, "
+                             f"safe to re-evaluate fresh.")
+                    self.save_state()
+                    return
+                Log.warning(f"[{leg_key}] reconcile: entry order {order_id} genuinely "
+                            f"rejected/cancelled, but the leg HOLDS a filled leg "
+                            f"(short={pos.entry_filled}, hedge={pos.hedge_entry_filled}) -- "
+                            f"closing it out rather than discarding the position.")
+                side._abandon_attempt("reconcile_rejected")
+                return
             elif error_state == "exit_failed":
                 pos.short_exit_order_id = ""
                 pos.short_exit_filled = False
@@ -2973,21 +3932,29 @@ class StrategyEngine:
         script's own descendant), which had the identical shape: the
         hedge leg simply never appeared there, even though it was
         genuinely filled."""
+        # Each leg reports INDEPENDENTLY of the other's fill state. This used
+        # to skip the whole position unless the SHORT had filled, which was
+        # safe only while the short was placed first. Since 2026-11-01 the
+        # HEDGE is bought first, so that gate hid a genuinely filled long
+        # option for the whole window between the two fills -- and hid it
+        # permanently whenever the short then failed and the leg went to error
+        # recovery still holding the hedge. A position the account holds must
+        # appear in PnL whatever order it was built in.
         open_positions = []
         for leg_key, leg in self.state.legs.items():
             pos = leg.position
-            if not pos.short_symbol or not pos.entry_filled:
-                continue
-            short_ltp = self.price_stream.get_ltp(pos.short_symbol, OPTIONS_EXCHANGE, config.ws_stale_seconds)
-            if short_ltp is None:
-                short_ltp = pos.entry_px  # last-known fallback -- never fabricate movement
-            short_pnl = (pos.entry_px - short_ltp) * pos.quantity
+            if pos.short_symbol and pos.entry_filled:
+                short_ltp = self.price_stream.get_ltp(pos.short_symbol, OPTIONS_EXCHANGE,
+                                                      config.ws_stale_seconds)
+                if short_ltp is None:
+                    short_ltp = pos.entry_px  # last-known fallback -- never fabricate movement
+                short_pnl = (pos.entry_px - short_ltp) * pos.quantity
 
-            open_positions.append({
-                "leg_key": leg_key, "symbol": pos.short_symbol, "direction": "SHORT",
-                "quantity": -pos.quantity, "entry_price": pos.entry_px, "current_price": short_ltp,
-                "pnl": short_pnl, "entry_time": pos.entry_time, "execution_id": pos.execution_id,
-            })
+                open_positions.append({
+                    "leg_key": leg_key, "symbol": pos.short_symbol, "direction": "SHORT",
+                    "quantity": -pos.quantity, "entry_price": pos.entry_px, "current_price": short_ltp,
+                    "pnl": short_pnl, "entry_time": pos.entry_time, "execution_id": pos.execution_id,
+                })
 
             if pos.hedge_symbol and pos.hedge_entry_filled:
                 hedge_ltp = self.price_stream.get_ltp(pos.hedge_symbol, OPTIONS_EXCHANGE, config.ws_stale_seconds)
@@ -3014,9 +3981,17 @@ class StrategyEngine:
         """Force-closes every leg currently holding a position, regardless
         of the strategy's own signal/exit logic -- idempotent/resumable
         across cycles. A leg already in error_state is left untouched.
-        Short (naked, undefined risk) leg is always closed before its own
-        hedge (bounded risk) leg -- see MonthlyShortEngine._exit's own
-        ordering, reused here unchanged."""
+
+        Ordering: this routes through _exit() like every other close, so it
+        is short BUY first, then hedge SELL -- the reverse of the entry's
+        hedge-then-short, and correct for the same reason. Closing the naked
+        (undefined-risk) leg first means the remaining seconds are spent
+        holding a long option; selling the hedge first would leave the short
+        unhedged exactly when something is already going wrong enough to
+        warrant a force exit. Verified 2026-11-01 when the entry order was
+        reversed: all four close reasons (stop_loss, opposite_signal,
+        expiry_day_close, force_exit) share this one chain, so none of them
+        needed changing."""
         all_flat = True
         for ot in OPTION_TYPES:
             side = self.monthly[ot]
@@ -3055,8 +4030,32 @@ def print_banner():
     print(f"SL tier 2 (ratchet)  : locks to breakeven once premium <= entry * "
           f"{config.sl_tier2_trigger_pct / 100.0:.2f}")
     print(f"Hedge target premium : {config.hedge_premium_pct_of_short}% of sold strike's premium")
+    print("Order sequence       : ENTRY hedge BUY -> short SELL | "
+          "EXIT short BUY -> hedge SELL")
+    print(f"Decision buffer      : +{config.decision_buffer_min} min after each "
+          f"scheduled time (candle asked for is still the scheduled one)")
+    print(f"Current OI source    : {'live quote/chain' if config.use_live_oi_for_current else 'closed candle'}"
+          f"   (reference: closed candle, cached once per day)")
     print(f"Entry evaluation time: {config.entry_evaluation_time.strftime('%H:%M')} (cycle-start day only)")
-    print(f"Daily decision time  : {config.daily_decision_time.strftime('%H:%M')} (non-entry days)")
+    if config.expiry_close_time not in config.daily_decision_times:
+        raise SystemExit(
+            f"config error: expiry_close_time "
+            f"{config.expiry_close_time.strftime('%H:%M')} is not one of the position "
+            f"checks ("
+            + ", ".join(t.strftime('%H:%M') for t in config.daily_decision_times)
+            + "). The expiry-day square-off runs inside a position check, so a time "
+              "that is not a check would never fire and the position would be carried "
+              "into expiry unmanaged."
+        )
+    print("Position checks      : "
+          + " ".join(t.strftime('%H:%M') for t in config.daily_decision_times)
+          + " (non-entry days)")
+    print(f"Short when verdict   : {config.short_verdict}   "
+          f"(hold while {config.hold_verdict})")
+    print(f"SL check window      : {config.sl_check_start_time.strftime('%H:%M')}"
+          f"-{config.sl_check_end_time.strftime('%H:%M')}")
+    print(f"Expiry-day square-off: {config.expiry_close_time.strftime('%H:%M')} "
+          f"(held contract's own expiry date)")
     print(f"Quantity per leg     : {config.quantity}")
     print(f"Product              : {config.product}")
     print("MONTHLY SELL -- delta-qualified strike + own-side OI accumulation, hedged, tiered SL.")
