@@ -36,6 +36,7 @@ import json
 import os
 import random
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -326,6 +327,28 @@ def _require_session(f):
 
 _zmq_context = None
 _zmq_socket = None
+# Serialises every use of _zmq_socket, including its lazy creation.
+#
+# libzmq sockets are NOT thread-safe, and this process serves requests on
+# werkzeug's threaded server -- one OS thread per request -- while five routes
+# publish through the one socket, the PnL push among them (every running
+# strategy, every ~0.8s). Two threads sending at once corrupt the socket's
+# message reference counts and libzmq aborts the whole process. Observed in
+# production on 2026-11-03:
+#
+#     10:26:03  Assertion failed: refs_ >= 0 (src/msg.cpp:563)
+#     10:26:14  strategy_reporting subprocess (PID 346649) died (exit code -6)
+#
+# so every /python/* route 502'd and every strategy's PnL push and
+# pending-action poll timed out until the watchdog respawned it. The
+# collision rate grows with the number of strategies pushing, which is why
+# running more of them made it worse.
+#
+# A plain threading.Lock is correct here: this is a separate child process on
+# real OS threads, never eventlet (see this module's docstring). The critical
+# section is tiny, because a PUB socket never blocks -- at SNDHWM it drops.
+# One socket is kept rather than one per thread, so no extra file descriptors.
+_zmq_lock = threading.Lock()
 
 # PnL DB-write throttle -- broadcast_bridge no longer reads the DB back to
 # build the SSE payload (2026-08-07, uses the event's own embedded
@@ -351,14 +374,15 @@ def _publish_bridge_event(event: dict):
     try:
         import zmq
 
-        if _zmq_socket is None:
-            port = os.getenv("ZMQ_REPORTING_PORT", "5565")
-            _zmq_context = zmq.Context()
-            _zmq_socket = _zmq_context.socket(zmq.PUB)
-            _zmq_socket.setsockopt(zmq.LINGER, 1000)
-            _zmq_socket.setsockopt(zmq.SNDHWM, 1000)
-            _zmq_socket.connect(f"tcp://127.0.0.1:{port}")
-        _zmq_socket.send_json(event)
+        with _zmq_lock:
+            if _zmq_socket is None:
+                port = os.getenv("ZMQ_REPORTING_PORT", "5565")
+                _zmq_context = zmq.Context()
+                _zmq_socket = _zmq_context.socket(zmq.PUB)
+                _zmq_socket.setsockopt(zmq.LINGER, 1000)
+                _zmq_socket.setsockopt(zmq.SNDHWM, 1000)
+                _zmq_socket.connect(f"tcp://127.0.0.1:{port}")
+            _zmq_socket.send_json(event)
     except Exception:
         logger.exception(f"Failed to publish bridge event: {event}")
 
