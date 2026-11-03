@@ -537,7 +537,7 @@ class LegState:
     # follows" -- with ONE check a day that was implicit in returning from
     # it, but with three checks the leg is simply flat when 13:30 arrives
     # and the flat branch would open a fresh short+hedge in NEXT month's
-    # contract on expiry day: a day before resolve_cycle_start_date allows
+    # contract on expiry day: a day before get_cycle_start_date allows
     # the cycle to start, which then suppresses the real cycle-start day's
     # own entry evaluation. This field makes the terminality explicit.
     expiry_closed_date: str = ""
@@ -565,6 +565,14 @@ class StrategyState:
     last_updated: str = ""
     today_realized_pnl: float = 0.0
     last_execution_id: int = 0
+    # The cycle's expiry as last observed (ISO date). Always at or after the
+    # day it was observed, because the broker's expiry list only carries
+    # future dates. When it is seen to be in the PAST, the cycle that ended on
+    # it is over and cycle_start_date is derived from it.
+    cycle_expiry_seen: str = ""
+    # First trading day of the current cycle (ISO date), derived above. Kept
+    # so a restart on that day still recognises it as the cycle-start day.
+    cycle_start_date: str = ""
 
 
 ###############################################################################
@@ -937,6 +945,8 @@ class StateStore:
         self.state.last_updated = data.get("last_updated", "")
         self.state.today_realized_pnl = data.get("today_realized_pnl", 0.0)
         self.state.last_execution_id = data.get("last_execution_id", 0)
+        self.state.cycle_expiry_seen = data.get("cycle_expiry_seen", "")
+        self.state.cycle_start_date = data.get("cycle_start_date", "")
         ref_raw = data.get("reference", {})
         self.state.reference = ReferenceSnapshot(
             **{**asdict(ReferenceSnapshot()), **filter_known_fields(ReferenceSnapshot, ref_raw)}
@@ -965,6 +975,8 @@ class StateStore:
             "last_updated": self.state.last_updated,
             "today_realized_pnl": self.state.today_realized_pnl,
             "last_execution_id": self.state.last_execution_id,
+            "cycle_expiry_seen": self.state.cycle_expiry_seen,
+            "cycle_start_date": self.state.cycle_start_date,
             "reference": asdict(self.state.reference),
             "legs": {
                 k: {
@@ -1192,34 +1204,6 @@ def resolve_current_month_expiry_date(client) -> Optional["datetime.date"]:
     return latest
 
 
-def resolve_cycle_start_date(client) -> Optional["datetime.date"]:
-    """The first trading day this strategy can enter the CURRENT monthly
-    contract -- the day after the PRIOR contract's own expiry (spec item 3).
-    Derived purely from the expiry calendar returned by client.expiry(),
-    independent of any position history, so it self-corrects across
-    restarts with no state to persist. Returns None if the calendar has no
-    PAST month-end expiry to anchor from (e.g. the very first month this
-    strategy is ever deployed in) -- callers must treat that as "not a
-    cycle-start day", never guess a date."""
-    resp = client.expiry(symbol=UNDERLYING_SYMBOL, exchange=OPTIONS_EXCHANGE, instrumenttype="options")
-    if resp.get("status") != "success" or not resp.get("data"):
-        raise RuntimeError(f"Could not resolve options expiry calendar: {resp}")
-    today = datetime.now(IST).date()
-    all_dates = sorted(datetime.strptime(raw, "%d-%b-%y").date() for raw in resp["data"])
-
-    month_ends: dict[tuple, "datetime.date"] = {}
-    for d in all_dates:
-        key = (d.year, d.month)
-        if key not in month_ends or d > month_ends[key]:
-            month_ends[key] = d
-
-    past_month_ends = sorted(v for v in month_ends.values() if v < today)
-    if not past_month_ends:
-        return None
-    prev_expiry = past_month_ends[-1]
-    return _next_trading_day(prev_expiry)
-
-
 def _next_trading_day(d) -> "datetime.date":
     """Next calendar day, skipping weekends -- does NOT consult the exchange
     holiday calendar, same documented simplification as
@@ -1230,6 +1214,29 @@ def _next_trading_day(d) -> "datetime.date":
     while d.weekday() >= 5:  # Saturday=5, Sunday=6
         d += timedelta(days=1)
     return d
+
+
+# Holiday-aware next trading day, from the platform's shared calendar --
+# the same import Nifty_LEAPS_OptionsSell uses, with the same weekday-only
+# fallback if the module is not importable in the strategy subprocess. The
+# fallback matters less than it looks: a cycle start computed onto a holiday
+# fails SAFE (today never matches it, so no 09:30 entry is taken), it does not
+# trade on a wrong day.
+try:
+    from utils.trading_calendar import next_trading_day as _calendar_next_trading_day
+except ImportError:
+    _calendar_next_trading_day = None
+
+
+def _cycle_next_trading_day(d) -> "datetime.date":
+    """First trading day strictly after `d`, holiday-aware when possible."""
+    if _calendar_next_trading_day is not None:
+        try:
+            return _calendar_next_trading_day(d)
+        except Exception as exc:
+            Log.warning(f"trading calendar unavailable ({exc}) -- falling back to "
+                        f"weekday-only next-trading-day.")
+    return _next_trading_day(d)
 
 
 def resolve_previous_trading_day(today) -> "datetime.date":
@@ -3503,16 +3510,62 @@ class StrategyEngine:
         return d
 
     def get_cycle_start_date(self) -> Optional["datetime.date"]:
-        today = datetime.now(IST).date().isoformat()
-        if self._cycle_start_date_cache and self._cycle_start_date_cache[0] == today:
+        """First trading day of the current cycle, derived by looking FORWARD.
+
+        The broker's expiry list only ever carries dates at or after today, so
+        the previous expiry cannot be read from it -- which is why the old
+        backward-looking resolver returned None on every day. Instead, the
+        cycle's expiry is observed each day (forward-only, the same principle
+        resolve_hedge_monthly_expiry relies on) and persisted. On the first
+        trading day that stored date is in the past, the cycle has ended and
+        the new one starts on the first trading day after it.
+
+        Cached per calendar day; persisted so a restart on the cycle-start day
+        still recognises it. None until one cycle expiry has been seen to pass
+        -- correct on first deployment, which never lands on a cycle start
+        with no history behind it."""
+        today = datetime.now(IST).date()
+        today_key = today.isoformat()
+        if self._cycle_start_date_cache and self._cycle_start_date_cache[0] == today_key:
             return self._cycle_start_date_cache[1]
-        try:
-            cycle_start = resolve_cycle_start_date(self.client)
-        except RuntimeError as exc:
-            Log.warning(f"resolve_cycle_start_date failed: {exc}")
-            return None
-        self._cycle_start_date_cache = (today, cycle_start)
-        Log.info(f"Cycle start date resolved: {cycle_start}")
+
+        seen = None
+        if self.state.cycle_expiry_seen:
+            try:
+                seen = datetime.fromisoformat(self.state.cycle_expiry_seen).date()
+            except ValueError:
+                Log.warning(f"Unreadable stored cycle expiry "
+                            f"{self.state.cycle_expiry_seen!r} -- ignoring it.")
+                seen = None
+
+        changed = False
+        if seen is not None and seen < today:
+            # The cycle that expired on `seen` is over.
+            start = _cycle_next_trading_day(seen)
+            if self.state.cycle_start_date != start.isoformat():
+                self.state.cycle_start_date = start.isoformat()
+                changed = True
+                Log.info(f"Cycle that expired {seen} has ended -- new cycle starts {start}.")
+
+        # Advance the observed expiry only once the previous one has passed,
+        # so it always names the RUNNING cycle's expiry.
+        if seen is None or seen < today:
+            current = self.get_cycle_expiry_date()
+            if current is not None and self.state.cycle_expiry_seen != current.isoformat():
+                self.state.cycle_expiry_seen = current.isoformat()
+                changed = True
+        if changed:
+            self.save_state()
+
+        cycle_start = None
+        if self.state.cycle_start_date:
+            try:
+                cycle_start = datetime.fromisoformat(self.state.cycle_start_date).date()
+            except ValueError:
+                cycle_start = None
+        self._cycle_start_date_cache = (today_key, cycle_start)
+        Log.info(f"Cycle start date resolved: {cycle_start} "
+                 f"(cycle expiry observed: {self.state.cycle_expiry_seen or 'none yet'})")
         return cycle_start
 
     def _reset_day_if_needed(self):

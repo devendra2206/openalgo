@@ -590,7 +590,69 @@ def main():
         assert best[0] == 23900, best
         assert lo <= best[1] <= hi, f"{best[1]} should sit inside the band"
 
-    for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16):
+    # 17 ------------------------------------------------------------------
+    @case("cycle start resolves from a FUTURE-ONLY expiry list, holiday-aware")
+    def t17():
+        """2026-11-03: `Cycle start date resolved: None` in the live log. The
+        expiry API drops every past date (upstream #1392), and the old
+        resolver needed one, so it returned None on every day. It now
+        observes the cycle expiry forward and persists it.
+
+        Uses the live list and the real 24-Nov-2026 holiday: the weekday-only
+        rule would name 24-Nov, a day the strategy never runs."""
+        import datetime as _d
+        HOL = {date(2026, 11, 10), date(2026, 11, 24)}
+
+        def ntd(d):
+            c = d + _d.timedelta(days=1)
+            while c.weekday() >= 5 or c in HOL:
+                c += _d.timedelta(days=1)
+            return c
+
+        orig_cal = m._calendar_next_trading_day
+        m._calendar_next_trading_day = ntd
+        LIVE = ["03-NOV-26", "09-NOV-26", "17-NOV-26", "23-NOV-26", "01-DEC-26",
+                "29-DEC-26", "25-JAN-27", "30-MAR-27"]
+
+        class C:
+            def expiry(self, **k):
+                t = m.datetime.now(m.IST).date()
+                return {"status": "success",
+                        "data": [x for x in LIVE
+                                 if _d.datetime.strptime(x, "%d-%b-%y").date() >= t]}
+
+        eng = object.__new__(m.StrategyEngine)
+        eng.client = C()
+        eng.state = m.StrategyState()
+        eng.save_state = lambda: None
+
+        def on(day):
+            class F(_d.datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return _d.datetime.combine(day, time(9, 31)).replace(tzinfo=tz)
+            o = m.datetime
+            m.datetime = F
+            try:
+                eng._cycle_start_date_cache = None
+                eng._cycle_expiry_date_cache = None
+                return m.StrategyEngine.get_cycle_start_date(eng)
+            finally:
+                m.datetime = o
+
+        try:
+            assert on(date(2026, 11, 3)) is None, "first deployment, nothing observed yet"
+            assert eng.state.cycle_expiry_seen == "2026-11-23", eng.state.cycle_expiry_seen
+            assert on(date(2026, 11, 23)) is None, "the expiry day itself is not a cycle start"
+            got = on(date(2026, 11, 25))
+            assert got == date(2026, 11, 25),                 f"the first trading day after 23-Nov (24-Nov is a holiday) must start the cycle, got {got}"
+            assert eng.state.cycle_expiry_seen == "2026-12-29", "the observed expiry must advance"
+            assert on(date(2026, 11, 25)) == date(2026, 11, 25), "a restart that day must still see it"
+            assert on(date(2026, 11, 26)) == date(2026, 11, 25), "and the next day is not a cycle start"
+        finally:
+            m._calendar_next_trading_day = orig_cal
+
+    for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17):
         fn()
 
     print("\n" + "=" * 74)

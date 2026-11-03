@@ -1955,3 +1955,58 @@ Summary of what's in them (all 5 original scripts, unless noted):
   `test/test_fyers_hsm_batch_and_unsubscribe.py`,
   `test/test_fyers_hsm_raw_token_staleness.py`, and
   `test/test_fyers_reconnect.py` (21 tests total) still pass unchanged.
+
+## Expiry API returns future dates only: `Nifty_OI_Positional_MonthlySell_1` cycle start (2026-11-03)
+
+**The contract, which is upstream's, not this fork's.** Since upstream
+`440b78ef2` (2026-05-07, `fix(groww/expiry): drop expired expiries ...`,
+#1392), `services/expiry_service.py` drops every expiry before today
+before returning: *"Drop expired dates and sort chronologically."* So
+`client.expiry()` / `/api/v1/expiry` never contains a past date. On
+2026-11-03 the live NIFTY options list started at `03-NOV-26` -- today.
+
+**What it broke.** `Nifty_OI_Positional_MonthlySell_1` was first committed
+2026-08-23, three and a half months after that change, and its
+`resolve_cycle_start_date()` anchored on the PREVIOUS monthly expiry:
+
+```python
+past_month_ends = sorted(v for v in month_ends.values() if v < today)
+if not past_month_ends:
+    return None
+```
+
+`past_month_ends` was therefore always empty and the function returned
+`None` on every day it ever ran (`Cycle start date resolved: None` in the
+live log). The 09:30 cycle-start entry is gated on it, so it never fired --
+from the day the script was written. Nobody noticed because entries still
+happened through the position checks' re-entry search.
+
+**The fix, in that script only.** The cycle's expiry is resolved FORWARD
+each day (`resolve_cycle_expiry_date()`: earliest month-end at or after
+today -- the same forward-only principle `Nifty_LEAPS_OptionsSell`'s
+`resolve_hedge_monthly_expiry()` relies on) and persisted as
+`StrategyState.cycle_expiry_seen`. On the first trading day that stored
+date is in the past, the cycle has ended, and `cycle_start_date` is the
+first trading day after it -- also persisted, so a restart on that day
+still recognises it.
+
+**A second defect in the same path.** `_next_trading_day()` skipped
+weekends only. 24-Nov-2026 is a trading holiday (Prakash Gurpurb Sri Guru
+Nanak Dev -- it is why November's monthly moved to Monday 23-Nov), so the
+weekday rule would have named 24-Nov as the next cycle start, a day the
+strategy never runs, and the entry would still have been missed. The next
+trading day now comes from `utils.trading_calendar.next_trading_day`
+(holiday-aware, backed by `market_calendar_service`), with the same
+weekday-only fallback `Nifty_LEAPS_OptionsSell` uses if the import is
+unavailable in the strategy subprocess. Verified: the real calendar
+returns 2026-11-25 for the day after 2026-11-23.
+
+**Scope.** Checked every script in `strategies/deployed/` that calls
+`client.expiry()`: none other anchors on a past expiry. The rule for any
+future one: **if logic needs a past expiry, remember it while it is still
+in the future -- never query for it.**
+
+**Upstream sync note.** Nothing to merge here: the filter is already
+upstream. But if upstream ever stops dropping expired dates, this fix
+still works (it never reads a past date from the API), whereas a revert of
+it would silently go back to returning `None`.
