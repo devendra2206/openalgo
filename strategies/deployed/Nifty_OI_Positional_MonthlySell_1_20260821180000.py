@@ -1089,120 +1089,121 @@ def fetch_option_chain_strikes(client, expiry_compact: str, strike_count: int = 
     return strikes
 
 
-def resolve_monthly_expiry(client) -> tuple[str, str]:
-    """Calendar day-of-month > monthly_expiry_roll_day_of_month (15) ->
-    roll to next month's expiry, regardless of how many days remain to the
-    current month's own expiry; on/before day 15, use the current month's
-    own expiry. Copied unchanged from Nifty_OI_WeeklyBuy_MonthlySell (only
-    Config.monthly_expiry_roll_day_of_month's VALUE differs -- 15 here vs.
-    20 there -- the comparison itself, `today.day <= roll_day`, is
-    identical). This result is used ONLY to decide which expiry a NEW entry
-    searches against -- it never closes an already-open position (see
-    module docstring's rollover section)."""
-    resp = client.expiry(symbol=UNDERLYING_SYMBOL, exchange=OPTIONS_EXCHANGE, instrumenttype="options")
-    if resp.get("status") != "success" or not resp.get("data"):
-        raise RuntimeError(f"Could not resolve monthly options expiry: {resp}")
+# NIFTY monthly expiry dates for the day, from the FUTURES list. One shared,
+# per-day cache so the contract a new entry trades and the cycle date it
+# captures can never come from two different calls -- see
+# fetch_monthly_expiries. Keyed by the date, so it invalidates itself daily.
+_MONTHLY_EXPIRY_CACHE: dict = {"day": None, "dates": None}
+_MONTHLY_EXPIRY_LOCK = threading.Lock()
+
+
+def clear_monthly_expiry_cache():
+    with _MONTHLY_EXPIRY_LOCK:
+        _MONTHLY_EXPIRY_CACHE["day"] = None
+        _MONTHLY_EXPIRY_CACHE["dates"] = None
+
+
+def fetch_monthly_expiries(client) -> list:
+    """NIFTY monthly expiry dates at or after today, oldest first.
+
+    Read from the FUTURES expiry list, not the options one. The options list
+    mixes weeklies and monthlies with no flag (docs/api/symbol-services/
+    expiry.md), so its monthly had to be guessed as "the last date listed in
+    each month" -- and with the current month's monthly missing, that guess
+    picks a mid-month weekly. NIFTY futures are listed only as monthly
+    contracts and expire on the same day as that month's monthly options, so
+    each date here IS a monthly, already holiday-adjusted by the exchange.
+
+    Cached once per calendar day and shared by every caller. Raises
+    RuntimeError -- never guesses -- when the call fails, the list is empty,
+    or it holds two dates in one month (it would then not be the monthly-only
+    list this relies on). Every caller already turns that into "no entry this
+    time"."""
     today = datetime.now(IST).date()
-    dates = sorted(datetime.strptime(raw, "%d-%b-%y").date() for raw in resp["data"])
+    with _MONTHLY_EXPIRY_LOCK:
+        if _MONTHLY_EXPIRY_CACHE["day"] == today and _MONTHLY_EXPIRY_CACHE["dates"]:
+            return list(_MONTHLY_EXPIRY_CACHE["dates"])
+    try:
+        resp = client.expiry(symbol=UNDERLYING_SYMBOL, exchange=OPTIONS_EXCHANGE,
+                             instrumenttype="futures")
+    except Exception as exc:
+        raise RuntimeError(f"NIFTY futures expiry call failed: {exc}") from exc
+    if not isinstance(resp, dict) or resp.get("status") != "success" or not resp.get("data"):
+        raise RuntimeError(f"Could not resolve NIFTY futures expiries: {resp}")
+    dates = sorted({datetime.strptime(raw, "%d-%b-%y").date() for raw in resp["data"]})
     dates = [d for d in dates if d >= today]
     if not dates:
-        raise RuntimeError("No upcoming expiries at all.")
-
-    # Group by (year, month), take the last (month-end) expiry in each group.
-    month_ends: dict[tuple, "datetime.date"] = {}
+        raise RuntimeError("No upcoming NIFTY futures expiry in the list.")
+    seen_months: dict = {}
     for d in dates:
         key = (d.year, d.month)
-        if key not in month_ends or d > month_ends[key]:
-            month_ends[key] = d
+        if key in seen_months:
+            raise RuntimeError(
+                f"NIFTY futures expiry list has two dates in {d.year}-{d.month:02d} "
+                f"({seen_months[key]} and {d}) -- not the monthly-only list this "
+                f"strategy relies on. Refusing to guess which is the monthly."
+            )
+        seen_months[key] = d
+    with _MONTHLY_EXPIRY_LOCK:
+        _MONTHLY_EXPIRY_CACHE["day"] = today
+        _MONTHLY_EXPIRY_CACHE["dates"] = list(dates)
+    return list(dates)
+
+
+def resolve_monthly_expiry(client) -> tuple[str, str]:
+    """The contract a NEW entry trades. Calendar day-of-month >
+    monthly_expiry_roll_day_of_month (15) -> next month's monthly; on/before
+    day 15 -> the current month's own monthly. Unchanged rule; only the source
+    of the monthly date changed (fetch_monthly_expiries, the futures list).
+    Used ONLY to decide which expiry a NEW entry searches against -- it never
+    closes an already-open position (see module docstring's rollover
+    section)."""
+    today = datetime.now(IST).date()
+    by_month = {(d.year, d.month): d for d in fetch_monthly_expiries(client)}
     current_month_key = (today.year, today.month)
-    current_month_end = month_ends.get(current_month_key)
+    current_month_end = by_month.get(current_month_key)
 
     if today.day <= config.monthly_expiry_roll_day_of_month and current_month_end is not None:
         chosen = current_month_end
     else:
         # Past the roll day-of-month (or the current month's own expiry has
-        # already passed) -- next month's month-end.
-        future_keys = sorted(k for k in month_ends if k > current_month_key)
+        # already passed) -- next month's monthly.
+        future_keys = sorted(k for k in by_month if k > current_month_key)
         if not future_keys:
             raise RuntimeError("No next-month expiry available to roll to.")
-        chosen = month_ends[future_keys[0]]
+        chosen = by_month[future_keys[0]]
 
     raw = chosen.strftime("%d-%b-%y")
     return _compact_expiry(raw), raw
 
 
 def resolve_cycle_expiry_date(client) -> Optional["datetime.date"]:
-    """The expiry the CURRENT CYCLE runs to: the earliest month-end expiry at
-    or after today.
+    """The expiry the CURRENT CYCLE runs to: the earliest monthly at or after
+    today. This is what gets captured on a cycle's first fresh trade and what
+    the 15:30 square-off then fires on.
 
-    This is what gets captured on a cycle's first fresh trade and what the
-    square-off then fires on. It is none of the other three dates:
+    Distinct from resolve_monthly_expiry(), which applies the day>15 roll and
+    so from the 16th names NEXT month's contract -- a 20-Nov trade would
+    capture December and the cycle would never end -- and from pos.expiry_date,
+    the contract a position actually holds.
 
-      - resolve_monthly_expiry() applies the day>15 roll, so from the 16th it
-        names NEXT month's contract -- a 20-Nov trade would capture December
-        and the cycle would never end.
-      - resolve_current_month_expiry_date() is the CALENDAR month's own expiry,
-        which on a cycle-start day like 27-May has already passed (26-May).
-      - pos.expiry_date is the contract a given position holds, which after the
-        15th is next month's.
-
-    On 27-May it returns 30-Jun; on 20-Nov, 24-Nov; on the expiry day itself,
-    that day. Returns None if the broker lists no month-end expiry at or after
-    today, which callers must treat as unknown and never guess.
-    """
-    resp = client.expiry(symbol=UNDERLYING_SYMBOL, exchange=OPTIONS_EXCHANGE, instrumenttype="options")
-    if resp.get("status") != "success" or not resp.get("data"):
-        raise RuntimeError(f"Could not resolve options expiry calendar: {resp}")
-    today = datetime.now(IST).date()
-    all_dates = sorted(datetime.strptime(raw, "%d-%b-%y").date() for raw in resp["data"])
-    month_ends: dict[tuple, "datetime.date"] = {}
-    for d in all_dates:
-        key = (d.year, d.month)
-        if key not in month_ends or d > month_ends[key]:
-            month_ends[key] = d
-    upcoming = sorted(d for d in month_ends.values() if d >= today)
-    return upcoming[0] if upcoming else None
+    On 03-Nov it returns 23-Nov; on 20-Nov, 23-Nov; on the expiry day itself,
+    that day. Raises (via fetch_monthly_expiries) rather than guessing; the
+    caller, get_cycle_expiry_date, turns that into None."""
+    monthlies = fetch_monthly_expiries(client)
+    return monthlies[0] if monthlies else None
 
 
 def resolve_current_month_expiry_date(client) -> Optional["datetime.date"]:
-    """The CURRENT CALENDAR month's own month-end expiry date, with no roll
-    rule applied.
-
-    Distinct from the two expiries either side of it, and the distinction is
-    the point:
-      - resolve_monthly_expiry() applies the day>15 roll and names the
-        contract a NEW ENTRY searches -- next month's, late in the month.
-      - pos.expiry_date is the contract a position was
-        actually opened in, and is what the cycle-end square-off keys on.
-      - THIS is the calendar month's own expiry, which from day 16 onward is
-        neither of those.
-
-    Returns None when the broker's calendar lists no expiry in the current
-    month (it has already passed and been dropped); callers must read that as
-    "unknown", never guess a date.
-    """
-    resp = client.expiry(symbol=UNDERLYING_SYMBOL, exchange=OPTIONS_EXCHANGE, instrumenttype="options")
-    if resp.get("status") != "success" or not resp.get("data"):
-        raise RuntimeError(f"Could not resolve options expiry calendar: {resp}")
+    """The CURRENT CALENDAR month's own monthly, or None once it has passed.
+    Currently unused -- the square-off keys on the captured cycle expiry --
+    kept at the author's request, now reading the same futures-based source as
+    everything else so the file has a single monthly rule."""
     today = datetime.now(IST).date()
-    all_dates = sorted(datetime.strptime(raw, "%d-%b-%y").date() for raw in resp["data"])
-    this_month = [d for d in all_dates if (d.year, d.month) == (today.year, today.month)]
-    if not this_month:
-        return None
-    latest = max(this_month)
-    if latest < today:
-        # The broker's list no longer carries this month's month-end expiry --
-        # it has passed and been dropped. Returning the newest WEEKLY still in
-        # the list would be wrong, and returning a past date means the
-        # square-off comparison silently never matches today. Say so loudly
-        # and return None, so the caller treats it as unknown rather than as
-        # "not an expiry day".
-        Log.warning(f"[Expiry] the current month's month-end expiry is no longer in the "
-                    f"broker's calendar (newest listed in {today.year}-{today.month:02d} is "
-                    f"{latest}, which is in the past) -- the calendar-month square-off cannot "
-                    f"be evaluated today.")
-        return None
-    return latest
+    for d in fetch_monthly_expiries(client):
+        if (d.year, d.month) == (today.year, today.month):
+            return d
+    return None
 
 
 def _next_trading_day(d) -> "datetime.date":
@@ -3631,6 +3632,7 @@ class StrategyEngine:
             self._cm_expiry_date_cache = None
             self._cycle_expiry_date_cache = None
             clear_reference_cache()
+            clear_monthly_expiry_cache()
             self.save_state()
 
     def _ensure_reference(self):

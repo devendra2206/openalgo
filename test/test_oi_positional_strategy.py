@@ -614,12 +614,18 @@ def main():
         LIVE = ["03-NOV-26", "09-NOV-26", "17-NOV-26", "23-NOV-26", "01-DEC-26",
                 "29-DEC-26", "25-JAN-27", "30-MAR-27"]
 
+        # Monthly dates come from the FUTURES list since 2026-11-03 -- monthly
+        # contracts only, three serial months, like NSE lists them. The options
+        # list (LIVE) is kept for reference but the code no longer reads it.
+        MONTHLY = ["23-NOV-26", "29-DEC-26", "25-JAN-27", "23-FEB-27", "30-MAR-27"]
+
         class C:
             def expiry(self, **k):
                 t = m.datetime.now(m.IST).date()
+                src = MONTHLY if k.get("instrumenttype") == "futures" else LIVE
+                live = [x for x in src if _d.datetime.strptime(x, "%d-%b-%y").date() >= t]
                 return {"status": "success",
-                        "data": [x for x in LIVE
-                                 if _d.datetime.strptime(x, "%d-%b-%y").date() >= t]}
+                        "data": live[:3] if k.get("instrumenttype") == "futures" else live}
 
         eng = object.__new__(m.StrategyEngine)
         eng.client = C()
@@ -636,6 +642,7 @@ def main():
             try:
                 eng._cycle_start_date_cache = None
                 eng._cycle_expiry_date_cache = None
+                m.clear_monthly_expiry_cache()
                 return m.StrategyEngine.get_cycle_start_date(eng)
             finally:
                 m.datetime = o
@@ -686,7 +693,77 @@ def main():
         assert secret not in out, "the API key must never reach the log"
         assert "pending_action?leg_key=MONTHLY_CE&apikey=***" in out,             "the path must still be logged, with the key masked"
 
-    for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18):
+    # 19 ------------------------------------------------------------------
+    @case("monthly dates come from the FUTURES list, shared, and refuse to guess")
+    def t19():
+        """2026-11-03. The options list has no weekly/monthly flag, so its
+        monthly was guessed as "the last date listed in the month" -- and with
+        23-NOV-26 missing it picked the 17-Nov WEEKLY. NIFTY futures are
+        monthly-only, so their dates ARE the monthlies. Asserts: the futures
+        list is what is asked for; a broken OPTIONS list no longer matters; the
+        contract and the cycle date share one call; and every bad response
+        refuses rather than guessing."""
+        import datetime as _d
+
+        def at(day):
+            class F(_d.datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return _d.datetime.combine(day, time(11, 31)).replace(tzinfo=tz)
+            return F
+
+        def resolve(day, expiry_fn):
+            m.clear_monthly_expiry_cache()
+            calls = []
+
+            class C:
+                def expiry(self, **k):
+                    calls.append(k.get("instrumenttype"))
+                    return expiry_fn(k)
+
+            o = m.datetime
+            m.datetime = at(day)
+            try:
+                c = C()
+                return m.resolve_monthly_expiry(c)[1], m.resolve_cycle_expiry_date(c), calls
+            finally:
+                m.datetime = o
+
+        GOOD = {"status": "success", "data": ["23-NOV-26", "29-DEC-26", "25-JAN-27"]}
+        BROKEN_OPTIONS = {"status": "success",
+                          "data": ["03-NOV-26", "09-NOV-26", "17-NOV-26", "01-DEC-26"]}
+
+        def good(k):
+            return GOOD if k["instrumenttype"] == "futures" else BROKEN_OPTIONS
+
+        contract, cycle, calls = resolve(date(2026, 11, 4), good)
+        assert calls == ["futures"], f"one futures call, shared by both: {calls}"
+        assert contract == "23-Nov-26", f"day 4 trades the current month: {contract}"
+        assert cycle == date(2026, 11, 23), f"cycle expiry is the monthly, not 17-Nov: {cycle}"
+
+        contract, cycle, _ = resolve(date(2026, 11, 20), good)
+        assert contract == "29-Dec-26", f"day 20 rolls to next month: {contract}"
+        assert cycle == date(2026, 11, 23), f"but the cycle still ends 23-Nov: {cycle}"
+
+        def bad(resp):
+            return lambda k: resp
+
+        def raises(k):
+            raise ConnectionError("reset")
+
+        for label, fn in (
+                ("error status", bad({"status": "error", "message": "down"})),
+                ("empty list", bad({"status": "success", "data": []})),
+                ("two dates in one month", bad({"status": "success",
+                                                "data": ["17-NOV-26", "23-NOV-26"]})),
+                ("the call raising", raises)):
+            try:
+                resolve(date(2026, 11, 4), fn)
+            except RuntimeError:
+                continue
+            raise AssertionError(f"{label} must refuse with RuntimeError, not guess")
+
+    for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19):
         fn()
 
     print("\n" + "=" * 74)
