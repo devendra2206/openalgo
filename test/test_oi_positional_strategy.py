@@ -652,7 +652,41 @@ def main():
         finally:
             m._calendar_next_trading_day = orig_cal
 
-    for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17):
+    # 18 ------------------------------------------------------------------
+    @case("a failed platform call logs the URL with the API key masked")
+    def t18():
+        """check_pending_action and check_force_exit carry the API key in the
+        query string, and the strategy's Log is a bare StreamHandler with no
+        redaction. Nifty_LEAPS_OptionsSell's otherwise-identical helper writes
+        the full key to the log on every failure (verified 2026-11-03 by
+        executing it); this script's port must not. Drives the real helpers
+        against a port nothing listens on."""
+        import io
+        import logging
+        import os
+        import types
+        buf = io.StringIO()
+        h = logging.StreamHandler(buf)
+        m.Log.logger.addHandler(h)
+        old_port = os.environ.get("STRATEGY_REPORTING_PORT")
+        os.environ["STRATEGY_REPORTING_PORT"] = "1"
+        secret = "SEKRETKEY0123456789abcdef"
+        env = types.SimpleNamespace(api_key=secret, strategy_tag="T")
+        try:
+            m.check_pending_action(env, "MONTHLY_CE")
+            m.check_force_exit(env)
+        finally:
+            m.Log.logger.removeHandler(h)
+            if old_port is None:
+                os.environ.pop("STRATEGY_REPORTING_PORT", None)
+            else:
+                os.environ["STRATEGY_REPORTING_PORT"] = old_port
+        out = buf.getvalue()
+        assert "_get_json_local GET" in out, "the failure must still be logged"
+        assert secret not in out, "the API key must never reach the log"
+        assert "pending_action?leg_key=MONTHLY_CE&apikey=***" in out,             "the path must still be logged, with the key masked"
+
+    for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18):
         fn()
 
     print("\n" + "=" * 74)

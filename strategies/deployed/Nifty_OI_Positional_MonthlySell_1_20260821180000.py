@@ -120,6 +120,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import urllib.error
@@ -1867,6 +1868,23 @@ def append_trade_log(strategy_tag: str, leg_key: str, symbol: str, quantity: int
 ###############################################################################
 
 
+_APIKEY_IN_URL = re.compile(r"(apikey=)[^&#\s]+", re.IGNORECASE)
+
+
+def _redact_url(url: str) -> str:
+    """The URL with any apikey query value masked, for logging only.
+
+    check_pending_action and check_force_exit carry the API key in the query
+    string (`...?apikey=<key>`), and this script's Log is a bare
+    StreamHandler with no redaction filter, so logging the raw URL writes the
+    full key to the log on every failed call. That is exactly what
+    Nifty_LEAPS_OptionsSell's otherwise-identical helpers do (verified
+    2026-11-03 by executing them against a dead port); this port masks it.
+    The path and every other parameter are kept, because the path is what
+    identifies a 404."""
+    return _APIKEY_IN_URL.sub(r"\1***", url)
+
+
 def _post_json_local(env: "Environment", path: str, payload: bytes, timeout: float = 3.0):
     """POST to the dedicated strategy_reporting subprocess over plain TCP
     loopback on STRATEGY_REPORTING_PORT (default 8766). Retries once at 3x
@@ -1875,15 +1893,31 @@ def _post_json_local(env: "Environment", path: str, payload: bytes, timeout: flo
     why this must never hit FLASK_PORT/openalgo.sock."""
     headers = {"Content-Type": "application/json"}
     base = f"http://127.0.0.1:{os.getenv('STRATEGY_REPORTING_PORT', '8766')}"
+    url_for_log = _redact_url(f"{base}{path}")
     last_exc: Optional[Exception] = None
     for attempt_timeout in (timeout, timeout * 3):
         try:
             req = urllib.request.Request(f"{base}{path}", data=payload, method="POST", headers=headers)
             urllib.request.urlopen(req, timeout=attempt_timeout).close()
             return
+        except urllib.error.HTTPError as exc:
+            # Read the BODY, not just the status line -- str(HTTPError) is only
+            # "HTTP Error 404: NOT FOUND", identical whether the 404 came from
+            # the handler's own JSON or from Flask never matching the route.
+            # Same reasoning as Nifty_LEAPS_OptionsSell's helper (2026-10-21).
+            # The body is the SERVER's response, never this request's payload.
+            body = ""
+            try:
+                body = exc.read().decode(errors="replace")[:300]
+            except Exception:
+                pass
+            last_exc = exc
+            Log.warning(f"_post_json_local POST {url_for_log} (timeout={attempt_timeout}s) "
+                        f"-> HTTP {exc.code} {exc.reason}: {body}")
         except Exception as exc:
             last_exc = exc
-            Log.warning(f"_post_json_local: attempt (timeout={attempt_timeout}s) failed: {exc}")
+            Log.warning(f"_post_json_local POST {url_for_log} "
+                        f"(timeout={attempt_timeout}s) failed: {exc}")
     raise last_exc
 
 
@@ -1892,14 +1926,25 @@ def _get_json_local(env: "Environment", path: str, timeout: float = 3.0) -> dict
     behavior. Raises if both attempts fail; caller treats it as "no action
     pending" rather than crashing the scheduler loop."""
     base = f"http://127.0.0.1:{os.getenv('STRATEGY_REPORTING_PORT', '8766')}"
+    url_for_log = _redact_url(f"{base}{path}")
     last_exc: Optional[Exception] = None
     for attempt_timeout in (timeout, timeout * 3):
         try:
             with urllib.request.urlopen(f"{base}{path}", timeout=attempt_timeout) as resp:
                 return json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode(errors="replace")[:300]
+            except Exception:
+                pass
+            last_exc = exc
+            Log.warning(f"_get_json_local GET {url_for_log} (timeout={attempt_timeout}s) "
+                        f"-> HTTP {exc.code} {exc.reason}: {body}")
         except Exception as exc:
             last_exc = exc
-            Log.warning(f"_get_json_local: attempt (timeout={attempt_timeout}s) failed: {exc}")
+            Log.warning(f"_get_json_local GET {url_for_log} "
+                        f"(timeout={attempt_timeout}s) failed: {exc}")
     raise last_exc
 
 
