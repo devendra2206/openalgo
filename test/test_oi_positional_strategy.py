@@ -763,7 +763,307 @@ def main():
                 continue
             raise AssertionError(f"{label} must refuse with RuntimeError, not guess")
 
-    for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19):
+    import datetime as _dt
+    import logging
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+
+    class _Clock:
+        """Pins the module's clock; threads in the pool see it too."""
+        def __init__(self, day, hm):
+            class F(_dt.datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return _dt.datetime.combine(day, hm).replace(tzinfo=tz)
+            self.f = F
+
+        def __enter__(self):
+            self.orig = m.datetime
+            m.datetime = self.f
+
+        def __exit__(self, *a):
+            m.datetime = self.orig
+
+    def _open_leg(side, ot="CE", entry_px=121.55):
+        side.leg.position = m.ShortHedgePosition(
+            short_symbol=f"S{ot}", quantity=65, entry_px=entry_px, entry_filled=True,
+            hedge_symbol=f"H{ot}", hedge_entry_px=60.0, hedge_entry_filled=True,
+            entry_time="t", execution_id="EX1", expiry_date="2026-11-23")
+
+    @case("an OPEN leg runs its position checks under the production thread pool")
+    def t20():
+        """Live 04-Nov-2026: no open leg logged a position check all day.
+        evaluate() dispatched the SL first on every tick; it holds the same
+        per-leg guard, so the check always found the leg busy. Every other
+        test here uses InlineExecutor, which runs the SL to completion before
+        the check is reached and so hid the defect -- this one uses the real
+        2-worker pool the engine builds."""
+        # (a) an ordinary 13:30 check is reached at all
+        eng = make_engine(m)
+        eng._fill_executor = ThreadPoolExecutor(max_workers=len(m.LEG_KEYS))
+        side = make_side(m, eng, "CE")
+        _open_leg(side)
+        ran = []
+        side._manage_open_position = lambda: _time.sleep(0.2)   # a REST quote's worth
+        side._daily_decision = lambda slot=None: ran.append(slot)
+        with _Clock(date(2026, 11, 4), time(13, 31)):
+            for _ in range(5):          # five scheduler ticks
+                side.evaluate()
+                _time.sleep(0.3)
+            _time.sleep(0.3)
+        eng._fill_executor.shutdown(wait=True)
+        assert ran == [time(13, 30)], f"13:30 check must run exactly once, ran {ran}"
+
+        # (b) the expiry-day square-off, driven through the REAL _daily_decision
+        c = FakeClient({"SCE": ("complete", 140.0), "HCE": ("complete", 20.0)})
+        eng = make_engine(m, c)
+        eng._fill_executor = ThreadPoolExecutor(max_workers=len(m.LEG_KEYS))
+        side = make_side(m, eng, "CE")
+        _open_leg(side)
+        side.leg.marked_expiry = "2026-11-23"
+        with _Clock(date(2026, 11, 23), time(15, 31)):
+            for _ in range(4):
+                side.evaluate()
+                _time.sleep(0.3)
+            eng._fill_executor.shutdown(wait=True)
+        acts = [(s, a) for s, a, q, o in c.orders]
+        assert acts[:2] == [("SCE", "BUY"), ("HCE", "SELL")], \
+            f"23-Nov 15:30 must square off short then hedge, orders were {acts}"
+
+    @case("the SL keeps running while a position check waits on a late candle")
+    def t21():
+        """The check owns the leg's guard for as long as it retries (up to
+        6 x 15s). Without running the SL from inside that wait the short
+        would have no stop for 90s; and once the SL has closed the position
+        the check must stop rather than decide on it."""
+        eng = make_engine(m)
+        side = make_side(m, eng, "CE")
+        _open_leg(side)
+        pos = side.leg.position
+        sl_calls = []
+
+        def sl():
+            sl_calls.append(1)
+            pos.short_exit_order_id = "SLX"      # the stop fired and sent its buy-back
+        side._manage_open_position = sl
+
+        def late(_pos, require_fresh_by=None):
+            if require_fresh_by is not None:
+                raise m.CandleNotYetFresh("not yet")
+            return "accumulation"
+        side._fresh_oi_reclassify = late
+        exits = []
+        side._exit = lambda p, reason: exits.append(reason)
+        old = (m.config.oi_freshness_retry_delay_sec, m.config.oi_freshness_max_retries)
+        m.config.oi_freshness_retry_delay_sec, m.config.oi_freshness_max_retries = 1.2, 3
+        buf_lines = []
+        h = logging.Handler()
+        h.emit = lambda r: buf_lines.append(r.getMessage())
+        m.Log.logger.addHandler(h)
+        try:
+            with _Clock(date(2026, 11, 4), time(13, 31)):
+                side._daily_decision(time(13, 30))
+        finally:
+            m.Log.logger.removeHandler(h)
+            m.config.oi_freshness_retry_delay_sec, m.config.oi_freshness_max_retries = old
+        assert sl_calls, "the SL must run while the check waits for its candle"
+        assert exits == [], f"the check must not send its own exit after the SL did: {exits}"
+        assert any("stop-loss closed this position" in l for l in buf_lines), buf_lines
+
+        # a stop whose exit order was REFUSED puts the leg in error: the
+        # check must not send a second exit on top of the error flow
+        _open_leg(side)
+        pos = side.leg.position
+
+        def refused():
+            pos.error_state = "exit_failed"
+        side._manage_open_position = refused
+        exits.clear()
+        m.config.oi_freshness_retry_delay_sec, m.config.oi_freshness_max_retries = 1.2, 3
+        try:
+            with _Clock(date(2026, 11, 4), time(13, 31)):
+                side._daily_decision(time(13, 30))
+        finally:
+            m.config.oi_freshness_retry_delay_sec, m.config.oi_freshness_max_retries = old
+        assert exits == [], f"no exit on top of a refused stop: {exits}"
+
+    @case("the (open) OI line is measured against the day's reference, not zero")
+    def t22():
+        """Live 04-Nov-2026: premium_chg always equalled the premium and the
+        verdict always read accumulation, because the line subtracted
+        pos.reference_premium / reference_oi, which nothing sets."""
+        eng = make_engine(m)
+        side = make_side(m, eng, "CE")
+        _open_leg(side, entry_px=15.0)          # stream LTP 10.0: no stop, no ratchet
+        eng._last_candle_boundary = _dt.datetime(2026, 11, 4, 11, 15)
+        ref_calls = []
+        orig = (m.fetch_candle_oi_premium, m.fetch_reference_oi_premium)
+        m.fetch_candle_oi_premium = lambda *a, **k: {
+            "premium": 119.10, "oi": 714675.0, "timestamp": "2026-11-04 11:15:00+05:30"}
+
+        def ref(*a, **k):
+            ref_calls.append(1)
+            return {"premium": 121.00, "oi": 700000.0}
+        m.fetch_reference_oi_premium = ref
+        lines = []
+        h = logging.Handler()
+        h.emit = lambda r: lines.append(r.getMessage())
+        m.Log.logger.addHandler(h)
+        try:
+            with _Clock(date(2026, 11, 4), time(11, 31)):
+                # reference not fixed yet (gap day before 09:45): no line at all
+                side._manage_open_position()
+                assert not any("(open)" in l for l in lines), lines
+                assert not ref_calls, "no reference read before the reference is fixed"
+                eng.state.reference = m.ReferenceSnapshot(
+                    reference_date="2026-11-04", mode="prev_close", computed=True)
+                side._manage_open_position()
+        finally:
+            m.Log.logger.removeHandler(h)
+            m.fetch_candle_oi_premium, m.fetch_reference_oi_premium = orig
+        line = next((l for l in lines if "(open)" in l), "")
+        want = m.classify_oi_premium(119.10 - 121.00, 714675.0 - 700000.0)
+        assert "premium_chg=-1.90" in line, line
+        assert "oi_chg=+14675" in line, line
+        assert f"verdict={want}" in line, line
+
+    @case("the hedge chain reaches the 20% target instead of stopping at the scan's edge")
+    def t23():
+        """Live 04-Nov-2026: 24600CE at 60.00 against a 24.31 target -- the
+        edge strike of the short scan's 16-strikes-a-side chain, reused as-is.
+        Drives the real select_hedge_strike with a chain whose width follows
+        strike_count, ATM 23800, 50-point strikes, as the API serves it."""
+        def chain(count, curve):
+            rows = []
+            for i in range(-count, count + 1):
+                k = 23800 + 50 * i
+                rows.append({"strike": float(k),
+                             "ce": {"ltp": curve(k - 23800)} if k >= 23800 else None,
+                             "pe": None})
+            return {"status": "success", "chain": rows}
+
+        class C:
+            def __init__(self, curve, fail=False):
+                self.curve, self.fail, self.counts = curve, fail, []
+
+            def optionchain(self, **k):
+                self.counts.append(k["strike_count"])
+                if self.fail:
+                    return {"status": "error", "message": "down"}
+                return chain(k["strike_count"], self.curve)
+
+        def gentle(d):                                             # 24600 -> 60.00
+            return round(max(1.0, 300 - 0.3 * d), 2)
+        short_chain = chain(16, gentle)                            # what the short scan hands over
+        target = 121.55 * 0.20                                     # 24.31
+
+        c = C(gentle)
+        h = m.select_hedge_strike(c, "23NOV26", "CE", 24300.0, 121.55, short_chain)
+        assert c.counts == [30], f"one wider fetch reaches the target, fetched {c.counts}"
+        assert h["strike"] == 24700.0 and abs(h["ltp"] - target) < 6, h
+
+        # a chain that already reaches the target is reused, no extra call
+        c = C(gentle)
+        h = m.select_hedge_strike(c, "23NOV26", "CE", 24300.0, 121.55, chain(30, gentle))
+        assert c.counts == [] and h["strike"] == 24700.0, (c.counts, h)
+
+        # premiums that fall slowly: widen 30 -> 60
+        def slow(d):
+            return round(max(1.0, 300 - 0.12 * d), 2)
+        c = C(slow)
+        h = m.select_hedge_strike(c, "23NOV26", "CE", 24300.0, 121.55, chain(16, slow))
+        assert c.counts == [30, 60], f"must widen until the target is reached, fetched {c.counts}"
+        assert abs(h["ltp"] - target) < 4, h
+
+        # a failed wider fetch still hedges, with the closest strike in hand
+        c = C(gentle, fail=True)
+        h = m.select_hedge_strike(c, "23NOV26", "CE", 24300.0, 121.55, short_chain)
+        assert h is not None and h["strike"] == 24600.0, \
+            f"never naked: fall back to the closest strike already known, got {h}"
+
+    @case("a gap day logs its wait once, re-checks nothing until 09:46, then fixes 09:30")
+    def t24():
+        """Live 04-Nov-2026: the wait line printed every 10s from 09:31 to
+        09:45, each one re-reading spot and the previous close. Drives the
+        real StrategyEngine._ensure_reference over 09:31 -> 09:46."""
+        eng = types.SimpleNamespace(state=m.StrategyState(), client=None, _gap_wait_day="")
+        eng.state.reference = m.ReferenceSnapshot()
+        spot_calls = []
+
+        def spot():
+            spot_calls.append(1)
+            return 24174.0                       # +0.72% over 24001
+        eng.get_spot_ltp = spot
+        orig = m.fetch_candle_oi_premium
+        m.fetch_candle_oi_premium = lambda *a, **k: {"premium": 24001.0, "oi": 0.0}
+        orig_prev = m.resolve_previous_trading_day
+        m.resolve_previous_trading_day = lambda d: date(2026, 11, 3)
+        lines = []
+        h = logging.Handler()
+        h.emit = lambda r: lines.append(r.getMessage())
+        m.Log.logger.addHandler(h)
+        try:
+            for mm in range(31, 46):             # every minute 09:31 .. 09:45
+                with _Clock(date(2026, 11, 4), time(9, mm)):
+                    m.StrategyEngine._ensure_reference(eng)
+            assert not eng.state.reference.computed, "the reference must wait for 09:45"
+            waits = [ln for ln in lines if "[Reference]" in ln]
+            assert len(waits) == 1, f"the wait is logged once, got {len(waits)}: {waits}"
+            assert len(spot_calls) == 1, f"spot is read once while waiting, read {len(spot_calls)}x"
+            with _Clock(date(2026, 11, 4), time(9, 46)):
+                m.StrategyEngine._ensure_reference(eng)
+        finally:
+            m.Log.logger.removeHandler(h)
+            m.fetch_candle_oi_premium = orig
+            m.resolve_previous_trading_day = orig_prev
+        ref = eng.state.reference
+        assert ref.computed and ref.mode == "today_0935", ref
+        assert ref.reference_time_iso.startswith("2026-11-04T09:30"), ref.reference_time_iso
+
+    @case("the previous close skips holidays and the Muhurat session")
+    def t25():
+        """25-Nov-2026 named 24-Nov (a holiday) as the previous day, so every
+        option's reference came back empty on the new cycle's first day.
+        The calendar here is the 2026 one: 24-Nov closed, Sunday 08-Nov a
+        special (Muhurat) session, which the author wants skipped."""
+        holidays = {date(2026, 11, 24)}
+        special = {date(2026, 11, 8)}
+
+        def is_td(d):
+            if d in special:
+                return True
+            return d not in holidays and d.weekday() < 5
+
+        def prev_td(d):
+            c = d - timedelta(days=1)
+            while not is_td(c):
+                c -= timedelta(days=1)
+            return c
+        orig = (m._calendar_prev_trading_day, m._calendar_special_sessions)
+        m._calendar_prev_trading_day = prev_td
+        m._calendar_special_sessions = lambda year: frozenset(special)
+        try:
+            got = {d: m.resolve_previous_trading_day(d) for d in
+                   (date(2026, 11, 25), date(2026, 11, 9), date(2026, 11, 5), date(2026, 11, 30))}
+        finally:
+            m._calendar_prev_trading_day, m._calendar_special_sessions = orig
+        assert got[date(2026, 11, 25)] == date(2026, 11, 23), got
+        assert got[date(2026, 11, 9)] == date(2026, 11, 6), "Muhurat skipped -> Friday's close"
+        assert got[date(2026, 11, 5)] == date(2026, 11, 4), got
+        assert got[date(2026, 11, 30)] == date(2026, 11, 27), got
+
+        # the calendar failing must not stop the strategy: weekends-only
+        def boom(d):
+            raise RuntimeError("calendar down")
+        m._calendar_prev_trading_day = boom
+        m._calendar_special_sessions = lambda year: frozenset()
+        try:
+            assert m.resolve_previous_trading_day(date(2026, 11, 9)) == date(2026, 11, 6)
+        finally:
+            m._calendar_prev_trading_day, m._calendar_special_sessions = orig
+
+    for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19,
+               t20, t21, t22, t23, t24, t25):
         fn()
 
     print("\n" + "=" * 74)

@@ -240,7 +240,8 @@ class Config:
 
     # Hedge -- premium-target selected, same side as the short leg, further OTM.
     hedge_premium_pct_of_short: float = 20.0
-    hedge_strike_scan_count: int = 30    # mirrors Batman's repair_chain_strike_count
+    hedge_strike_scan_count: int = 30    # first width fetched when the short scan's chain is too narrow
+    hedge_strike_scan_max: int = 100     # widen 30 -> 60 -> 100 (the API's own cap) until the target is reached
 
     # Position-check times (author 2026-11-01). Was ONE decision at 15:15;
     # now three, each shifted fifteen minutes later for the closing call
@@ -1228,6 +1229,12 @@ try:
     from utils.trading_calendar import next_trading_day as _calendar_next_trading_day
 except ImportError:
     _calendar_next_trading_day = None
+try:
+    from utils.trading_calendar import prev_trading_day as _calendar_prev_trading_day
+    from utils.trading_calendar import special_sessions as _calendar_special_sessions
+except ImportError:
+    _calendar_prev_trading_day = None
+    _calendar_special_sessions = None
 
 
 def _cycle_next_trading_day(d) -> "datetime.date":
@@ -1241,13 +1248,42 @@ def _cycle_next_trading_day(d) -> "datetime.date":
     return _next_trading_day(d)
 
 
-def resolve_previous_trading_day(today) -> "datetime.date":
-    """Previous calendar day, skipping weekends -- copied unchanged from
-    Nifty_OI_WeeklyBuy_MonthlySell (Reference Engine helper)."""
+def _weekday_previous_day(today) -> "datetime.date":
     d = today - timedelta(days=1)
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d
+
+
+def resolve_previous_trading_day(today) -> "datetime.date":
+    """The last REGULAR trading session before `today`: the day whose close
+    is the previous-close reference.
+
+    Holiday-aware, from the platform's trading calendar. It used to skip
+    weekends only, so on 25-Nov-2026 it named 24-Nov, a trading holiday:
+    the spot gap test still worked (it reads the last candle AT OR BEFORE
+    that date), but every option's reference read history for 24-Nov alone,
+    got nothing, and no strike could qualify on the new cycle's first day.
+
+    Special sessions are skipped too (author 2026-11-04: "skip muhurt
+    trading"). The calendar counts Diwali Muhurat -- Sunday 08-Nov-2026, a
+    one-hour evening session -- as a trading day, and its thin last candle
+    is not a close to measure a whole day's OI change from; 09-Nov takes
+    Friday 06-Nov's close instead. In the calendar feed SPECIAL_SESSION
+    entries are the Muhurat sessions (2025 and 2026 checked).
+
+    Falls back to weekends-only if the calendar is not importable or fails."""
+    if _calendar_prev_trading_day is not None and _calendar_special_sessions is not None:
+        try:
+            d = today
+            for _ in range(10):
+                d = _calendar_prev_trading_day(d)
+                if d not in _calendar_special_sessions(d.year):
+                    return d
+        except Exception as exc:
+            Log.warning(f"trading calendar unavailable ({exc}) -- falling back to "
+                        f"weekday-only previous trading day.")
+    return _weekday_previous_day(today)
 
 
 def _legs_with_strike(chain: dict, option_type: str) -> list:
@@ -1447,50 +1483,77 @@ def select_qualifying_monthly_strike(client, spot: float, expiry_raw: str, optio
 def select_hedge_strike(client, expiry_compact: str, option_type: str, sold_strike: float,
                          sold_premium: float, chain_response: Optional[dict] = None) -> Optional[dict]:
     """PREMIUM-based selection (unlike the short leg, the hedge IS chosen by
-    premium target, per spec) -- modeled on Nifty_Sensex_Expiry_Batman's
-    pick_leg_by_target_ltp. Reuses `chain_response` (from the just-completed
-    short-strike scan, same option_type) when it already covers the target
-    strike range; only calls optionchain() itself otherwise. Rejects any
-    candidate on the WRONG side of sold_strike even if its premium is
-    closer to target (further-OTM CE protects a sold CE; further-OTM PE
-    protects a sold PE)."""
+    premium target, per spec): the strike beyond sold_strike (further-OTM CE
+    for a sold CE, further-OTM PE for a sold PE) whose premium is closest to
+    hedge_premium_pct_of_short of the short's.
+
+    The chain must actually REACH the target. `chain_response` is the short
+    scan's own chain, only 16 strikes each side of ATM (800 points on
+    NIFTY), and a 20%-premium strike usually sits further out than that.
+    It used to be reused as-is, so the "closest" premium was simply the edge
+    strike of that window: live 04-Nov-2026 the CE hedge was 24600CE at 60.00
+    against a 24.31 target and the PE hedge 23050PE at 75.05 against 26.13,
+    each exactly 16 strikes from ATM. Now it is reused only when some
+    candidate is already priced at or below the target (so the closest is
+    inside it); otherwise a wider chain is fetched, hedge_strike_scan_count
+    then doubling up to hedge_strike_scan_max, until one is.
+
+    If even the widest chain cannot reach the target, or a wider fetch
+    fails, the closest strike already in hand is still taken: a hedge
+    nearer the short costs more but protects more, and selling naked is the
+    one outcome this never allows. Returns None only when no strike beyond
+    the short has a usable premium at all."""
     target_premium = sold_premium * (config.hedge_premium_pct_of_short / 100.0)
 
     def _candidates_from(resp) -> list:
         legs = _legs_with_strike(resp, option_type)
         if option_type == "CE":
-            return [l for l in legs if l["strike"] > sold_strike and l.get("ltp")]
-        return [l for l in legs if l["strike"] < sold_strike and l.get("ltp")]
+            return [leg for leg in legs if leg["strike"] > sold_strike and leg.get("ltp")]
+        return [leg for leg in legs if leg["strike"] < sold_strike and leg.get("ltp")]
 
-    # Reuse chain_response as-is when given -- it's the SAME expiry+side the
-    # short-strike scan just fetched, and per the plan is only re-fetched if
-    # the hedge target strike range falls outside what it already covers
-    # (rare, given hedge_strike_scan_count=30 is wider than the delta-scan's
-    # own bands). An empty _candidates_from(chain_response) here means
-    # "genuinely no strike on the correct side of sold_strike in that
-    # response" (already the widest band scanned), not "doesn't cover the
-    # range" -- re-fetching would only repeat the exact same emptiness, so
-    # only fall back to a fresh optionchain() call when no chain_response
-    # was passed in at all.
-    if chain_response is not None:
-        candidates = _candidates_from(chain_response)
-    else:
-        resp = client.optionchain(
-            underlying=UNDERLYING_SYMBOL, exchange=UNDERLYING_SPOT_EXCHANGE,
-            expiry_date=expiry_compact, strike_count=config.hedge_strike_scan_count,
-            with_quotes=True,   # ONE batched call, same efficiency pattern as the short-leg scan
-        )
-        if resp.get("status") != "success" or not resp.get("chain"):
-            Log.warning(f"[HEDGE_{option_type}] optionchain() failed for expiry {expiry_compact}: {resp}")
-            return None
-        candidates = _candidates_from(resp)
+    def _reaches_target(cands) -> bool:
+        return any(float(leg["ltp"]) <= target_premium for leg in cands)
+
+    candidates = _candidates_from(chain_response) if chain_response is not None else []
+    if not _reaches_target(candidates):
+        count = config.hedge_strike_scan_count
+        while True:
+            try:
+                resp = client.optionchain(
+                    underlying=UNDERLYING_SYMBOL, exchange=UNDERLYING_SPOT_EXCHANGE,
+                    expiry_date=expiry_compact, strike_count=count,
+                    with_quotes=True,   # ONE batched call per width
+                )
+            except Exception as exc:
+                Log.warning(f"[HEDGE_{option_type}] optionchain() raised for expiry "
+                            f"{expiry_compact} (strike_count={count}): {exc}")
+                break
+            if not isinstance(resp, dict) or resp.get("status") != "success" or not resp.get("chain"):
+                Log.warning(f"[HEDGE_{option_type}] optionchain() failed for expiry "
+                            f"{expiry_compact} (strike_count={count}): {resp}")
+                break
+            wider = _candidates_from(resp)
+            if wider:
+                candidates = wider
+            if _reaches_target(candidates) or count >= config.hedge_strike_scan_max:
+                break
+            count = min(config.hedge_strike_scan_max, count * 2)
 
     if not candidates:
         Log.warning(f"[HEDGE_{option_type}] no {option_type} candidate strictly beyond sold "
                     f"strike {sold_strike} with a usable premium -- no hedge available.")
         return None
 
-    return min(candidates, key=lambda l: abs(l["ltp"] - target_premium))
+    best = min(candidates, key=lambda leg: abs(float(leg["ltp"]) - target_premium))
+    if _reaches_target(candidates):
+        Log.info(f"[HEDGE_{option_type}] hedge strike={best['strike']} premium={float(best['ltp']):.2f} "
+                 f"(target {target_premium:.2f} = {config.hedge_premium_pct_of_short:.0f}% of "
+                 f"{sold_premium:.2f})")
+    else:
+        Log.warning(f"[HEDGE_{option_type}] no strike in reach is priced down to the target "
+                    f"{target_premium:.2f} -- taking the closest, strike={best['strike']} "
+                    f"premium={float(best['ltp']):.2f} (nearer hedge: costs more, protects more).")
+    return best
 
 
 def fetch_candle_oi_premium(client, symbol: str, exchange: str,
@@ -2100,12 +2163,24 @@ class MonthlyShortEngine:
                 return
             if pos.short_exit_order_id or pos.hedge_exit_order_id:
                 return  # an exit is already in flight (one leg confirmed, other pending) -- watcher owns it
-            # Continuous tiered-SL check -- every tick, not gated to a
-            # candle boundary (spec item 5).
-            self._manage_open_position_bg()
-            # position checks (config.daily_decision_times) -- every day,
-            # including this cycle's own entry day.
+            # Position checks (config.daily_decision_times) FIRST, then the
+            # tiered SL. Both dispatch through the same per-leg _eval_pending
+            # guard, so whichever is submitted first owns the leg for that
+            # tick. They were once the other way round: the SL was submitted
+            # on every tick, so the position check always found the leg busy
+            # and returned -- an open leg never ran its 11:30 / 13:30 / 15:30
+            # check, the expiry-day square-off included (live 04-Nov-2026: no
+            # position-check line for any open leg all day). A due slot now
+            # takes the leg for one tick and the SL resumes on the next; the
+            # check itself keeps running the SL while it waits on a late
+            # candle (_reclassify_with_retry). Keeping one guard is
+            # deliberate: _exit's in-flight check is not atomic, so an SL and
+            # a check running side by side could each send a buy-back.
             self._maybe_daily_decision_bg()
+            # Continuous tiered-SL check -- every tick, not gated to a
+            # candle boundary (spec item 5). A no-op on the tick a position
+            # check was just dispatched (the guard above holds the leg).
+            self._manage_open_position_bg()
         else:
             # Flat -- a position check's search and the 9:30 entry evaluation
             # can BOTH apply on an entry day now; see
@@ -2269,9 +2344,9 @@ class MonthlyShortEngine:
         It repeats evaluate()'s guards rather than calling it, because
         everything else evaluate() reaches -- the entry search and the
         verdict re-check -- genuinely needs the reference. The SL does not:
-        it compares the live LTP to entry_px, and the OI line
-        _manage_open_position logs uses the position's OWN stored
-        reference_premium/reference_oi, captured at entry.
+        it compares the live LTP to entry_px. The OI line
+        _manage_open_position logs needs the day's reference too, so it is
+        simply skipped until that is fixed.
         """
         if self.leg_key in self.engine._pending_fills:
             return
@@ -2617,11 +2692,25 @@ class MonthlyShortEngine:
         # 13:30 or 15:30, per config.daily_decision_times).
         boundary = self.engine._last_candle_boundary
         boundary_key = boundary.isoformat() if boundary is not None else None
-        if boundary_key is not None and boundary_key != self._last_logged_boundary:
+        # Measured against the DAY'S Reference Snapshot, the same basis the
+        # position check decides on (_fresh_oi_reclassify). It used to read
+        # pos.reference_premium / pos.reference_oi, which nothing ever sets,
+        # so every line was "change vs zero" -- premium_chg equal to the
+        # premium itself and a verdict of "accumulation" whatever the market
+        # did (live 04-Nov-2026). Skipped while the reference is not yet
+        # fixed (a gap day before 09:45, via manage_sl_only): there is no
+        # honest change to report then.
+        reference = self.engine.state.reference
+        reference_ready = bool(reference is not None and reference.computed and reference.mode)
+        if (reference_ready and boundary_key is not None
+                and boundary_key != self._last_logged_boundary):
             current = fetch_candle_oi_premium(self.engine.client, pos.short_symbol, OPTIONS_EXCHANGE)
-            if current is not None:
-                premium_change = current["premium"] - pos.reference_premium
-                oi_change = current["oi"] - pos.reference_oi
+            ref_reading = (fetch_reference_oi_premium(self.engine.client, pos.short_symbol,
+                                                      OPTIONS_EXCHANGE, reference)
+                           if current is not None else None)
+            if current is not None and ref_reading is not None:
+                premium_change = current["premium"] - ref_reading["premium"]
+                oi_change = current["oi"] - ref_reading["oi"]
                 verdict = classify_oi_premium(premium_change, oi_change)
                 Log.info(f"[MONTHLY_{self.option_type}] (open) candle={current['timestamp']} "
                          f"symbol={pos.short_symbol} premium={current['premium']:.2f} "
@@ -2722,6 +2811,15 @@ class MonthlyShortEngine:
 
         if pos.short_symbol:
             verdict = self._reclassify_with_retry(pos, slot_time or config.daily_decision_time)
+            if pos.error_state:
+                Log.warning(f"[MONTHLY_{self.option_type}] position check: the leg went into error "
+                            f"while the check waited (a stop-loss exit was refused) -- leaving it "
+                            f"to the error flow, no second exit.")
+                return
+            if pos.short_exit_order_id or not pos.short_symbol:
+                Log.info(f"[MONTHLY_{self.option_type}] position check: the stop-loss closed this "
+                         f"position while the check waited for its candle -- nothing more to decide.")
+                return
             if verdict is None:
                 Log.warning(f"[MONTHLY_{self.option_type}] fresh OI re-check unavailable this slot -- "
                             f"holding, will retry at the next position check.")
@@ -2812,8 +2910,36 @@ class MonthlyShortEngine:
                 Log.info(f"[MONTHLY_{self.option_type}] daily-decision candle not yet published by "
                           f"broker (attempt {attempt}/{max_attempts}) -- retrying in "
                           f"{config.oi_freshness_retry_delay_sec:.0f}s: {exc}")
-                _time.sleep(config.oi_freshness_retry_delay_sec)
+                if self._wait_running_sl(config.oi_freshness_retry_delay_sec):
+                    return None  # the SL closed the position while we waited
         return None  # unreachable in practice -- the last attempt's fresh_gate is None
+
+    def _wait_running_sl(self, seconds: float) -> bool:
+        """Sleep `seconds` while still running the tiered SL every
+        scheduler_interval. This runs on the position check's own thread,
+        which holds the leg's _eval_pending guard, so the SL cannot be
+        dispatched separately meanwhile -- without this a late candle (up to
+        oi_freshness_max_retries x oi_freshness_retry_delay_sec, 90s) would
+        leave the short with no stop for that whole wait. Same thread, so the
+        SL and the check still never send an exit side by side. Returns True
+        once an exit is in flight, so the check stops instead of deciding on
+        a position that is already being closed."""
+        import time as _time
+        pos = self.leg.position
+        step = max(1.0, float(config.scheduler_interval))
+        deadline = _time.monotonic() + seconds
+        while True:
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                return False
+            _time.sleep(min(step, remaining))
+            try:
+                self._manage_open_position()
+            except Exception as exc:
+                Log.exception(f"[MONTHLY_{self.option_type}] SL check during position-check "
+                              f"wait failed: {exc}")
+            if pos.short_exit_order_id or not pos.short_symbol or pos.error_state:
+                return True
 
     def _search_and_enter_fresh(self, slot_time: Optional[time] = None):
         spot = self.engine.get_spot_ltp()
@@ -3491,6 +3617,9 @@ class StrategyEngine:
         # _refresh_force_exit_check_bg instead; _force_exit_pending is the
         # cheap boolean run_cycle actually reads.
         self._force_exit_pending: bool = False
+        # Date a gap day's wait for the 09:45 candle was logged; until then
+        # _ensure_reference returns at once instead of re-measuring every tick.
+        self._gap_wait_day: str = ""
         self._force_exit_check_pending: bool = False
         # Throttles the outer run_cycle except-clause's WhatsApp alert.
         self._last_cycle_failure_notify: Optional[datetime] = None
@@ -3650,6 +3779,18 @@ class StrategyEngine:
         if now < _with_buffer(config.reference_check_time):
             return  # too early, wait for 09:30 (+buffer)
 
+        # A gap day is decided at 09:30 (+buffer); after that there is nothing
+        # to check until the 09:45 candle has closed. Return here without
+        # re-reading spot or the previous close, and without logging -- the
+        # wait used to be re-measured and printed every 10s (90 identical
+        # lines on 04-Nov-2026). At 09:46 the code below runs once and
+        # re-measures the gap, which decides the mode. One difference from
+        # before: the old loop would switch to the previous-close reference
+        # at the first tick in 09:31-09:45 where the gap dipped to 0.5% or
+        # less; now only the 09:46 reading can do that.
+        if self._gap_wait_day == today_key and now < _with_buffer(config.reference_wait_time):
+            return
+
         spot_now = self.get_spot_ltp()
         if spot_now is None:
             Log.warning("[Reference] spot LTP unavailable, retrying next cycle.")
@@ -3691,9 +3832,12 @@ class StrategyEngine:
         # ref.reference_time_iso below stays anchored at 09:30: the buffer
         # moves when we look, never which candle we want.
         if now < _with_buffer(config.reference_wait_time):
-            Log.info(f"[Reference] gap={gap_pct:+.3f}% (> {config.gap_threshold_pct}%) -- "
-                     f"waiting for the {config.reference_wait_time.strftime('%H:%M')} "
-                     f"candle to close.")
+            if self._gap_wait_day != today_key:
+                self._gap_wait_day = today_key
+                Log.info(f"[Reference] gap={gap_pct:+.3f}% (> {config.gap_threshold_pct}%) -- "
+                         f"reference will be fixed when the "
+                         f"{config.reference_wait_time.strftime('%H:%M')} candle closes; "
+                         f"no further checks until then.")
             return
 
         ref.reference_date = today_key
@@ -4212,6 +4356,20 @@ def main():
     print(f"State File         : OK ({state_store.path})")
     print(f"Execution ID       : {execution_id}")
     print(f"Price Stream       : starting ({len(already_known)} symbol(s) already known today)")
+    # The previous-close reference and the cycle start both depend on the
+    # platform's holiday list. If it cannot be read, the calendar quietly
+    # degrades to weekends-only (it logs, never raises), and a day after a
+    # holiday would read the holiday's empty history -- so say so at startup.
+    try:
+        from utils.trading_calendar import trading_holidays as _th
+        _n_hol = len(_th(datetime.now(IST).date().year))
+    except Exception:
+        _n_hol = -1
+    if _n_hol > 0:
+        print(f"Trading Calendar   : OK ({_n_hol} holidays this year)")
+    else:
+        print("Trading Calendar   : NOT LOADED -- weekends only; the day after a holiday "
+              "will find no reference candle")
     print("=" * 70)
 
     engine = StrategyEngine(client, state_store, env, price_stream, execution_id=execution_id,

@@ -2010,3 +2010,45 @@ in the future -- never query for it.**
 upstream. But if upstream ever stops dropping expired dates, this fix
 still works (it never reads a past date from the API), whereas a revert of
 it would silently go back to returning `None`.
+
+## Nifty_OI_Positional_MonthlySell_1: open-leg position checks, hedge width, OI log (2026-11-04)
+
+Four defects found in the first live run (04-Nov-2026), all in
+`strategies/deployed/Nifty_OI_Positional_MonthlySell_1_20260821180000.py`.
+
+**Open legs never ran a position check.** `evaluate()` dispatched the
+tiered SL before the position check on every tick, and both share the
+per-leg `_eval_pending` guard, so the check always found the leg busy and
+returned. No open leg ran its 11:30 / 13:30 / 15:30 check, and the 15:30
+square-off on the captured expiry lives inside that check, so 23-Nov would
+not have been closed. The order is now check first, then SL. They stay on
+one guard on purpose: `_exit`'s in-flight test is not atomic. While a check
+retries on a late candle (up to 90s) it runs the SL itself every
+`scheduler_interval`, and stops if the SL has sent an exit or put the leg
+in error. The test harness's `InlineExecutor` had hidden this; t20 uses the
+real thread pool.
+
+**Hedge stopped at the edge of the short scan's chain.** The hedge reused
+the short scan's chain (16 strikes a side, 800 points), so the "closest to
+20%" strike was the window's last one: 24600CE at 60.00 against a 24.31
+target. It now fetches a wider chain (30, then 60, then 100 strikes, the
+API cap) until a strike is priced at or below the target, and still takes
+the closest available strike rather than selling naked if none is.
+
+**The "(open)" OI line measured against zero.** It subtracted
+`pos.reference_premium` / `reference_oi`, which nothing sets. It now uses
+the day's Reference Snapshot, the same basis as the position check.
+
+**Gap-day wait logged every 10s.** The wait for the 09:45 candle is logged
+once and nothing is re-measured until 09:46, which then decides the
+reference as before.
+
+**Previous close skipped weekends only.** `resolve_previous_trading_day`
+named 24-Nov-2026 (a holiday) as the previous day for 25-Nov, the next
+cycle's first day, so every option's previous-close reference read an empty
+history and no strike could qualify. It now uses
+`utils.trading_calendar.prev_trading_day` and also skips SPECIAL_SESSION
+dates (author: "skip muhurt trading"), so 09-Nov-2026 measures from Friday
+06-Nov rather than the one-hour Muhurat session on Sunday 08-Nov. If the
+calendar cannot load its holiday list it degrades to weekends-only, so the
+startup health check now prints a `Trading Calendar` line saying which.
