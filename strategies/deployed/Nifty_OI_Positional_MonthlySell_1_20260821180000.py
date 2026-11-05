@@ -2986,7 +2986,7 @@ class MonthlyShortEngine:
         else:
             tail = (f"the old hedge still covers the short until it expires on {hx:%d-%b}. "
                     f"Retrying from {config.hedge_roll_morning_retry.strftime('%H:%M')} "
-                    f"tomorrow.")
+                    f"on the next trading day.")
         msg = (f"MONTHLY_{self.option_type} weekly hedge roll not done by "
                f"{config.hedge_roll_cutoff.strftime('%H:%M')}: {pos.hedge_symbol} -- {tail}")
         Log.error(f"[HEDGE_{self.option_type}] {msg}")
