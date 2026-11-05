@@ -928,7 +928,22 @@ def main():
         assert "OI now=714,675 vs ref=700,000 (+14,675)" in line, line
         assert f"-> {want} |" in line, line
 
+    def _pct(value):
+        """Pin hedge_premium_pct_of_short for one test: these two cases test
+        the chain WIDENING, written against the old 20% target."""
+        def deco(fn):
+            def run():
+                old = m.config.hedge_premium_pct_of_short
+                m.config.hedge_premium_pct_of_short = value
+                try:
+                    fn()
+                finally:
+                    m.config.hedge_premium_pct_of_short = old
+            return run
+        return deco
+
     @case("the hedge chain reaches the 20% target instead of stopping at the scan's edge")
+    @_pct(20.0)
     def t23():
         """Live 04-Nov-2026: 24600CE at 60.00 against a 24.31 target -- the
         edge strike of the short scan's 16-strikes-a-side chain, reused as-is.
@@ -1109,6 +1124,7 @@ def main():
         assert not eng.state.reference.computed, "a gap day waits for 09:45, not prev_close"
 
     @case("the hedge's wide chain goes through the long-timeout client, nothing else does")
+    @_pct(20.0)
     def t27():
         """Live 05-Nov-2026: strike_count=30 timed out on the main client's
         10s (Shoonya quotes 20 symbols per batch with a 1s pause), so the
@@ -1246,8 +1262,379 @@ def main():
         src = SCRIPT.read_text(encoding="utf-8")
         assert "| {_oi_comparison(current, ref_reading)} " in src
 
+    # ------------------------------------------------ weekly hedge (05-Nov) --
+    WEEKLIES = ["09-NOV-26", "17-NOV-26", "23-NOV-26", "01-DEC-26", "08-DEC-26",
+                "29-DEC-26", "25-JAN-27"]   # the live options list, 05-Nov-2026
+
+    def _calendar():
+        """2026 calendar: 24-Nov closed, Sunday 08-Nov Muhurat (skipped)."""
+        holidays, special = {date(2026, 11, 24)}, {date(2026, 11, 8)}
+
+        def prev_td(d):
+            c = d - timedelta(days=1)
+            while not (c in special or (c not in holidays and c.weekday() < 5)):
+                c -= timedelta(days=1)
+            return c
+        orig = (m._calendar_prev_trading_day, m._calendar_special_sessions)
+        m._calendar_prev_trading_day = prev_td
+        m._calendar_special_sessions = lambda year: frozenset(special)
+        m.clear_option_expiry_cache()
+        return orig
+
+    def _uncalendar(orig):
+        m._calendar_prev_trading_day, m._calendar_special_sessions = orig
+        m.clear_option_expiry_cache()
+
+    def _chain(count, ot="CE"):
+        """ATM 23800, 50-point strikes; premiums fall 0.1 per point OTM."""
+        rows = []
+        for i in range(-count, count + 1):
+            k = 23800 + 50 * i
+            d = abs(k - 23800)
+            leg = {"ltp": round(max(0.5, 100 - 0.1 * d), 2)}
+            rows.append({"strike": float(k),
+                         "ce": leg if (ot == "CE" and k >= 23800) else None,
+                         "pe": leg if (ot == "PE" and k <= 23800) else None})
+        return {"status": "success", "chain": rows}
+
+    class RollClient(FakeClient):
+        def __init__(self, fills=None, expiries=WEEKLIES):
+            super().__init__(fills)
+            self.expiries, self.expiry_calls, self.chains = expiries, [], []
+
+        def expiry(self, **k):
+            self.expiry_calls.append(k.get("instrumenttype"))
+            return {"status": "success", "data": list(self.expiries)}
+
+        def optionchain(self, **k):
+            self.chains.append((k["expiry_date"], k["strike_count"]))
+            return _chain(k["strike_count"])
+
+    def _rolling_leg(side, hedge_expiry="2026-11-09"):
+        side.leg.position = m.ShortHedgePosition(
+            short_symbol="NIFTY29DEC2624300CE", short_strike=24300.0, quantity=65,
+            entry_px=121.55, entry_filled=True,
+            hedge_symbol="NIFTY09NOV2625000CE", hedge_strike=25000.0, hedge_entry_px=12.0,
+            hedge_entry_filled=True, hedge_expiry=hedge_expiry, hedge_entry_time="h0",
+            entry_time="t", execution_id="EX1", expiry_date="2026-12-29")
+        side.leg.marked_expiry = "2026-12-29"
+
+    @case("weekly hedge expiry: current weekly, next one from the day before expiry")
+    def t30():
+        orig = _calendar()
+        try:
+            got = {}
+            for day, cap in ((date(2026, 11, 5), date(2026, 12, 29)),
+                             (date(2026, 11, 6), date(2026, 12, 29)),   # roll day of 09-Nov
+                             (date(2026, 11, 9), date(2026, 12, 29)),   # 09-Nov expiry day
+                             (date(2026, 11, 13), date(2026, 12, 29)),
+                             (date(2026, 11, 16), date(2026, 12, 29)),  # roll day of 17-Nov
+                             (date(2026, 11, 20), date(2026, 12, 29)),  # Fri, roll of Mon 23-Nov
+                             (date(2026, 11, 20), date(2026, 11, 23)),  # capped by the cycle
+                             (date(2026, 12, 28), date(2026, 12, 29))):
+                m.clear_option_expiry_cache()
+                c = RollClient()
+                with _Clock(day, time(9, 31)):
+                    got[(day, cap)] = m.resolve_hedge_expiry(c, cap)
+                assert c.expiry_calls == ["options"], c.expiry_calls
+            want = {
+                (date(2026, 11, 5), date(2026, 12, 29)): date(2026, 11, 9),
+                (date(2026, 11, 6), date(2026, 12, 29)): date(2026, 11, 17),
+                (date(2026, 11, 9), date(2026, 12, 29)): date(2026, 11, 17),
+                (date(2026, 11, 13), date(2026, 12, 29)): date(2026, 11, 17),
+                (date(2026, 11, 16), date(2026, 12, 29)): date(2026, 11, 23),
+                (date(2026, 11, 20), date(2026, 12, 29)): date(2026, 12, 1),
+                (date(2026, 11, 20), date(2026, 11, 23)): date(2026, 11, 23),
+                (date(2026, 12, 28), date(2026, 12, 29)): date(2026, 12, 29),
+            }
+            assert got == want, {k: (v, want[k]) for k, v in got.items() if v != want[k]}
+            # roll days: Muhurat Sunday and weekends skipped, holiday-aware
+            assert m.hedge_roll_day(date(2026, 11, 9)) == date(2026, 11, 6)
+            assert m.hedge_roll_day(date(2026, 11, 23)) == date(2026, 11, 20)
+            assert m.hedge_roll_day(date(2026, 11, 25)) == date(2026, 11, 23)  # 24-Nov closed
+            # a broken list refuses instead of guessing
+            m.clear_option_expiry_cache()
+            with _Clock(date(2026, 11, 5), time(9, 31)):
+                try:
+                    m.resolve_hedge_expiry(RollClient(expiries=[]), date(2026, 12, 29))
+                    raise AssertionError("an empty options list must raise")
+                except RuntimeError:
+                    pass
+        finally:
+            _uncalendar(orig)
+
+    @case("a NEW trade on the day before weekly expiry hedges in next week's expiry at 10%")
+    def t31():
+        orig = _calendar()
+        try:
+            eng = make_engine(m, RollClient())
+            side = make_side(m, eng, "CE")
+            eng.get_cycle_expiry_date = lambda: date(2026, 12, 29)
+            # wide enough to reach the target itself: reusing it for a weekly
+            # hedge would price the hedge off the WRONG expiry's premiums
+            short_chain = _chain(30)
+            with _Clock(date(2026, 11, 6), time(11, 31)):           # roll day of 09-Nov
+                hedge, sym, hx = side._select_entry_hedge(24300.0, 60.0, short_chain, "29-Dec-26")
+            assert hx == "2026-11-17", hx
+            assert sym.startswith("NIFTY17NOV26") and sym.endswith("CE"), sym
+            assert eng.client.chains and all(e == "17NOV26" for e, _ in eng.client.chains), \
+                f"the weekly chain must be fetched, the short's chain not reused: {eng.client.chains}"
+            assert abs(float(hedge["ltp"]) - 6.0) <= 2.5, f"10% of 60.00 is 6.00, got {hedge}"
+            # an ordinary day: the current weekly
+            eng = make_engine(m, RollClient())
+            side = make_side(m, eng, "CE")
+            eng.get_cycle_expiry_date = lambda: date(2026, 12, 29)
+            m.clear_option_expiry_cache()
+            with _Clock(date(2026, 11, 5), time(11, 31)):
+                _, sym, hx = side._select_entry_hedge(24300.0, 60.0, short_chain, "29-Dec-26")
+            assert hx == "2026-11-09" and sym.startswith("NIFTY09NOV26"), (hx, sym)
+            # hedge in the short's own expiry (the cap): the short's chain is reused
+            eng = make_engine(m, RollClient())
+            side = make_side(m, eng, "CE")
+            eng.get_cycle_expiry_date = lambda: date(2026, 11, 23)
+            m.clear_option_expiry_cache()
+            with _Clock(date(2026, 11, 20), time(11, 31)):
+                _, sym, hx = side._select_entry_hedge(24300.0, 60.0, _chain(30), "23-Nov-26")
+            assert hx == "2026-11-23" and eng.client.chains == [], (hx, eng.client.chains)
+        finally:
+            _uncalendar(orig)
+
+    @case("15:00 roll: buys next week's hedge first, then sells the old one")
+    def t32():
+        orig = _calendar()
+        try:
+            TRADE_LOG.clear()
+            c = RollClient({"NIFTY09NOV2625000CE": ("complete", 3.20)})
+            eng = make_engine(m, c)
+            eng._fill_executor = ThreadPoolExecutor(max_workers=len(m.LEG_KEYS))
+            side = make_side(m, eng, "CE")
+            _rolling_leg(side)
+            sl = []
+            side._manage_open_position = lambda: sl.append(1)
+            side._daily_decision = lambda slot=None: None
+            side.leg.last_daily_decision_date = "2026-11-06 13:30"
+            # before the roll day, and before 15:00 on it: nothing
+            for day, hm in ((date(2026, 11, 5), time(15, 1)), (date(2026, 11, 6), time(14, 59))):
+                with _Clock(day, hm):
+                    side.evaluate()
+                    _time.sleep(0.2)
+            assert c.orders == [], f"no roll before 15:00 on the roll day: {c.orders}"
+            with _Clock(date(2026, 11, 6), time(15, 1)):
+                for _ in range(3):
+                    side.evaluate()
+                    _time.sleep(0.3)
+                eng._fill_executor.shutdown(wait=True)
+            acts = [(s, a) for s, a, q, o in c.orders]
+            assert len(acts) == 2 and acts[0][1] == "BUY" and acts[0][0].startswith("NIFTY17NOV26") \
+                and acts[1] == ("NIFTY09NOV2625000CE", "SELL"), f"buy new, then sell old: {acts}"
+            pos = side.leg.position
+            assert pos.hedge_symbol == acts[0][0] and pos.hedge_expiry == "2026-11-17", pos
+            assert pos.hedge_entry_px == 10.0 and not pos.roll_symbol and not pos.roll_order_id
+            assert side.leg.leftover_hedges == [], side.leg.leftover_hedges
+            assert len(sl) >= 2, "the SL runs before the chain read and again before the BUY"
+            assert c.chains[0][0] == "17NOV26", c.chains
+            row = TRADE_LOG[-1]
+            assert row[2] == "NIFTY09NOV2625000CE" and row[8] == "hedge_roll", row
+            want = (3.20 - 12.0) * 65
+            assert abs(eng.state.today_realized_pnl - want) < 0.01 and abs(pos.hedge_roll_pnl - want) < 0.01
+            assert "MONTHLY_CE" not in eng._pending_fills, "the roll must release the leg"
+            assert "MONTHLY_CE" not in eng._eval_pending
+        finally:
+            _uncalendar(orig)
+
+    @case("a refused roll BUY keeps the old hedge; after 15:20 it alerts once, no orders")
+    def t33():
+        orig = _calendar()
+        try:
+            c = RollClient()
+            eng = make_engine(m, c)
+            alerts = []
+            eng._notify_telegram_error_bg = lambda msg: alerts.append(msg)
+            side = make_side(m, eng, "CE")
+            _rolling_leg(side)
+            side._manage_open_position = lambda: None
+            new = None
+            # every BUY of a 17-Nov strike comes back rejected
+            c.fills = type("F", (dict,), {"get": lambda self, s, d=None:
+                                          ("rejected", 0) if s.startswith("NIFTY17NOV26")
+                                          else ("complete", 10.0)})()
+            with _Clock(date(2026, 11, 6), time(15, 1)):
+                side._roll_hedge()
+            pos = side.leg.position
+            new = [s for s, a, q, o in c.orders if a == "BUY"]
+            assert new and pos.hedge_symbol == "NIFTY09NOV2625000CE", (new, pos.hedge_symbol)
+            assert not any(a == "SELL" for s, a, q, o in c.orders), "old hedge must NOT be sold"
+            assert not pos.roll_symbol and not pos.roll_order_id and not side.leg.leftover_hedges
+            n = len(c.orders)
+            side._next_roll_try = None
+            with _Clock(date(2026, 11, 6), time(15, 21)):
+                side.evaluate()
+                side.evaluate()
+            assert len(c.orders) == n, "nothing is sent after the cutoff"
+            assert len(alerts) == 1 and "still covers the short until it expires on 09-Nov" in alerts[0], alerts
+            # next morning (the old hedge's expiry day) it retries from 09:30
+            side._next_roll_try = None
+            side.leg.last_daily_decision_date = "2026-11-09 09:45"
+            c.fills = {}
+            with _Clock(date(2026, 11, 9), time(9, 31)):
+                side._daily_decision = lambda slot=None: None
+                side.evaluate()
+            assert side.leg.position.hedge_expiry == "2026-11-17", side.leg.position.hedge_expiry
+        finally:
+            _uncalendar(orig)
+
+    @case("an old hedge whose SELL fails stays recorded and is sold later, even once flat")
+    def t34():
+        orig = _calendar()
+        try:
+            TRADE_LOG.clear()
+            c = RollClient({"NIFTY09NOV2625000CE": ("rejected", 0)})
+            eng = make_engine(m, c)
+            side = make_side(m, eng, "CE")
+            _rolling_leg(side)
+            side._manage_open_position = lambda: None
+            with _Clock(date(2026, 11, 6), time(15, 1)):
+                side._roll_hedge()
+            left = side.leg.leftover_hedges
+            assert len(left) == 1 and left[0]["symbol"] == "NIFTY09NOV2625000CE", left
+            assert side.leg.position.hedge_expiry == "2026-11-17", "the new hedge is in place"
+            # the position closes and resets; the old hedge is still sold
+            side.leg.position = m.ShortHedgePosition()
+            c.fills = {"NIFTY09NOV2625000CE": ("complete", 2.0)}
+            side._next_leftover_try = None
+            with _Clock(date(2026, 11, 6), time(15, 5)):
+                side.evaluate()
+            assert side.leg.leftover_hedges == [], side.leg.leftover_hedges
+            assert TRADE_LOG[-1][2] == "NIFTY09NOV2625000CE" and TRADE_LOG[-1][8] == "hedge_roll"
+            # PnL reports a leftover while it is held
+            side.leg.leftover_hedges = [{"symbol": "OLD", "quantity": 65, "entry_px": 5.0,
+                                         "entry_time": "x", "expiry": "2026-11-09",
+                                         "execution_id": 1, "sell_order_id": ""}]
+            realeng = object.__new__(m.StrategyEngine)
+            realeng.state, realeng.price_stream = eng.state, eng.price_stream
+            rows = m.StrategyEngine._open_positions_for_pnl(realeng)
+            assert [r["symbol"] for r in rows] == ["OLD"], rows
+            # a leftover past its expiry cannot be sold: booked at 0, no order
+            n = len(c.orders)
+            with _Clock(date(2026, 11, 10), time(9, 20)):
+                side._sell_leftover_hedges()
+            assert len(c.orders) == n and side.leg.leftover_hedges == []
+            assert TRADE_LOG[-1][7] == 0.0 and TRADE_LOG[-1][8] == "hedge_expired", TRADE_LOG[-1]
+        finally:
+            _uncalendar(orig)
+
+    @case("a stop loss inside the roll stops it before any BUY and keeps the exit's guard")
+    def t35():
+        orig = _calendar()
+        try:
+            c = RollClient()
+            eng = make_engine(m, c)
+            side = make_side(m, eng, "CE")
+            _rolling_leg(side)
+            pos = side.leg.position
+            calls = []
+
+            def sl():
+                calls.append(1)
+                if len(calls) == 2:            # fires after the chain read, before the BUY
+                    pos.short_exit_order_id = "SLX"
+            side._manage_open_position = sl
+            with _Clock(date(2026, 11, 6), time(15, 1)):
+                side._roll_hedge()
+            assert c.orders == [], f"no roll order once the stop has fired: {c.orders}"
+            assert pos.hedge_symbol == "NIFTY09NOV2625000CE" and not pos.roll_symbol
+            assert "MONTHLY_CE" in eng._pending_fills, "the exit chain owns the leg now"
+        finally:
+            _uncalendar(orig)
+
+    @case("a resting roll BUY is cancelled; a fill found on cancel completes the roll")
+    def t36():
+        orig = _calendar()
+        old = (m.config.fill_poll_timeout, m.config.fill_poll_interval, m.config.reprice_max_attempts)
+        m.config.fill_poll_timeout, m.config.fill_poll_interval, m.config.reprice_max_attempts = 0.05, 0.01, 1
+        try:
+            class Resting(RollClient):
+                def orderstatus(self, order_id, strategy=None):
+                    sym = next((s for s, a, q, o in self.orders if o == order_id), "")
+                    if sym.startswith("NIFTY17NOV26") and order_id not in self.cancels:
+                        return {"data": {"order_status": "open"}}
+                    return {"data": {"order_status": "complete", "average_price": 9.0}}
+            c = Resting()
+            eng = make_engine(m, c)
+            side = make_side(m, eng, "CE")
+            _rolling_leg(side)
+            side._manage_open_position = lambda: None
+            # poll_fill's deadline reads the clock, so this one has to move
+            start = _time.monotonic()
+
+            class Tick(_dt.datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    base = _dt.datetime.combine(date(2026, 11, 6), time(15, 1)).replace(tzinfo=tz)
+                    return base + timedelta(seconds=_time.monotonic() - start)
+            o = m.datetime
+            m.datetime = Tick
+            try:
+                side._roll_hedge()
+            finally:
+                m.datetime = o
+            assert c.cancels, "the resting order must be cancelled, not left to fill unwatched"
+            pos = side.leg.position
+            assert pos.hedge_expiry == "2026-11-17" and pos.hedge_entry_px == 9.0, pos
+            assert [a for s, a, q, o in c.orders] == ["BUY", "SELL"], c.orders
+        finally:
+            (m.config.fill_poll_timeout, m.config.fill_poll_interval,
+             m.config.reprice_max_attempts) = old
+            _uncalendar(orig)
+
+    @case("roll state survives a restart; an unrecorded order stops rolling for the day")
+    def t37():
+        import json
+        import tempfile
+        orig = _calendar()
+        try:
+            store = m.StateStore(types.SimpleNamespace(strategy_tag="T"))
+            store.path = Path(tempfile.mkdtemp()) / "state.json"
+            leg = store.state.legs["MONTHLY_CE"]
+            leg.leftover_hedges = [{"symbol": "OLD", "quantity": 65, "entry_px": 5.0,
+                                    "entry_time": "x", "expiry": "2026-11-09",
+                                    "execution_id": 1, "sell_order_id": "OID9"}]
+            leg.position = m.ShortHedgePosition(short_symbol="S", hedge_symbol="H",
+                                                hedge_expiry="2026-11-17", roll_symbol="R",
+                                                roll_order_id="OID8", hedge_roll_pnl=-12.5)
+            store.save()
+            assert "leftover_hedges" in json.loads(store.path.read_text())["legs"]["MONTHLY_CE"]
+            store.state = m.StrategyState()
+            store.load()
+            got = store.state.legs["MONTHLY_CE"]
+            assert got.leftover_hedges[0]["sell_order_id"] == "OID9", got.leftover_hedges
+            p = got.position
+            assert (p.hedge_expiry, p.roll_symbol, p.roll_order_id, p.hedge_roll_pnl) == \
+                ("2026-11-17", "R", "OID8", -12.5), p
+            # recorded roll without an order id: never guess, stop for the day
+            c = RollClient()
+            eng = make_engine(m, c)
+            alerts = []
+            eng._notify_telegram_error_bg = lambda msg: alerts.append(msg)
+            side = make_side(m, eng, "CE")
+            _rolling_leg(side)
+            side.leg.position.roll_symbol = "NIFTY17NOV2625000CE"
+            side._manage_open_position = lambda: None
+            with _Clock(date(2026, 11, 6), time(15, 1)):
+                side._roll_hedge()
+                side._next_roll_try = None
+                side._maybe_roll_hedge_bg()
+            assert c.orders == [] and side.leg.position.roll_blocked_date == "2026-11-06"
+            assert alerts and "NIFTY17NOV2625000CE" in alerts[0], alerts
+            # a position from before weekly hedging (no hedge_expiry) never rolls
+            _rolling_leg(side, hedge_expiry="")
+            assert side._roll_target(side.leg.position) is None
+        finally:
+            _uncalendar(orig)
+
     for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19,
-               t20, t21, t22, t23, t24, t25, t26, t27, t28, t29):
+               t20, t21, t22, t23, t24, t25, t26, t27, t28, t29, t30, t31, t32, t33, t34, t35,
+               t36, t37):
         fn()
 
     print("\n" + "=" * 74)

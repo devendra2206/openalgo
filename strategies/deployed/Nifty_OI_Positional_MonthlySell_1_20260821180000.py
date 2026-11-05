@@ -239,9 +239,26 @@ class Config:
     sl_tier2_trigger_pct: float = 50.0   # permanent ratchet trigger (premium <= 50% of entry, ever)
 
     # Hedge -- premium-target selected, same side as the short leg, further OTM.
-    hedge_premium_pct_of_short: float = 20.0
+    # 10% of the SOLD strike's current premium, closest either side (author
+    # 2026-11-05). Bought in the WEEKLY expiry, not the short's monthly: the
+    # current weekly, or the next one on the trading day before the current
+    # weekly expires (resolve_hedge_expiry), never later than the short's own
+    # expiry or the cycle's square-off date.
+    hedge_premium_pct_of_short: float = 10.0
     hedge_strike_scan_count: int = 30    # first width fetched when the short scan's chain is too narrow
     hedge_strike_scan_max: int = 100     # widen 30 -> 60 -> 100 (the API's own cap) until the target is reached
+    # Weekly hedge rollover, on the trading day before the hedge's weekly
+    # expiry (holidays and Muhurat skipped): buy the next weekly at 10% of the
+    # sold strike's live premium, then sell the old hedge once the buy fills.
+    # A roll that has not happened by hedge_roll_cutoff is alerted on Telegram
+    # and retried from hedge_roll_morning_retry the next trading day.
+    # Weekly chain measured live 05-Nov-2026 on Shoonya (17-Nov expiry):
+    # 30 strikes 17.5s, 60 21.2s, 100 37.0s -- inside hedge_chain_timeout.
+    hedge_roll_time: time = time(15, 0)
+    hedge_roll_cutoff: time = time(15, 20)
+    hedge_roll_morning_retry: time = time(9, 30)
+    hedge_roll_retry_gap_sec: float = 30.0      # pause between failed roll attempts
+    leftover_hedge_retry_gap_sec: float = 60.0  # pause between attempts to sell an old hedge
 
     # Position-check times (author 2026-11-01). Was ONE decision at 15:15;
     # now three, each shifted fifteen minutes later for the closing call
@@ -473,6 +490,22 @@ class ShortHedgePosition:
     hedge_exit_order_id: str = ""
     hedge_exit_filled: bool = False
     hedge_exit_fill_px: Optional[float] = None
+    # Weekly hedge (2026-11-05). hedge_expiry is the ISO date of the contract
+    # the hedge holds; empty on a position opened before weekly hedging, which
+    # is then never rolled (its hedge shares the short's monthly expiry).
+    hedge_expiry: str = ""
+    hedge_entry_time: str = ""          # when THIS hedge was bought (a roll replaces it)
+    hedge_roll_pnl: float = 0.0         # realized PnL of hedges already rolled out of
+    # A roll's new-hedge BUY, persisted before placeorder() and cleared once
+    # it fills (the new hedge then becomes hedge_*) or is refused.
+    roll_symbol: str = ""
+    roll_strike: float = 0.0
+    roll_expiry: str = ""
+    roll_order_id: str = ""
+    # ISO date on which rolling is stopped for the day after an outcome that
+    # cannot be read safely (a placeorder that raised, a restart between
+    # recording the roll and its order id). Telegram says what to check.
+    roll_blocked_date: str = ""
 
     reference_oi: float = 0.0
     reference_premium: float = 0.0
@@ -549,6 +582,11 @@ class LegState:
     # the cycle to start, which then suppresses the real cycle-start day's
     # own entry evaluation. This field makes the terminality explicit.
     expiry_closed_date: str = ""
+    # Hedges a roll has replaced but not yet sold: one dict per hedge
+    # (symbol, quantity, entry_px, entry_time, expiry, execution_id,
+    # sell_order_id). Kept on the LEG, not the position, so an old hedge is
+    # still sold after the position itself closes and resets.
+    leftover_hedges: list = field(default_factory=list)
 
 
 @dataclass
@@ -986,6 +1024,8 @@ class StateStore:
             leg.last_daily_decision_date = leg_raw.get("last_daily_decision_date", "")
             leg.expiry_closed_date = leg_raw.get("expiry_closed_date", "")
             leg.marked_expiry = leg_raw.get("marked_expiry", "")
+            leg.leftover_hedges = [dict(h) for h in (leg_raw.get("leftover_hedges") or [])
+                                   if isinstance(h, dict) and h.get("symbol")]
             pos_raw = leg_raw.get("position", {})
             leg.position = ShortHedgePosition(
                 **{**asdict(ShortHedgePosition()), **filter_known_fields(ShortHedgePosition, pos_raw)}
@@ -1011,6 +1051,7 @@ class StateStore:
                     "last_daily_decision_date": v.last_daily_decision_date,
                     "expiry_closed_date": v.expiry_closed_date,
                     "marked_expiry": v.marked_expiry,
+                    "leftover_hedges": [dict(h) for h in v.leftover_hedges],
                     "position": asdict(v.position),
                 }
                 for k, v in self.state.legs.items()
@@ -1229,6 +1270,95 @@ def resolve_current_month_expiry_date(client) -> Optional["datetime.date"]:
         if (d.year, d.month) == (today.year, today.month):
             return d
     return None
+
+
+# NIFTY OPTION expiry dates for the day -- weeklies and monthlies together,
+# which is exactly what the weekly hedge needs (the monthly short keeps the
+# futures list above). Same source and parsing as
+# Nifty_Sensex_VWAP_NoHA_Intraday's resolve_current_week_expiry. Cached once
+# per calendar day.
+_OPTION_EXPIRY_CACHE: dict = {"day": None, "dates": None}
+_OPTION_EXPIRY_LOCK = threading.Lock()
+# Roll day per expiry date -- the calendar lookup is not repeated every tick.
+_ROLL_DAY_CACHE: dict = {}
+
+
+def clear_option_expiry_cache():
+    with _OPTION_EXPIRY_LOCK:
+        _OPTION_EXPIRY_CACHE["day"] = None
+        _OPTION_EXPIRY_CACHE["dates"] = None
+        _ROLL_DAY_CACHE.clear()
+
+
+def fetch_option_expiries(client) -> list:
+    """NIFTY option expiry dates at or after today, oldest first, from
+    client.expiry(instrumenttype="options"). Raises RuntimeError rather than
+    guessing when the call fails or the list is empty."""
+    today = datetime.now(IST).date()
+    with _OPTION_EXPIRY_LOCK:
+        if _OPTION_EXPIRY_CACHE["day"] == today and _OPTION_EXPIRY_CACHE["dates"]:
+            return list(_OPTION_EXPIRY_CACHE["dates"])
+    try:
+        resp = client.expiry(symbol=UNDERLYING_SYMBOL, exchange=OPTIONS_EXCHANGE,
+                             instrumenttype="options")
+    except Exception as exc:
+        raise RuntimeError(f"NIFTY options expiry call failed: {exc}") from exc
+    if not isinstance(resp, dict) or resp.get("status") != "success" or not resp.get("data"):
+        raise RuntimeError(f"Could not resolve NIFTY option expiries: {resp}")
+    dates = sorted({datetime.strptime(raw, "%d-%b-%y").date() for raw in resp["data"]})
+    dates = [d for d in dates if d >= today]
+    if not dates:
+        raise RuntimeError("No upcoming NIFTY option expiry in the list.")
+    with _OPTION_EXPIRY_LOCK:
+        _OPTION_EXPIRY_CACHE["day"] = today
+        _OPTION_EXPIRY_CACHE["dates"] = list(dates)
+        # Roll days are re-read once a day too, so a day computed while the
+        # calendar was briefly unavailable (weekday-only fallback) does not stick.
+        _ROLL_DAY_CACHE.clear()
+    return list(dates)
+
+
+def hedge_roll_day(expiry) -> "datetime.date":
+    """The trading day before `expiry`: the day a hedge in that expiry is
+    rolled. Holiday-aware and Muhurat-skipping, via
+    resolve_previous_trading_day -- 23-Nov-2026 (Monday) rolls on Friday
+    20-Nov, 09-Nov-2026 on Friday 06-Nov (not Sunday 08-Nov's Muhurat)."""
+    d = _ROLL_DAY_CACHE.get(expiry)
+    if d is None:
+        d = resolve_previous_trading_day(expiry)
+        _ROLL_DAY_CACHE[expiry] = d
+    return d
+
+
+def resolve_hedge_expiry(client, cap, today=None) -> "datetime.date":
+    """The weekly a hedge bought today belongs in: the first listed option
+    expiry whose roll day is still AFTER today -- the current weekly, or the
+    next one on the current weekly's roll day (and on its expiry day). Never
+    later than `cap` (the short's own expiry, or the cycle's square-off date
+    if that is sooner): when the next weekly would pass it, `cap` itself.
+
+    Raises RuntimeError (via fetch_option_expiries) when the list cannot be
+    read; the caller decides what to do then."""
+    today = today or datetime.now(IST).date()
+    for d in fetch_option_expiries(client):
+        if d > cap:
+            break
+        if hedge_roll_day(d) > today:
+            return d
+    return cap
+
+
+def _iso_date(value) -> Optional["datetime.date"]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _expiry_compact(d) -> str:
+    return _compact_expiry(d.strftime("%d-%b-%y"))
 
 
 def _next_trading_day(d) -> "datetime.date":
@@ -2204,6 +2334,13 @@ class MonthlyShortEngine:
         # In-memory only, self-corrects within one scheduler tick after a
         # restart, no need to survive one.
         self._last_logged_boundary: Optional[str] = None
+        # Weekly hedge roll / leftover-hedge sale throttles and once-a-day
+        # alert markers. In-memory: after a restart they simply allow the
+        # next attempt and at most one repeat alert.
+        self._next_roll_try: Optional[datetime] = None
+        self._roll_alert_day: str = ""
+        self._next_leftover_try: Optional[datetime] = None
+        self._leftover_alerted: set = set()
 
     @property
     def leg(self) -> LegState:
@@ -2215,6 +2352,10 @@ class MonthlyShortEngine:
     def evaluate(self):
         if self.leg_key in self.engine._pending_fills:
             return  # a background fill-watcher is already resolving this leg
+        # An old hedge a roll replaced is sold on its own, whatever the
+        # position is doing -- it lives on the leg, not the position.
+        if self.leg.leftover_hedges and self._leftover_sale_due():
+            self._dispatch_bg(self._sell_leftover_hedges)
         pos = self.leg.position
         if pos.error_state:
             # Backgrounded (see _refresh_pending_action_bg) so a slow/
@@ -2258,6 +2399,10 @@ class MonthlyShortEngine:
             # deliberate: _exit's in-flight check is not atomic, so an SL and
             # a check running side by side could each send a buy-back.
             self._maybe_daily_decision_bg()
+            # Weekly hedge roll (15:00 on the trading day before the hedge's
+            # expiry). Same _eval_pending guard: never alongside a check or
+            # the SL, and it runs the SL itself before each order.
+            self._maybe_roll_hedge_bg()
             # Continuous tiered-SL check -- every tick, not gated to a
             # candle boundary (spec item 5). A no-op on the tick a position
             # check was just dispatched (the guard above holds the leg).
@@ -2603,21 +2748,69 @@ class MonthlyShortEngine:
             return
         strike, delta, premium, verdict, chain_response = result
 
-        hedge = select_hedge_strike(
-            self.engine.client, expiry_compact, self.option_type, strike, premium, chain_response,
-            chain_client=getattr(self.engine, "hedge_chain_client", None),
-        )
-        if hedge is None:
+        picked = self._select_entry_hedge(strike, premium, chain_response, expiry_raw)
+        if picked is None:
             Log.warning(f"[MONTHLY_{self.option_type}] qualifying short strike {strike} found but no "
                         f"hedge candidate available -- refusing to sell naked, skipping entry.")
             return
+        hedge, hedge_symbol, hedge_expiry_iso = picked
 
         symbol = f"{UNDERLYING_SYMBOL}{expiry_compact}{int(strike)}{self.option_type}"
-        hedge_symbol = f"{UNDERLYING_SYMBOL}{expiry_compact}{int(hedge['strike'])}{self.option_type}"
         expiry_date_iso = datetime.strptime(expiry_raw, "%d-%b-%y").date().isoformat()
-        self._enter(symbol, strike, delta, verdict, hedge_symbol, hedge, expiry_date_iso)
+        self._enter(symbol, strike, delta, verdict, hedge_symbol, hedge, expiry_date_iso,
+                    hedge_expiry_iso)
 
-    def _enter(self, symbol, strike, delta, verdict, hedge_symbol, hedge, expiry_date_iso):
+    def _hedge_cap(self, short_expiry, allow_lookup: bool = True) -> Optional["datetime.date"]:
+        """The latest expiry a hedge may hold: the short's own expiry, or the
+        cycle's square-off date if that comes first (a short in next month's
+        contract is still closed on the cycle's date, so a hedge outliving
+        that date protects nothing). The captured marked_expiry is used when
+        it is still current; otherwise, at entry, the cycle date it is about
+        to be captured as."""
+        today = datetime.now(IST).date()
+        caps = [d for d in (short_expiry,) if d is not None]
+        cycle = _iso_date(self.leg.marked_expiry)
+        if (cycle is None or cycle < today) and allow_lookup:
+            cycle = self.engine.get_cycle_expiry_date()
+        if cycle is not None and cycle >= today:
+            caps.append(cycle)
+        return min(caps) if caps else None
+
+    def _select_entry_hedge(self, strike, premium, chain_response, expiry_raw) -> Optional[tuple]:
+        """The hedge for a NEW trade: in the weekly resolve_hedge_expiry
+        names, at hedge_premium_pct_of_short of the sold strike's current
+        premium (its chain price now). Returns (hedge, hedge_symbol,
+        hedge_expiry_iso) or None when no hedge strike is available.
+
+        If the options expiry list cannot be read, the hedge goes in the
+        short's own expiry: still a hedge, logged, never a naked short."""
+        short_expiry = datetime.strptime(expiry_raw, "%d-%b-%y").date()
+        cap = self._hedge_cap(short_expiry) or short_expiry
+        try:
+            hedge_expiry = resolve_hedge_expiry(self.engine.client, cap)
+        except RuntimeError as exc:
+            Log.warning(f"[HEDGE_{self.option_type}] option expiry list unavailable ({exc}) -- "
+                        f"hedging in the short's own expiry {short_expiry:%d-%b-%y} instead.")
+            hedge_expiry = short_expiry
+        compact = _expiry_compact(hedge_expiry)
+        roll_note = ("not rolled (shares the cap)" if hedge_expiry >= cap
+                     else f"rolls on {hedge_roll_day(hedge_expiry):%d-%b}")
+        Log.info(f"[HEDGE_{self.option_type}] hedge expiry {hedge_expiry:%d-%b-%y} | short expiry "
+                 f"{short_expiry:%d-%b-%y} | cap {cap:%d-%b-%y} | {roll_note}")
+        # The short scan's chain is for the SHORT's expiry: reusable only
+        # when the hedge is in that same expiry.
+        reuse = chain_response if hedge_expiry == short_expiry else None
+        hedge = select_hedge_strike(
+            self.engine.client, compact, self.option_type, strike, premium, reuse,
+            chain_client=getattr(self.engine, "hedge_chain_client", None),
+        )
+        if hedge is None:
+            return None
+        hedge_symbol = f"{UNDERLYING_SYMBOL}{compact}{int(hedge['strike'])}{self.option_type}"
+        return hedge, hedge_symbol, hedge_expiry.isoformat()
+
+    def _enter(self, symbol, strike, delta, verdict, hedge_symbol, hedge, expiry_date_iso,
+               hedge_expiry_iso=""):
         leg = self.leg
         if leg.position.short_symbol:
             return  # defensive no-op -- evaluate() already branches on this
@@ -2629,6 +2822,7 @@ class MonthlyShortEngine:
             entry_time=datetime.now(IST).isoformat(), entry_px=0.0,
             entry_order_id="", entry_filled=False,
             hedge_symbol=hedge_symbol, hedge_strike=hedge["strike"],
+            hedge_expiry=hedge_expiry_iso,
             execution_id=self.engine.execution_id,
             entry_trigger_verdict=verdict, delta_at_entry=delta,
             expiry_date=expiry_date_iso,
@@ -2722,6 +2916,7 @@ class MonthlyShortEngine:
             hedge_px = float(hedge_fill.get("average_price") or hedge_fill.get("price") or 0.0)
             pos.hedge_entry_px = hedge_px
             pos.hedge_entry_filled = True
+            pos.hedge_entry_time = datetime.now(IST).isoformat()
             self.engine.price_stream.add_instruments([{"symbol": hedge_symbol, "exchange": OPTIONS_EXCHANGE}])
             self.engine.save_state()
             Log.info(f"[MONTHLY_{self.option_type}] Hedge entry filled: {hedge_symbol}@{hedge_px} "
@@ -2730,6 +2925,378 @@ class MonthlyShortEngine:
             self._place_and_watch_short(symbol)
         finally:
             self.engine._pending_fills.discard(self.leg_key)
+
+    # -------------------------------------------------------------------
+    # Weekly hedge rollover
+    # -------------------------------------------------------------------
+    def _roll_target(self, pos) -> Optional[tuple]:
+        """(hedge_expiry, roll_day, cap) for a held hedge that has a later
+        weekly to move to, else None. A hedge with no recorded expiry (opened
+        before weekly hedging) or already at the cap is never rolled."""
+        hx = _iso_date(pos.hedge_expiry)
+        if hx is None:
+            return None
+        cap = self._hedge_cap(_iso_date(pos.expiry_date), allow_lookup=False)
+        if cap is None or hx >= cap:
+            return None
+        return hx, hedge_roll_day(hx), cap
+
+    def _maybe_roll_hedge_bg(self):
+        pos = self.leg.position
+        now = datetime.now(IST)
+        today = now.date()
+        if pos.roll_blocked_date == today.isoformat():
+            return
+        if pos.roll_order_id or pos.roll_symbol:
+            due = True                      # a roll left unfinished: settle it
+        else:
+            target = self._roll_target(pos)
+            if target is None:
+                return
+            hx, roll_day, _cap = target
+            if today < roll_day:
+                return
+            # On the roll day itself from hedge_roll_time; a roll still not
+            # done on a later day (refused yesterday, process down) from the
+            # morning retry time. Both stop at the cutoff.
+            start = config.hedge_roll_time if today == roll_day else config.hedge_roll_morning_retry
+            if now.time() > config.hedge_roll_cutoff:
+                self._alert_roll_not_done(pos, hx, today)
+                return
+            due = now.time() >= start
+        if not due:
+            return
+        if self._next_roll_try is not None and now < self._next_roll_try:
+            return
+        if self.leg_key in self.engine._eval_pending:
+            return
+        self._next_roll_try = now + timedelta(seconds=config.hedge_roll_retry_gap_sec)
+        self._dispatch_bg(self._roll_hedge)
+
+    def _alert_roll_not_done(self, pos, hx, today):
+        if self._roll_alert_day == today.isoformat():
+            return
+        self._roll_alert_day = today.isoformat()
+        if hx < today:
+            tail = (f"it expired on {hx:%d-%b} -- the short has NO hedge now. "
+                    f"Buy a hedge manually or close the short.")
+        elif hx == today:
+            tail = (f"it expires TODAY ({hx:%d-%b}) -- the short has no hedge after the close. "
+                    f"Buy a hedge manually or close the short.")
+        else:
+            tail = (f"the old hedge still covers the short until it expires on {hx:%d-%b}. "
+                    f"Retrying from {config.hedge_roll_morning_retry.strftime('%H:%M')} "
+                    f"tomorrow.")
+        msg = (f"MONTHLY_{self.option_type} weekly hedge roll not done by "
+               f"{config.hedge_roll_cutoff.strftime('%H:%M')}: {pos.hedge_symbol} -- {tail}")
+        Log.error(f"[HEDGE_{self.option_type}] {msg}")
+        self.engine._notify_telegram_error_bg(msg)
+
+    def _short_live_premium(self, pos) -> Optional[float]:
+        ltp = self.engine.price_stream.get_ltp(pos.short_symbol, OPTIONS_EXCHANGE, config.ws_stale_seconds)
+        if ltp is None:
+            ltp = fetch_symbol_ltp(self.engine.client, pos.short_symbol, OPTIONS_EXCHANGE,
+                                   require_two_sided=True)
+        return ltp
+
+    def _exit_in_flight(self, pos) -> bool:
+        return bool(pos.short_exit_order_id or pos.hedge_exit_order_id or pos.error_state
+                    or not pos.short_symbol)
+
+    def _roll_hedge(self):
+        """Runs on _fill_executor under _eval_pending. Holds _pending_fills
+        too, so Force Exit and evaluate() leave the leg alone while hedge
+        symbols are being swapped. Order of work, never reversed:
+
+          SL check -> pick the next weekly's strike -> SL check -> BUY new
+          hedge -> (fill) new hedge becomes the position's hedge, old one a
+          leftover -> SELL the old hedge.
+
+        The short is never without a hedge: the old one is sold only after
+        the new one is filled. A stop loss that fires inside the roll starts
+        the normal exit chain, which owns the leg (and _pending_fills) from
+        then on; the roll stops there."""
+        pos = self.leg.position
+        if self._exit_in_flight(pos) or not (pos.entry_filled and pos.hedge_entry_filled):
+            return
+        if self.leg_key in self.engine._pending_fills:
+            return
+        self.engine._pending_fills.add(self.leg_key)
+        handed_over = False
+        try:
+            self._manage_open_position()
+            if self._exit_in_flight(pos):
+                handed_over = bool(pos.short_exit_order_id and not pos.short_exit_filled)
+                return
+
+            if pos.roll_symbol and not pos.roll_order_id:
+                # Recorded, then the process stopped before placeorder()
+                # answered: an order may or may not exist. Never guess.
+                self._block_roll(pos, f"a restart interrupted the roll to {pos.roll_symbol} "
+                                      f"before its order id was recorded. Check the broker for "
+                                      f"an open BUY of {pos.roll_symbol}.")
+                return
+
+            if pos.roll_order_id:
+                fill = self._settle_roll_order(pos, pos.roll_order_id)
+            else:
+                fill = self._place_roll_buy(pos)
+                if self._exit_in_flight(pos):
+                    handed_over = bool(pos.short_exit_order_id and not pos.short_exit_filled)
+                    return
+            if fill is None:
+                return
+            self._complete_roll(pos, fill)
+            self._sell_leftover_hedges(inline=True)
+        finally:
+            if not handed_over:
+                self.engine._pending_fills.discard(self.leg_key)
+
+    def _block_roll(self, pos, why):
+        pos.roll_symbol = ""
+        pos.roll_strike = 0.0
+        pos.roll_expiry = ""
+        pos.roll_order_id = ""
+        pos.roll_blocked_date = datetime.now(IST).date().isoformat()
+        self.engine.save_state()
+        msg = (f"MONTHLY_{self.option_type} weekly hedge roll stopped for today: {why} "
+               f"The current hedge {pos.hedge_symbol} is kept.")
+        Log.error(f"[HEDGE_{self.option_type}] {msg}")
+        self.engine._notify_telegram_error_bg(msg)
+
+    def _clear_roll(self, pos):
+        pos.roll_symbol = ""
+        pos.roll_strike = 0.0
+        pos.roll_expiry = ""
+        pos.roll_order_id = ""
+        self.engine.save_state()
+
+    def _place_roll_buy(self, pos) -> Optional[dict]:
+        hx = _iso_date(pos.hedge_expiry)
+        cap = self._hedge_cap(_iso_date(pos.expiry_date), allow_lookup=False)
+        ltp = self._short_live_premium(pos)
+        if ltp is None:
+            Log.warning(f"[HEDGE_{self.option_type}] roll: no live premium for {pos.short_symbol} "
+                        f"-- retrying shortly.")
+            return None
+        try:
+            new_expiry = resolve_hedge_expiry(self.engine.client, cap)
+        except RuntimeError as exc:
+            Log.warning(f"[HEDGE_{self.option_type}] roll: option expiry list unavailable "
+                        f"({exc}) -- retrying shortly.")
+            return None
+        if hx is not None and new_expiry <= hx:
+            Log.warning(f"[HEDGE_{self.option_type}] roll: no later weekly than {hx:%d-%b-%y} "
+                        f"within {cap:%d-%b-%y} in the broker's list -- keeping "
+                        f"{pos.hedge_symbol}.")
+            return None
+        target = ltp * config.hedge_premium_pct_of_short / 100.0
+        Log.info(f"[HEDGE_{self.option_type}] roll: sold strike {pos.short_symbol} now={ltp:.2f} "
+                 f"-> target {target:.2f} ({config.hedge_premium_pct_of_short:.0f}%) | "
+                 f"{pos.hedge_symbol} expires {hx:%d-%b-%y}, moving to {new_expiry:%d-%b-%y}")
+        compact = _expiry_compact(new_expiry)
+        hedge = select_hedge_strike(
+            self.engine.client, compact, self.option_type, pos.short_strike, ltp, None,
+            chain_client=getattr(self.engine, "hedge_chain_client", None),
+        )
+        if hedge is None:
+            Log.warning(f"[HEDGE_{self.option_type}] roll: no {new_expiry:%d-%b-%y} strike with a "
+                        f"usable premium -- keeping {pos.hedge_symbol}, retrying shortly.")
+            return None
+        symbol = f"{UNDERLYING_SYMBOL}{compact}{int(hedge['strike'])}{self.option_type}"
+        if symbol == pos.hedge_symbol:
+            return None
+        # The chain read can take 20-40s on Shoonya: look at the stop again
+        # before committing to an order.
+        self._manage_open_position()
+        if self._exit_in_flight(pos):
+            return None
+
+        pos.roll_symbol = symbol
+        pos.roll_strike = float(hedge["strike"])
+        pos.roll_expiry = new_expiry.isoformat()
+        pos.roll_order_id = ""
+        self.engine.save_state()
+        try:
+            order_id = place(self.engine.client, self.engine.env.strategy_tag, symbol,
+                             OPTIONS_EXCHANGE, "BUY", pos.quantity)
+        except Exception as exc:
+            if str(exc).startswith("placeorder failed for"):
+                # A clean refusal from the broker: nothing was placed.
+                Log.warning(f"[HEDGE_{self.option_type}] roll: BUY {symbol} refused ({exc}) -- "
+                            f"keeping {pos.hedge_symbol}, retrying shortly.")
+                self._clear_roll(pos)
+                return None
+            Log.exception(f"[HEDGE_{self.option_type}] roll: placeorder for {symbol} raised")
+            self._block_roll(pos, f"the BUY of {symbol} returned no clear answer from the broker "
+                                  f"({exc}). Check the broker for that order.")
+            return None
+        pos.roll_order_id = order_id
+        self.engine.save_state()
+        return self._settle_roll_order(pos, order_id)
+
+    def _settle_roll_order(self, pos, order_id) -> Optional[dict]:
+        """Drive a roll BUY to a final answer: its fill (returned), or a
+        clear refusal (roll fields cleared, retried later). An order still
+        resting after the reprices is cancelled rather than left to fill
+        unwatched; if it completed meanwhile, that fill is used."""
+        symbol = pos.roll_symbol
+        try:
+            return poll_fill(self.engine.client, order_id, self.engine.env.strategy_tag,
+                             symbol, OPTIONS_EXCHANGE, "BUY", pos.quantity)
+        except (RuntimeError, TimeoutError) as exc:
+            Log.warning(f"[HEDGE_{self.option_type}] roll: BUY {symbol} did not fill ({exc}) -- "
+                        f"keeping {pos.hedge_symbol}, retrying shortly.")
+            self._clear_roll(pos)
+            return None
+        except OrderNeedsAttention:
+            pass
+        except Exception as exc:
+            Log.exception(f"[HEDGE_{self.option_type}] roll: fill check for {symbol} failed: {exc}")
+            return None   # roll_order_id kept: the next attempt checks it again
+        try:
+            self.engine.client.cancelorder(order_id=order_id, strategy=self.engine.env.strategy_tag)
+        except Exception as exc:
+            Log.warning(f"[HEDGE_{self.option_type}] roll: cancel of resting {order_id} failed: {exc}")
+        try:
+            data = self.engine.client.orderstatus(
+                order_id=order_id, strategy=self.engine.env.strategy_tag).get("data", {})
+        except Exception as exc:
+            Log.warning(f"[HEDGE_{self.option_type}] roll: status of {order_id} unreadable: {exc}")
+            return None   # kept: checked again next attempt
+        status = str(data.get("order_status", "")).lower()
+        if status == "complete":
+            return data
+        if status in {"rejected", "cancelled", "canceled"}:
+            Log.warning(f"[HEDGE_{self.option_type}] roll: resting BUY {symbol} cancelled -- "
+                        f"keeping {pos.hedge_symbol}, retrying shortly.")
+            self._clear_roll(pos)
+            return None
+        Log.warning(f"[HEDGE_{self.option_type}] roll: BUY {order_id} still '{status}' after "
+                    f"cancel -- checking again next attempt.")
+        return None
+
+    def _complete_roll(self, pos, fill):
+        px = float(fill.get("average_price") or fill.get("price") or 0.0)
+        now_iso = datetime.now(IST).isoformat()
+        old = {
+            "symbol": pos.hedge_symbol, "quantity": pos.quantity,
+            "entry_px": pos.hedge_entry_px, "entry_time": pos.hedge_entry_time or pos.entry_time,
+            "expiry": pos.hedge_expiry, "execution_id": pos.execution_id, "sell_order_id": "",
+        }
+        self.leg.leftover_hedges.append(old)
+        pos.hedge_symbol = pos.roll_symbol
+        pos.hedge_strike = pos.roll_strike
+        pos.hedge_expiry = pos.roll_expiry
+        pos.hedge_entry_px = px
+        pos.hedge_entry_order_id = pos.roll_order_id
+        pos.hedge_entry_time = now_iso
+        pos.roll_symbol = ""
+        pos.roll_strike = 0.0
+        pos.roll_expiry = ""
+        pos.roll_order_id = ""
+        self.engine.price_stream.add_instruments([{"symbol": pos.hedge_symbol, "exchange": OPTIONS_EXCHANGE}])
+        self.engine.save_state()
+        Log.info(f"[HEDGE_{self.option_type}] roll: bought {pos.hedge_symbol}@{px:.2f} -- now "
+                 f"selling the old hedge {old['symbol']}.")
+
+    def _leftover_sale_due(self) -> bool:
+        now = datetime.now(IST)
+        if not (time(9, 15) <= now.time() <= config.sl_check_end_time):
+            return False
+        if self._next_leftover_try is not None and now < self._next_leftover_try:
+            return False
+        return self.leg_key not in self.engine._eval_pending
+
+    def _sell_leftover_hedges(self, inline: bool = False):
+        """Sell every hedge a roll replaced. Each is independent of the
+        position: it is still sold after the position closes. A hedge whose
+        expiry has passed can no longer be sold and is booked at 0."""
+        if not inline:
+            self._next_leftover_try = datetime.now(IST) + timedelta(
+                seconds=config.leftover_hedge_retry_gap_sec)
+        today = datetime.now(IST).date()
+        for old in list(self.leg.leftover_hedges):
+            symbol = old["symbol"]
+            expiry = _iso_date(old.get("expiry"))
+            if expiry is not None and expiry < today:
+                Log.warning(f"[HEDGE_{self.option_type}] old hedge {symbol} expired on "
+                            f"{expiry:%d-%b} unsold -- booked at 0.00.")
+                self._book_leftover(old, 0.0, "hedge_expired")
+                continue
+            order_id = old.get("sell_order_id") or ""
+            fill = None
+            if order_id:
+                try:
+                    data = self.engine.client.orderstatus(
+                        order_id=order_id, strategy=self.engine.env.strategy_tag).get("data", {})
+                    status = str(data.get("order_status", "")).lower()
+                except Exception as exc:
+                    Log.warning(f"[HEDGE_{self.option_type}] old hedge {symbol}: status of "
+                                f"{order_id} unreadable: {exc}")
+                    continue
+                if status == "complete":
+                    fill = data
+                elif status in {"rejected", "cancelled", "canceled"}:
+                    old["sell_order_id"] = ""
+                    order_id = ""
+                    self.engine.save_state()
+            if fill is None and not order_id:
+                try:
+                    order_id = place(self.engine.client, self.engine.env.strategy_tag, symbol,
+                                     OPTIONS_EXCHANGE, "SELL", int(old["quantity"]))
+                except Exception as exc:
+                    self._leftover_failed(old, f"SELL could not be placed ({exc})")
+                    continue
+                old["sell_order_id"] = order_id
+                self.engine.save_state()
+            if fill is None:
+                try:
+                    fill = poll_fill(self.engine.client, order_id, self.engine.env.strategy_tag,
+                                     symbol, OPTIONS_EXCHANGE, "SELL", int(old["quantity"]))
+                except (RuntimeError, TimeoutError) as exc:
+                    old["sell_order_id"] = ""
+                    self.engine.save_state()
+                    self._leftover_failed(old, f"SELL did not fill ({exc})")
+                    continue
+                except Exception as exc:   # resting or unreadable: checked again next time
+                    self._leftover_failed(old, f"SELL {order_id} not confirmed ({exc})")
+                    continue
+            px = float(fill.get("average_price") or fill.get("price") or 0.0)
+            self._book_leftover(old, px, "hedge_roll")
+
+    def _leftover_failed(self, old, why):
+        Log.warning(f"[HEDGE_{self.option_type}] old hedge {old['symbol']}: {why} -- retrying.")
+        today_iso = datetime.now(IST).date().isoformat()
+        key = f"{today_iso} {old['symbol']}"
+        # One alert per hedge per day; earlier days' markers are dropped so
+        # the set stays bounded in a process that runs for months.
+        self._leftover_alerted = {k for k in self._leftover_alerted if k.startswith(today_iso)}
+        if key not in self._leftover_alerted:
+            self._leftover_alerted.add(key)
+            self.engine._notify_telegram_error_bg(
+                f"MONTHLY_{self.option_type}: the old hedge {old['symbol']} replaced by a weekly "
+                f"roll is not sold yet ({why}). The strategy keeps retrying; it is a bought "
+                f"option, so the most it can lose is what it cost.")
+
+    def _book_leftover(self, old, exit_px, reason):
+        qty = int(old["quantity"])
+        pnl = (exit_px - float(old["entry_px"])) * qty
+        self.engine.state.today_realized_pnl += pnl
+        pos = self.leg.position
+        if pos.short_symbol:
+            pos.hedge_roll_pnl += pnl
+        append_trade_log(self.engine.env.strategy_tag, f"{self.leg_key}_HEDGE", old["symbol"], qty,
+                         old.get("entry_time") or "", float(old["entry_px"]),
+                         datetime.now(IST).isoformat(), exit_px, reason,
+                         old.get("execution_id") or 0, is_short=False)
+        self.leg.leftover_hedges = [h for h in self.leg.leftover_hedges if h is not old]
+        if old["symbol"] not in (pos.short_symbol, pos.hedge_symbol):
+            self.engine.price_stream.remove_instruments(
+                [{"symbol": old["symbol"], "exchange": OPTIONS_EXCHANGE}])
+        self.engine.save_state()
+        Log.info(f"[HEDGE_{self.option_type}] old hedge {old['symbol']} sold @{exit_px:.2f} "
+                 f"(bought {float(old['entry_px']):.2f}, pnl={pnl:+.2f}, {reason})")
 
     # -------------------------------------------------------------------
     # Continuous tiered-SL management
@@ -3055,18 +3622,16 @@ class MonthlyShortEngine:
             Log.info(f"[MONTHLY_{self.option_type}] daily decision: no qualifying strike -- staying flat.")
             return
         strike, delta, premium, verdict, chain_response = result
-        hedge = select_hedge_strike(
-            self.engine.client, expiry_compact, self.option_type, strike, premium, chain_response,
-            chain_client=getattr(self.engine, "hedge_chain_client", None),
-        )
-        if hedge is None:
+        picked = self._select_entry_hedge(strike, premium, chain_response, expiry_raw)
+        if picked is None:
             Log.warning(f"[MONTHLY_{self.option_type}] daily decision: qualifying strike {strike} found "
                         f"but no hedge candidate available -- refusing to sell naked, skipping re-entry.")
             return
+        hedge, hedge_symbol, hedge_expiry_iso = picked
         symbol = f"{UNDERLYING_SYMBOL}{expiry_compact}{int(strike)}{self.option_type}"
-        hedge_symbol = f"{UNDERLYING_SYMBOL}{expiry_compact}{int(hedge['strike'])}{self.option_type}"
         expiry_date_iso = datetime.strptime(expiry_raw, "%d-%b-%y").date().isoformat()
-        self._enter(symbol, strike, delta, verdict, hedge_symbol, hedge, expiry_date_iso)
+        self._enter(symbol, strike, delta, verdict, hedge_symbol, hedge, expiry_date_iso,
+                    hedge_expiry_iso)
 
     # -------------------------------------------------------------------
     # Exit -- short leg first, then hedge leg (AUTHORING_CHECKLIST.md:
@@ -3275,11 +3840,20 @@ class MonthlyShortEngine:
                               pos.execution_id, is_short=True)
         if hedge_was_open:
             append_trade_log(self.engine.env.strategy_tag, f"{self.leg_key}_HEDGE", pos.hedge_symbol,
-                              pos.quantity, pos.entry_time, pos.hedge_entry_px, now_iso, hedge_exit_px,
-                              reason, pos.execution_id, is_short=False)
+                              pos.quantity, pos.hedge_entry_time or pos.entry_time, pos.hedge_entry_px,
+                              now_iso, hedge_exit_px, reason, pos.execution_id, is_short=False)
+        # Hedges rolled out of earlier were booked when each was sold; shown
+        # here so the line carries the position's whole result.
         Log.info(f"[MONTHLY_{self.option_type}] Position closed: short={pos.short_symbol} "
                  f"hedge={pos.hedge_symbol} reason={reason} short_pnl={short_pnl_rupees:.2f} "
-                 f"hedge_pnl={hedge_pnl_rupees:.2f} total_pnl={total_pnl_rupees:.2f}")
+                 f"hedge_pnl={hedge_pnl_rupees:.2f} rolled_hedges_pnl={pos.hedge_roll_pnl:.2f} "
+                 f"total_pnl={total_pnl_rupees + pos.hedge_roll_pnl:.2f}")
+        if pos.roll_symbol or pos.roll_order_id:
+            msg = (f"MONTHLY_{self.option_type} closed while a weekly hedge roll BUY of "
+                   f"{pos.roll_symbol} (order {pos.roll_order_id or 'not recorded'}) was unsettled. "
+                   f"Check the broker: if it filled, that option is no longer tracked.")
+            Log.error(f"[HEDGE_{self.option_type}] {msg}")
+            self.engine._notify_telegram_error_bg(msg)
 
         self.engine.price_stream.remove_instruments([
             {"symbol": pos.short_symbol, "exchange": OPTIONS_EXCHANGE},
@@ -4308,7 +4882,21 @@ class StrategyEngine:
                 open_positions.append({
                     "leg_key": f"{leg_key}_HEDGE", "symbol": pos.hedge_symbol, "direction": "LONG",
                     "quantity": pos.quantity, "entry_price": pos.hedge_entry_px, "current_price": hedge_ltp,
-                    "pnl": hedge_pnl, "entry_time": pos.entry_time, "execution_id": pos.execution_id,
+                    "pnl": hedge_pnl, "entry_time": pos.hedge_entry_time or pos.entry_time,
+                    "execution_id": pos.execution_id,
+                })
+            # Old hedges a weekly roll replaced, until they are sold.
+            for old in leg.leftover_hedges:
+                ltp = self.price_stream.get_ltp(old["symbol"], OPTIONS_EXCHANGE, config.ws_stale_seconds)
+                entry_px = float(old["entry_px"])
+                if ltp is None:
+                    ltp = entry_px
+                qty = int(old["quantity"])
+                open_positions.append({
+                    "leg_key": f"{leg_key}_HEDGE_OLD", "symbol": old["symbol"], "direction": "LONG",
+                    "quantity": qty, "entry_price": entry_px, "current_price": ltp,
+                    "pnl": (ltp - entry_px) * qty, "entry_time": old.get("entry_time") or "",
+                    "execution_id": old.get("execution_id") or 0,
                 })
         return open_positions
 
@@ -4351,6 +4939,11 @@ class StrategyEngine:
                     if side.leg_key not in self._pending_fills and not pos.short_exit_order_id:
                         pos.pending_reentry_search = False
                         side._exit(pos, "force_exit")
+            # Old hedges a weekly roll replaced are part of "flat" too.
+            if side.leg.leftover_hedges:
+                all_flat = False
+                if side.leg_key not in self._pending_fills and side._leftover_sale_due():
+                    side._dispatch_bg(side._sell_leftover_hedges)
         self.save_state()
         if all_flat:
             ack_force_exit_complete(self.env)
@@ -4373,7 +4966,12 @@ def print_banner():
     print(f"SL tier 1            : premium >= entry * {1 + config.sl_tier1_pct / 100.0:.3f}")
     print(f"SL tier 2 (ratchet)  : locks to breakeven once premium <= entry * "
           f"{config.sl_tier2_trigger_pct / 100.0:.2f}")
-    print(f"Hedge target premium : {config.hedge_premium_pct_of_short}% of sold strike's premium")
+    print(f"Hedge target premium : {config.hedge_premium_pct_of_short}% of sold strike's current premium")
+    print("Hedge expiry         : current WEEKLY (next weekly on the day before it expires), "
+          "never past the short's expiry or the cycle square-off")
+    print(f"Hedge rollover       : {config.hedge_roll_time.strftime('%H:%M')}-"
+          f"{config.hedge_roll_cutoff.strftime('%H:%M')} on the trading day before the hedge's "
+          f"expiry (buy new, then sell old)")
     print("Order sequence       : ENTRY hedge BUY -> short SELL | "
           "EXIT short BUY -> hedge SELL")
     print(f"Decision buffer      : +{config.decision_buffer_min} min after each "

@@ -2187,3 +2187,51 @@ have timed out before this. Test: t27.
   position-check lines now read, for example,
   `premium now=135.10 vs ref=154.50 (-19.40) | OI now=1,234,000 vs ref=318,800 (+915,200) -> weakening`.
 - Tests t28 and t29; t6 updated for the new slot list.
+
+## Nifty_OI_Positional_MonthlySell_1: weekly hedge with a rollover (2026-11-05)
+
+The hedge used to sit in the short's own monthly expiry at 20% of the short's
+premium, bought once at entry. It is now a **weekly** hedge at **10% of the
+sold strike's current premium**, rolled every week.
+
+- **Which weekly.** From the NIFTY **options** expiry list
+  (`instrumenttype="options"`, the same source as
+  `Nifty_Sensex_VWAP_NoHA_Intraday.resolve_current_week_expiry`), the first
+  expiry whose roll day is still after today. The roll day is the trading day
+  before the expiry, from `resolve_previous_trading_day`, so holidays and the
+  Muhurat session are skipped (09-Nov-2026 rolls on Friday 06-Nov, 23-Nov on
+  Friday 20-Nov). VWAP switches week only on the expiry day itself; this
+  switches a day earlier, by the author's rule. The monthly short keeps the
+  futures list (`fetch_monthly_expiries`), which has no weeklies.
+- **Cap.** Never later than the short's own expiry or the cycle's square-off
+  date (`marked_expiry`), whichever is sooner. A hedge that has reached the
+  cap is not rolled again.
+- **New trade.** Hedge in the weekly above. On a roll day that is already the
+  next week's expiry (author: "if its one day before expiry, hedge to be
+  taken on next week expiry"). The short scan's chain is reused only when the
+  hedge shares the short's expiry; otherwise the weekly chain is fetched.
+- **Rollover, 15:00-15:20 on the roll day.** The order is fixed: SL check, read
+  the sold strike's live premium, pick the next weekly at 10%, SL check
+  again, BUY the new hedge, and only after it fills SELL the old one. The old
+  hedge's result is a separate trade row (`hedge_roll`), added to the day's
+  PnL and to `rolled_hedges_pnl` on the position's close line.
+- **Failures.** A refused or unfilled BUY keeps the old hedge and retries
+  every 30s until 15:20, then sends one Telegram alert and retries from 09:30
+  on the next trading day. A BUY still resting after the reprices is
+  cancelled, and its fill is used if it completed meanwhile. A placeorder
+  with no clear answer, or a restart between recording the roll and its
+  order id, stops rolling for the day with an alert naming the symbol to
+  check, and never re-buys blind. An old hedge whose SELL fails is kept in
+  `LegState.leftover_hedges` and retried every 60s, even after the position
+  has closed; one past its expiry is booked at 0.
+- **Positions opened before this change** have no `hedge_expiry` and are
+  never rolled (the open 23-Nov PE's hedge already shares its expiry).
+- **Measured live, 05-Nov-2026:** a weekly chain on Shoonya takes 17.5s at 30
+  strikes, 21.2s at 60, 37.0s at 100, all inside the 60s chain client. A roll
+  reaching a 10% target took 34.6s (30, then 60 strikes); the SL is checked
+  before and after that read.
+- **Known limit:** the roll's BUY uses the shared `poll_fill`, so in the worst
+  case (an order that will not fill) the leg's SL waits for its reprices, the
+  same as for any other order this script sends.
+- Tests t30-t37 (t23 and t27 now pin the old 20% target: they test chain
+  widening, not the percentage).
