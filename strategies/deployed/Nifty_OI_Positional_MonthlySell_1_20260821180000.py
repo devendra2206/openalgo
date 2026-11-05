@@ -2795,10 +2795,11 @@ class MonthlyShortEngine:
                 premium_change = current["premium"] - ref_reading["premium"]
                 oi_change = current["oi"] - ref_reading["oi"]
                 verdict = classify_oi_premium(premium_change, oi_change)
+                # Reference values printed too (author 2026-11-05), the same
+                # wording as the candidate and position-check lines.
                 Log.info(f"[MONTHLY_{self.option_type}] (open) candle={current['timestamp']} "
-                         f"symbol={pos.short_symbol} premium={current['premium']:.2f} "
-                         f"premium_chg={premium_change:+.2f} oi_chg={oi_change:+.0f} verdict={verdict} "
-                         f"sl_price={sl_price:.2f} tier2_locked={pos.sl_tier2_locked}")
+                         f"symbol={pos.short_symbol} | {_oi_comparison(current, ref_reading)} "
+                         f"-> {verdict} | sl_price={sl_price:.2f} tier2_locked={pos.sl_tier2_locked}")
                 self._last_logged_boundary = boundary_key
 
     # -------------------------------------------------------------------

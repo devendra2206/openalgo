@@ -924,9 +924,9 @@ def main():
             m.fetch_candle_oi_premium, m.fetch_reference_oi_premium = orig
         line = next((l for l in lines if "(open)" in l), "")
         want = m.classify_oi_premium(119.10 - 121.00, 714675.0 - 700000.0)
-        assert "premium_chg=-1.90" in line, line
-        assert "oi_chg=+14675" in line, line
-        assert f"verdict={want}" in line, line
+        assert "premium now=119.10 vs ref=121.00 (-1.90)" in line, line
+        assert "OI now=714,675 vs ref=700,000 (+14,675)" in line, line
+        assert f"-> {want} |" in line, line
 
     @case("the hedge chain reaches the 20% target instead of stopping at the scan's edge")
     def t23():
