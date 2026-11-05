@@ -2124,3 +2124,49 @@ series. If an indicator spans the day boundary on intraday candles, rebuild
 each completed day's last candle from that day's 1m bars before computing.
 The 15:31 same-day check is not a valid test of this: the candle only
 changes the next morning.
+
+## Shoonya option chain is slow: size client timeouts from measurements (2026-11-05)
+
+**What went wrong.** The hedge fix above widened the hedge's option chain
+to 30, then 60, then 100 strikes, and I estimated "a second or two" without
+measuring. Live on 05-Nov-2026 the 30-strike call timed out on the strategy's
+10s client timeout (`Environment.timeout`), and the hedge fell back to
+23600PE at 68.90 against a 26.33 target. The `Nifty_LEAPS_OptionsSell_1`
+config comment already recorded 32.5s for a 120-strike request; I had not
+read it.
+
+**Why it is slow.** On Shoonya, OpenAlgo quotes an option chain in batches
+of 20 symbols with a 1s pause between batches
+(`broker/shoonya/api/data.py`, `get_multiquotes`: `BATCH_SIZE = 20`,
+`RATE_LIMIT_DELAY = 1.0`). A chain of strike_count N holds 2N+1 strikes, CE
+and PE each, so the time grows with N. Measured live on 05-Nov-2026 against
+the production server, with `with_quotes=True`:
+
+| strike_count | strikes | time |
+|---|---|---|
+| 16 (short scan, band 1) | 33 | 6.3s |
+| 30 | 61 | 10.0s |
+| 60 | 121 | 19.4s |
+| 100 | 201 | 35.9s |
+
+**Fix in `Nifty_OI_Positional_MonthlySell_1`.** A separate client
+(`Broker.connect_hedge_chain_client`, `Environment.hedge_chain_timeout =
+60.0`) is used for option-chain calls only: the short scan and the hedge's
+wider chain. Orders, quotes and history keep the 10s and 3s timeouts, so
+nothing that places or checks an order waits 60s. A widened hedge search
+can now take up to about 30s before the hedge order goes in (30 then 60
+strikes); the short scan's band 2 (32 strikes, about 10.5s) would also
+have timed out before this. Test: t27.
+
+**Rule for any new strategy or change on Shoonya:**
+- **Measure any new or wider API call against the live server before
+  shipping it**, at the size the code will request, and set the timeout
+  from that number with headroom. Never estimate a latency.
+- **Option chains, multiquotes and long history ranges get their own
+  longer-timeout client.** Never raise the main client's timeout to fit
+  them: order placement and fill polling must keep failing fast.
+- **A timeout must fail safe.** Every chain caller here turns a failure
+  into "no entry this time" or the closest strike already in hand, never a
+  naked short; keep it that way.
+- **Read the other deployed scripts' config comments for a measured number
+  before writing a new one.** Several record real latencies.

@@ -1107,8 +1107,54 @@ def main():
         assert "NIFTY at 09:31:00=24340.35" in line, line
         assert not eng.state.reference.computed, "a gap day waits for 09:45, not prev_close"
 
+    @case("the hedge's wide chain goes through the long-timeout client, nothing else does")
+    def t27():
+        """Live 05-Nov-2026: strike_count=30 timed out on the main client's
+        10s (Shoonya quotes 20 symbols per batch with a 1s pause), so the
+        hedge fell back to 23600PE at 68.90 against a 26.33 target."""
+        def chain(count):
+            rows = [{"strike": float(23800 + 50 * i),
+                     "ce": {"ltp": round(max(1.0, 300 - 0.3 * 50 * i), 2)} if i >= 0 else None,
+                     "pe": None} for i in range(-count, count + 1)]
+            return {"status": "success", "chain": rows}
+
+        class Main:
+            def __init__(self):
+                self.calls = 0
+
+            def optionchain(self, **k):
+                self.calls += 1
+                return {"status": "error", "message": "Request timed out.",
+                        "error_type": "timeout_error"}
+
+        class Long:
+            def __init__(self):
+                self.counts = []
+
+            def optionchain(self, **k):
+                self.counts.append(k["strike_count"])
+                return chain(k["strike_count"])
+
+        main_c, long_c = Main(), Long()
+        h = m.select_hedge_strike(main_c, "23NOV26", "CE", 24300.0, 121.55, chain(16),
+                                  chain_client=long_c)
+        assert main_c.calls == 0, "the wide chain must not use the 10s client"
+        assert long_c.counts == [30] and h["strike"] == 24700.0, (long_c.counts, h)
+
+        # without a long client it still works through the main one
+        main_c = Main()
+        h = m.select_hedge_strike(main_c, "23NOV26", "CE", 24300.0, 121.55, chain(16))
+        assert main_c.calls == 1 and h["strike"] == 24600.0, (main_c.calls, h)
+
+        # the engine hands its long client to both entry paths
+        src = SCRIPT.read_text(encoding="utf-8")
+        assert src.count('chain_client=getattr(self.engine, "hedge_chain_client", None)') == 3,             "both hedge calls and the short scan must get the long-timeout client"
+        assert src.count("(chain_client or client).optionchain(") == 2
+        assert "timeout=self.env.hedge_chain_timeout" in src
+        assert "self.hedge_chain_timeout = 60.0" in src
+
     for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19,
-               t20, t21, t22, t23, t24, t25, t26):
+               t20, t21, t22, t23, t24, t25, t26, t27):
         fn()
 
     print("\n" + "=" * 74)

@@ -591,6 +591,12 @@ class Environment:
         self.version = "v1"
         self.timeout = 10.0
         self.ltp_timeout = 3.0
+        # Option-chain calls only: the short scan and the hedge's wider chain.
+        # Shoonya quotes a chain in batches of 20 symbols with a 1s pause
+        # between them. Measured live 05-Nov-2026: strike_count 16 6.3s,
+        # 30 10.0s (timed out on the 10s above), 60 19.4s, 100 35.9s.
+        # Orders, quotes and history keep their own shorter timeouts.
+        self.hedge_chain_timeout = 60.0
         self.ws_url = os.getenv("WEBSOCKET_URL")
         self.strategy_tag = (
             os.getenv("OPENALGO_STRATEGY_TAG")
@@ -653,6 +659,18 @@ class Broker:
         )
         Log.info("Connected to OpenAlgo")
         return self.client
+
+    def connect_hedge_chain_client(self):
+        """A client used ONLY for option-chain calls (the short scan and the
+        hedge's wider chain), with Environment.hedge_chain_timeout -- see that
+        setting. Kept separate so no order or quote call ever inherits a 60s
+        wait."""
+        return api(
+            api_key=self.env.api_key,
+            host=self.env.host,
+            version=self.env.version,
+            timeout=self.env.hedge_chain_timeout,
+        )
 
     def connect_ltp_client(self):
         return api(
@@ -1346,7 +1364,8 @@ def _legs_with_strike(chain: dict, option_type: str) -> list:
 def select_qualifying_monthly_strike(client, spot: float, expiry_raw: str, option_type: str,
                                       reference: "ReferenceSnapshot",
                                       require_fresh_by: Optional[datetime] = None,
-                                      current_interval: Optional[str] = None) -> Optional[tuple]:
+                                      current_interval: Optional[str] = None,
+                                      chain_client=None) -> Optional[tuple]:
     """Extends Nifty_OI_WeeklyBuy_MonthlySell's select_monthly_delta_strike --
     PURE delta-closeness ranking to config.monthly_delta_target (0.27), no
     premium filter anywhere. Keeps that function's expanding-band-scan
@@ -1410,7 +1429,9 @@ def select_qualifying_monthly_strike(client, spot: float, expiry_raw: str, optio
         # band's width. Feeding the right forward reproduced the server's
         # delta to four decimals on all 13 strikes, which is why taking the
         # server's value directly is the simpler fix.
-        resp = client.optionchain(
+        # chain_client carries hedge_chain_timeout: band 1 (16 strikes) took
+        # 6.3s live on Shoonya and band 2 (32) ~10.5s, past the main 10s.
+        resp = (chain_client or client).optionchain(
             underlying=UNDERLYING_SYMBOL, exchange=UNDERLYING_SPOT_EXCHANGE,
             expiry_date=_compact_expiry(expiry_raw), strike_count=strike_count,
             with_quotes=True, with_greeks=True,
@@ -1522,7 +1543,8 @@ def select_qualifying_monthly_strike(client, spot: float, expiry_raw: str, optio
 
 
 def select_hedge_strike(client, expiry_compact: str, option_type: str, sold_strike: float,
-                         sold_premium: float, chain_response: Optional[dict] = None) -> Optional[dict]:
+                         sold_premium: float, chain_response: Optional[dict] = None,
+                         chain_client=None) -> Optional[dict]:
     """PREMIUM-based selection (unlike the short leg, the hedge IS chosen by
     premium target, per spec): the strike beyond sold_strike (further-OTM CE
     for a sold CE, further-OTM PE for a sold PE) whose premium is closest to
@@ -1560,7 +1582,9 @@ def select_hedge_strike(client, expiry_compact: str, option_type: str, sold_stri
         count = config.hedge_strike_scan_count
         while True:
             try:
-                resp = client.optionchain(
+                # chain_client carries the long hedge_chain_timeout: a wide
+                # chain takes 6-20s+ on Shoonya, past the main client's 10s.
+                resp = (chain_client or client).optionchain(
                     underlying=UNDERLYING_SYMBOL, exchange=UNDERLYING_SPOT_EXCHANGE,
                     expiry_date=expiry_compact, strike_count=count,
                     with_quotes=True,   # ONE batched call per width
@@ -2526,6 +2550,7 @@ class MonthlyShortEngine:
                     self.engine.client, spot, expiry_raw, self.option_type,
                     self.engine.state.reference, require_fresh_by=fresh_gate,
                     current_interval=current_interval,
+                    chain_client=getattr(self.engine, "hedge_chain_client", None),
                 )
             except CandleNotYetFresh as exc:
                 Log.info(f"[MONTHLY_{self.option_type}] candle not yet published by broker "
@@ -2563,7 +2588,8 @@ class MonthlyShortEngine:
         strike, delta, premium, verdict, chain_response = result
 
         hedge = select_hedge_strike(
-            self.engine.client, expiry_compact, self.option_type, strike, premium, chain_response
+            self.engine.client, expiry_compact, self.option_type, strike, premium, chain_response,
+            chain_client=getattr(self.engine, "hedge_chain_client", None),
         )
         if hedge is None:
             Log.warning(f"[MONTHLY_{self.option_type}] qualifying short strike {strike} found but no "
@@ -3004,7 +3030,8 @@ class MonthlyShortEngine:
             return
         strike, delta, premium, verdict, chain_response = result
         hedge = select_hedge_strike(
-            self.engine.client, expiry_compact, self.option_type, strike, premium, chain_response
+            self.engine.client, expiry_compact, self.option_type, strike, premium, chain_response,
+            chain_client=getattr(self.engine, "hedge_chain_client", None),
         )
         if hedge is None:
             Log.warning(f"[MONTHLY_{self.option_type}] daily decision: qualifying strike {strike} found "
@@ -3610,8 +3637,9 @@ class MonthlyShortEngine:
 ###############################################################################
 class StrategyEngine:
     def __init__(self, client, state_store: StateStore, env: Environment, price_stream: PriceStream,
-                 execution_id: int, ltp_client):
+                 execution_id: int, ltp_client, hedge_chain_client=None):
         self.client = client
+        self.hedge_chain_client = hedge_chain_client
         self.state_store = state_store
         self.state = state_store.state
         self.env = env
@@ -4366,6 +4394,7 @@ def main():
     broker = Broker(env)
     client = broker.connect()
     ltp_client = broker.connect_ltp_client()
+    hedge_chain_client = broker.connect_hedge_chain_client()
 
     price_stream = PriceStream(client)
 
@@ -4419,7 +4448,7 @@ def main():
     print("=" * 70)
 
     engine = StrategyEngine(client, state_store, env, price_stream, execution_id=execution_id,
-                             ltp_client=ltp_client)
+                             ltp_client=ltp_client, hedge_chain_client=hedge_chain_client)
 
     # Crash-recovery reconciliation FIRST -- resolves the narrow
     # order-placed-but-not-yet-confirmed window before anything else
