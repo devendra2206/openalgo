@@ -278,7 +278,8 @@ def main():
         got = m._with_buffer(time(11, 30))
         assert got == time(11, 31), got
         slots = list(m.config.daily_decision_times)
-        for probe, want in ((time(11, 30, 30), None), (time(11, 31), time(11, 30)),
+        for probe, want in ((time(9, 45, 30), None), (time(9, 46), time(9, 45)),
+                            (time(11, 30, 30), time(9, 45)), (time(11, 31), time(11, 30)),
                             (time(15, 31), time(15, 30))):
             el = [t for t in slots if probe >= m._with_buffer(t)]
             assert (el[-1] if el else None) == want, f"at {probe} expected {want}, got {el}"
@@ -1153,8 +1154,100 @@ def main():
         assert "timeout=self.env.hedge_chain_timeout" in src
         assert "self.hedge_chain_timeout = 60.0" in src
 
+    @case("09:46 entry check: a flat leg searches, an open leg is left alone")
+    def t28():
+        """Author 2026-11-05: "9:46 if position is not open, then take
+        position", every trading day. Drives the real _maybe_daily_decision_bg
+        and _daily_decision."""
+        assert time(9, 45) in m.config.daily_decision_times
+        assert m.config.entry_only_times == (time(9, 45),)
+        # flat leg: 09:46 runs the 09:45 slot, which searches
+        eng = make_engine(m)
+        side = make_side(m, eng, "CE")
+        searched = []
+        side._search_and_enter_fresh = lambda slot=None: searched.append(slot)
+        with _Clock(date(2026, 11, 6), time(9, 45, 30)):
+            side._maybe_daily_decision_bg()
+        assert searched == [], "09:45:30 is inside the 1-minute buffer"
+        with _Clock(date(2026, 11, 6), time(9, 46)):
+            side._maybe_daily_decision_bg()
+            side._maybe_daily_decision_bg()          # a second tick must not repeat it
+        assert searched == [time(9, 45)], searched
+        assert side.leg.last_daily_decision_date == "2026-11-06 09:45"
+
+        # open leg: no verdict check, no exit, a log line saying so
+        eng = make_engine(m)
+        side = make_side(m, eng, "PE")
+        _open_leg(side, "PE")
+        side.leg.marked_expiry = "2026-11-23"
+        calls = []
+        side._reclassify_with_retry = lambda *a, **k: calls.append("reclassify") or "accumulation"
+        side._exit = lambda p, r: calls.append(("exit", r))
+        side._search_and_enter_fresh = lambda slot=None: calls.append("search")
+        lines = []
+        h = logging.Handler()
+        h.emit = lambda r: lines.append(r.getMessage())
+        m.Log.logger.addHandler(h)
+        try:
+            with _Clock(date(2026, 11, 6), time(9, 46)):
+                side._daily_decision(time(9, 45))
+        finally:
+            m.Log.logger.removeHandler(h)
+        assert calls == [], f"09:45 must not judge or close an open leg: {calls}"
+        assert any("09:45 entry check: SPE already open" in ln for ln in lines), lines
+
+        # the same open leg IS judged at 11:30, unchanged
+        with _Clock(date(2026, 11, 6), time(11, 31)):
+            side._daily_decision(time(11, 30))
+        assert calls[:1] == ["reclassify"], calls
+
+        # the expiry-day square-off at 15:30 is unaffected
+        side2 = make_side(m, make_engine(m), "CE")
+        _open_leg(side2)
+        side2.leg.marked_expiry = "2026-11-23"
+        done = []
+        side2._exit = lambda p, r: done.append(r)
+        with _Clock(date(2026, 11, 23), time(9, 46)):
+            side2._daily_decision(time(9, 45))
+        assert done == [], "no square-off at 09:45 on the expiry date"
+        with _Clock(date(2026, 11, 23), time(15, 31)):
+            side2._daily_decision(time(15, 30))
+        assert done == ["expiry_day_close"], done
+
+    @case("every check logs the premium and OI it compares, now and reference")
+    def t29():
+        """Author 2026-11-05: "print new OI and prices that are being
+        compared". Candidate lines and position-check lines both carry them."""
+        cur = {"premium": 135.10, "oi": 1234000.0}
+        ref = {"premium": 154.50, "oi": 318800.0}
+        txt = m._oi_comparison(cur, ref)
+        assert txt == ("premium now=135.10 vs ref=154.50 (-19.40) | "
+                       "OI now=1,234,000 vs ref=318,800 (+915,200)"), txt
+        # the real position-check path prints it with its verdict
+        eng = make_engine(m)
+        side = make_side(m, eng, "PE")
+        _open_leg(side, "PE")
+        orig = (m.fetch_live_oi_premium, m.fetch_reference_oi_premium)
+        m.fetch_live_oi_premium = lambda *a, **k: dict(cur)
+        m.fetch_reference_oi_premium = lambda *a, **k: dict(ref)
+        lines = []
+        h = logging.Handler()
+        h.emit = lambda r: lines.append(r.getMessage())
+        m.Log.logger.addHandler(h)
+        try:
+            v = side._fresh_oi_reclassify(side.leg.position)
+        finally:
+            m.Log.logger.removeHandler(h)
+            m.fetch_live_oi_premium, m.fetch_reference_oi_premium = orig
+        want = m.classify_oi_premium(-19.40, 915200.0)
+        assert v == want
+        assert any(ln == f"[MONTHLY_PE] position check SPE: {txt} -> {want}" for ln in lines), lines
+        # the candidate line uses the same helper
+        src = SCRIPT.read_text(encoding="utf-8")
+        assert "| {_oi_comparison(current, ref_reading)} " in src
+
     for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19,
-               t20, t21, t22, t23, t24, t25, t26, t27):
+               t20, t21, t22, t23, t24, t25, t26, t27, t28, t29):
         fn()
 
     print("\n" + "=" * 74)

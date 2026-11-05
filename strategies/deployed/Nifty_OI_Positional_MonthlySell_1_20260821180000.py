@@ -254,7 +254,13 @@ class Config:
     # The 15:30 slot now sits AT the close rather than fifteen minutes before
     # it, so its fill is the closing price. The last complete 15-minute candle
     # at 15:30 is the 15:15-15:29 bucket.
-    daily_decision_times: tuple = (time(11, 30), time(13, 30), time(15, 30))
+    daily_decision_times: tuple = (time(9, 45), time(11, 30), time(13, 30), time(15, 30))
+    # Slots that only ENTER: a flat leg searches and may enter, an open leg is
+    # left alone (its stop-loss keeps running). Author 2026-11-05: "9:46 if
+    # position is not open, then take position", every trading day. With the
+    # 1-minute buffer it runs at 09:46, which on a gap day is also when the
+    # 09:30 reference is fixed -- _ensure_reference runs first in that tick.
+    entry_only_times: tuple = (time(9, 45),)
     # The last slot, kept under the old single-decision name so any reader of
     # it resolves to a sane value instead of raising.
     daily_decision_time: time = time(15, 30)
@@ -1533,13 +1539,23 @@ def select_qualifying_monthly_strike(client, spot: float, expiry_raw: str, optio
         oi_change = current["oi"] - ref_reading["oi"]
         verdict = classify_oi_premium(premium_change, oi_change)
         Log.info(f"[MONTHLY_{option_type}] candidate strike={strike} delta={candidate['delta']:.4f} "
-                  f"(diff={candidate['diff']:.4f}) premium={candidate['premium']:.2f} verdict={verdict}")
+                  f"(diff={candidate['diff']:.4f}) | {_oi_comparison(current, ref_reading)} "
+                  f"-> {verdict}")
         if verdict == config.short_verdict:
             return strike, candidate["delta"], candidate["premium"], verdict, last_chain_response
 
     Log.info(f"[MONTHLY_{option_type}] no candidate (of {len(ranked)} scanned) passed the "
               f"OI filter (need {config.short_verdict}) -- no qualifying strike this cycle.")
     return None
+
+
+def _oi_comparison(current: dict, ref: dict) -> str:
+    """The numbers a verdict is decided on, for the log (author 2026-11-05:
+    "print new OI and prices that are being compared")."""
+    pc = current["premium"] - ref["premium"]
+    oc = current["oi"] - ref["oi"]
+    return (f"premium now={current['premium']:.2f} vs ref={ref['premium']:.2f} ({pc:+.2f}) | "
+            f"OI now={current['oi']:,.0f} vs ref={ref['oi']:,.0f} ({oc:+,.0f})")
 
 
 def select_hedge_strike(client, expiry_compact: str, option_type: str, sold_strike: float,
@@ -2876,6 +2892,12 @@ class MonthlyShortEngine:
                 self._exit(pos, "expiry_day_close")
                 return  # terminal -- no new-position search follows today
 
+        if pos.short_symbol and slot_now in config.entry_only_times:
+            Log.info(f"[MONTHLY_{self.option_type}] {slot_now.strftime('%H:%M')} entry check: "
+                     f"{pos.short_symbol} already open -- nothing to do at this check "
+                     f"(its verdict is next checked at 11:30).")
+            return
+
         if pos.short_symbol:
             verdict = self._reclassify_with_retry(pos, slot_time or config.daily_decision_time)
             if pos.error_state:
@@ -2953,7 +2975,10 @@ class MonthlyShortEngine:
             return None
         premium_change = current["premium"] - ref_reading["premium"]
         oi_change = current["oi"] - ref_reading["oi"]
-        return classify_oi_premium(premium_change, oi_change)
+        verdict = classify_oi_premium(premium_change, oi_change)
+        Log.info(f"[MONTHLY_{self.option_type}] position check {pos.short_symbol}: "
+                 f"{_oi_comparison(current, ref_reading)} -> {verdict}")
+        return verdict
 
     def _reclassify_with_retry(self, pos, trigger_time: time) -> Optional[str]:
         """Bounded retry mirroring _select_qualifying_strike_with_retry, for
@@ -4366,8 +4391,9 @@ def print_banner():
               "into expiry unmanaged."
         )
     print("Position checks      : "
-          + " ".join(t.strftime('%H:%M') for t in config.daily_decision_times)
-          + " (non-entry days)")
+          + " ".join(t.strftime('%H:%M') + (" (entry only)" if t in config.entry_only_times else "")
+                     for t in config.daily_decision_times)
+          + "  (+1 min buffer each)")
     print(f"Short when verdict   : {config.short_verdict}   "
           f"(hold while {config.hold_verdict})")
     print(f"SL check window      : {config.sl_check_start_time.strftime('%H:%M')}"

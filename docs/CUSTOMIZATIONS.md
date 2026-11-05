@@ -2170,3 +2170,20 @@ have timed out before this. Test: t27.
   naked short; keep it that way.
 - **Read the other deployed scripts' config comments for a measured number
   before writing a new one.** Several record real latencies.
+
+## Nifty_OI_Positional_MonthlySell_1: 09:46 entry check, compared values in the log (2026-11-05)
+
+- **09:45 entry-only check, every trading day** (author: "9:46 if position
+  is not open, then take position"). `daily_decision_times` is now 09:45,
+  11:30, 13:30, 15:30, each run one minute late; `entry_only_times =
+  (09:45,)`. At 09:46 a flat leg searches with the usual rules and may
+  enter; an open leg is left alone (its stop-loss keeps running, its verdict
+  is next judged at 11:30). On a gap day the 09:30 reference is fixed in the
+  same 09:46 tick, before the legs are evaluated. On the expiry date a 09:46
+  entry past day 15 takes next month's contract and is squared off at 15:30
+  with everything else, as the existing expiry-day rule already does for
+  11:30 and 13:30.
+- **Every check logs the numbers it decides on.** Candidate lines and
+  position-check lines now read, for example,
+  `premium now=135.10 vs ref=154.50 (-19.40) | OI now=1,234,000 vs ref=318,800 (+915,200) -> weakening`.
+- Tests t28 and t29; t6 updated for the new slot list.
