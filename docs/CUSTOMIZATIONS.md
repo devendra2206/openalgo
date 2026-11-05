@@ -2235,3 +2235,47 @@ sold strike's current premium**, rolled every week.
   same as for any other order this script sends.
 - Tests t30-t37 (t23 and t27 now pin the old 20% target: they test chain
   widening, not the percentage).
+
+## Nifty_OI_Positional_MonthlySell_1: delta 0.22-0.32 is a hard limit (2026-11-05)
+
+Before, 0.22-0.32 only decided whether the scan widened from 8 to 16 strikes:
+every scanned strike was ranked by closeness to 0.27 and the first weakening
+one was sold, whatever its delta. The live 05-Nov 13:31 CE scan ranked 24600CE
+(0.467) and 25300CE (0.139) as candidates. Now (author: "delta .32 make it
+hard limit", and 0.22 too) a strike whose |delta| is outside 0.22-0.32 is
+never sold, edges included; the log lists them as "outside delta 0.22-0.32,
+not considered". If no strike inside the range is weakening, there is no
+trade. Test t40.
+
+## Strategy scripts cannot import platform `utils`: trading calendar via the API (2026-11-05)
+
+The strategy host starts `python -u strategies/scripts/<file>.py` with the app
+root as cwd, so only the **scripts folder** is on `sys.path`.
+`from utils.trading_calendar import ...` therefore always failed in a running
+strategy, and the scripts silently used a weekends-only calendar. The live OI
+log of 05-Nov-2026 showed `Trading Calendar : NOT LOADED`. Local tests never
+saw it because their loaders add the path themselves. Reproduced with the
+host's path: `No module named 'utils'`.
+
+- **Fix (OI positional and both LEAPS):** holidays come from the OpenAlgo API,
+  `client.holidays(year)`, which reads the same `market_holidays` table as
+  `utils.trading_calendar`. Each year is fetched once and kept; a failure
+  falls back to weekends only, warns at most every 5 minutes, and is retried
+  after 5 minutes. The health check prints the result.
+- **Rules:** closed = `TRADING_HOLIDAY` with `NFO` in `closed_exchanges`.
+  `SPECIAL_SESSION` (Muhurat) is a session (OI skips it for the previous
+  close; LEAPS never rolls on it). `SETTLEMENT_HOLIDAY` closes nothing,
+  unlike `utils.trading_calendar`, which counts any entry with no closed
+  exchanges as a special session.
+- **An empty list is "not loaded".** The platform answers `success` with
+  `[]` both for a year it has no seed for (`seed_holidays_2027` does not
+  exist yet) and when its own database read fails.
+- **What it had broken:** OI's previous close on 25-Nov-2026 (would read
+  24-Nov, a holiday) and holiday-adjacent weekly roll days; in LEAPS an 18th
+  that is a weekday holiday became a roll date the strategy never runs on, so
+  that month's hedge roll was skipped (not "one day early or late", as its
+  comment claimed). No 18th in Nov or Dec 2026 is a holiday.
+- **Rule for new scripts:** do not import from `utils/`, `services/` or
+  `database/` in a strategy. Use the OpenAlgo API, and check a dependency
+  with the host's import path, not with a test loader.
+- Tests: OI t41; `test/test_leaps_calendar.py` (8, both scripts).

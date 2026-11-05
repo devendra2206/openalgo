@@ -10,9 +10,10 @@ Python      : >= 3.11
 Sister strategy to Nifty_OI_WeeklyBuy_MonthlySell_1 (same OI-signal
 philosophy, monthly instrument, proven live) -- but this one is POSITIONAL
 (multi-day held), sells a single monthly CE and/or PE selected PURELY by
-target delta (0.27, scanned within a 0.22-0.32 band, no premium filter at
-all), each protected by its own monthly hedge (premium-target selected,
-~20% of the sold strike's premium, further OTM in the same direction), with
+target delta (0.27, only strikes with |delta| 0.22-0.32 can be sold, no
+premium filter at all), each protected by its own WEEKLY hedge (premium-target
+selected, ~10% of the sold strike's premium, further OTM in the same
+direction, rolled the trading day before it expires), with
 a tiered stop-loss (38.2% flat, permanently ratcheting to breakeven once
 premium ever touches 50% of entry) monitored continuously via live
 WebSocket LTP. One leg per side (MONTHLY_CE / MONTHLY_PE); no weekly buy
@@ -20,8 +21,9 @@ leg at all.
 
 Strike qualification (both required)
 ------------------------------------------------------------------------
-  1. Delta closest to 0.27 among round-100 strikes (0.22-0.32 is only a
-     "stop widening the scan" heuristic, never a hard filter).
+  1. Delta closest to 0.27 among round-100 strikes, and |delta| inside
+     0.22-0.32 -- a HARD limit (author 2026-11-05). A strike outside it is
+     never sold, even if it is the only weakening one.
   2. That exact strike's own OI signal classifies config.short_verdict --
      "weakening", i.e. short build-up or long unwinding, meaning the
      premium has FALLEN since the reference (author 2026-11-01). The
@@ -211,7 +213,11 @@ class Config:
 
     # Strike qualification -- delta-closeness only, NO premium filter anywhere.
     monthly_delta_target: float = 0.27
-    monthly_delta_low: float = 0.22     # widen-scan-stop heuristic only, never a hard filter
+    # HARD limits (author 2026-11-05: "delta .32 make it hard limit", and
+    # 0.22 too): a strike whose |delta| is outside 0.22-0.32 is never sold,
+    # even when it is the only weakening one. Also still the band that stops
+    # the scan widening from 8 to 16 strikes.
+    monthly_delta_low: float = 0.22
     monthly_delta_high: float = 0.32
     monthly_strike_round: int = 100
     # Which OI verdict qualifies a strike to be SHORTED, and which keeps an
@@ -1326,7 +1332,10 @@ def hedge_roll_day(expiry) -> "datetime.date":
     d = _ROLL_DAY_CACHE.get(expiry)
     if d is None:
         d = resolve_previous_trading_day(expiry)
-        _ROLL_DAY_CACHE[expiry] = d
+        # Kept only when the holiday list was really read: a weekday-only
+        # answer from a failed calendar is recomputed once it recovers.
+        if _calendar_loaded(expiry.year) and _calendar_loaded(d.year):
+            _ROLL_DAY_CACHE[expiry] = d
     return d
 
 
@@ -1373,32 +1382,141 @@ def _next_trading_day(d) -> "datetime.date":
     return d
 
 
-# Holiday-aware next trading day, from the platform's shared calendar --
-# the same import Nifty_LEAPS_OptionsSell uses, with the same weekday-only
-# fallback if the module is not importable in the strategy subprocess. The
-# fallback matters less than it looks: a cycle start computed onto a holiday
-# fails SAFE (today never matches it, so no 09:30 entry is taken), it does not
-# trade on a wrong day.
-try:
-    from utils.trading_calendar import next_trading_day as _calendar_next_trading_day
-except ImportError:
-    _calendar_next_trading_day = None
-try:
-    from utils.trading_calendar import prev_trading_day as _calendar_prev_trading_day
-    from utils.trading_calendar import special_sessions as _calendar_special_sessions
-except ImportError:
-    _calendar_prev_trading_day = None
-    _calendar_special_sessions = None
+# Trading calendar, read from the OpenAlgo API (client.holidays) -- the same
+# market_holidays table the platform's own utils.trading_calendar reads.
+#
+# It used to be `from utils.trading_calendar import ...`, which can never
+# work in a running strategy: the host starts `python -u strategies/scripts/
+# <file>.py`, so only the scripts folder is on sys.path, the import raised,
+# and the weekday-only fallback ran silently (live 05-Nov-2026: "Trading
+# Calendar : NOT LOADED"). Importing it by adding the app root would pull the
+# platform's logging and database layers into this process (every log line
+# printed twice in a probe), so the API is used instead.
+#
+# Rules (author 2026-11-05):
+#   closed  = TRADING_HOLIDAY with NFO in closed_exchanges
+#   special = SPECIAL_SESSION (Muhurat), a trading day the strategy skips
+# A SETTLEMENT_HOLIDAY closes nothing and is an ordinary trading day.
+# An EMPTY list is treated as not loaded, never as "no holidays": the platform
+# answers success with [] both for a year it has no data for (2027 today) and
+# when its own database read fails.
+_CALENDAR: dict = {"client": None, "years": {}, "retry_at": {}}
+_CALENDAR_LOCK = threading.Lock()
+_CALENDAR_RETRY_SEC = 300.0
+_CALENDAR_WARNED: dict = {"at": None}
+
+
+def set_calendar_client(client):
+    """The client the calendar reads holidays with; set once in main()."""
+    with _CALENDAR_LOCK:
+        _CALENDAR["client"] = client
+
+
+def _calendar_year(year: int) -> tuple:
+    """(closed NFO dates, special-session dates) for `year`, fetched once and
+    kept. Raises RuntimeError when the list is not available; a failure is
+    not retried for _CALENDAR_RETRY_SEC."""
+    import time as _t
+    with _CALENDAR_LOCK:
+        if year in _CALENDAR["years"]:
+            return _CALENDAR["years"][year]
+        client = _CALENDAR["client"]
+        retry_at = _CALENDAR["retry_at"].get(year)
+    if client is None:
+        raise RuntimeError("trading calendar not connected")
+    if retry_at is not None and _t.monotonic() < retry_at:
+        raise RuntimeError(f"holiday list for {year} unavailable (retrying shortly)")
+
+    def _fail(why):
+        with _CALENDAR_LOCK:
+            _CALENDAR["retry_at"][year] = _t.monotonic() + _CALENDAR_RETRY_SEC
+        raise RuntimeError(why)
+
+    try:
+        resp = client.holidays(year=year)
+    except Exception as exc:
+        _fail(f"holidays({year}) call failed: {exc}")
+    if not isinstance(resp, dict) or resp.get("status") != "success":
+        _fail(f"holidays({year}) answered {resp}")
+    data = resp.get("data") or []
+    if not data:
+        _fail(f"the OpenAlgo API has no holiday list for {year}")
+    closed, special = set(), set()
+    for entry in data:
+        try:
+            day = datetime.strptime(str(entry.get("date"))[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+        kind = str(entry.get("holiday_type") or "").upper()
+        if kind == "SPECIAL_SESSION":
+            special.add(day)
+        elif kind == "TRADING_HOLIDAY" and OPTIONS_EXCHANGE in (entry.get("closed_exchanges") or []):
+            closed.add(day)
+    result = (frozenset(closed), frozenset(special))
+    with _CALENDAR_LOCK:
+        _CALENDAR["years"][year] = result
+        _CALENDAR["retry_at"].pop(year, None)
+    return result
+
+
+def _calendar_loaded(year: int) -> bool:
+    with _CALENDAR_LOCK:
+        return year in _CALENDAR["years"]
+
+
+def _calendar_warn(message: str):
+    """A calendar fallback warning, at most once per _CALENDAR_RETRY_SEC --
+    the roll check asks every tick and must not repeat it every 10s."""
+    import time as _t
+    now = _t.monotonic()
+    last = _CALENDAR_WARNED["at"]
+    if last is None or now - last >= _CALENDAR_RETRY_SEC:
+        _CALENDAR_WARNED["at"] = now
+        Log.warning(message)
+
+
+def _nfo_trading_day(d) -> bool:
+    closed, special = _calendar_year(d.year)
+    if d in special:
+        return True                 # a session is held; callers that skip it do so themselves
+    return d.weekday() < 5 and d not in closed
+
+
+def _calendar_prev_trading_day(d) -> "datetime.date":
+    """Trading day strictly before `d` (special sessions count as trading days)."""
+    c = d - timedelta(days=1)
+    for _ in range(20):
+        if _nfo_trading_day(c):
+            return c
+        c -= timedelta(days=1)
+    raise RuntimeError(f"no trading day within 20 days before {d}")
+
+
+def _calendar_next_trading_day(d) -> "datetime.date":
+    """Trading day strictly after `d` (special sessions count as trading days)."""
+    c = d + timedelta(days=1)
+    for _ in range(20):
+        if _nfo_trading_day(c):
+            return c
+        c += timedelta(days=1)
+    raise RuntimeError(f"no trading day within 20 days after {d}")
+
+
+def _calendar_special_sessions(year: int) -> frozenset:
+    return _calendar_year(year)[1]
 
 
 def _cycle_next_trading_day(d) -> "datetime.date":
-    """First trading day strictly after `d`, holiday-aware when possible."""
+    """First trading day strictly after `d`, holiday-aware when possible.
+
+    A cycle start computed onto a holiday fails SAFE (today never matches it,
+    so no 09:30 entry is taken); it does not trade on a wrong day."""
     if _calendar_next_trading_day is not None:
         try:
             return _calendar_next_trading_day(d)
         except Exception as exc:
-            Log.warning(f"trading calendar unavailable ({exc}) -- falling back to "
-                        f"weekday-only next-trading-day.")
+            _calendar_warn(f"trading calendar unavailable ({exc}) -- falling back to "
+                           f"weekday-only next-trading-day.")
     return _next_trading_day(d)
 
 
@@ -1476,8 +1594,8 @@ def resolve_previous_trading_day(today) -> "datetime.date":
                 if d not in _calendar_special_sessions(d.year):
                     return d
         except Exception as exc:
-            Log.warning(f"trading calendar unavailable ({exc}) -- falling back to "
-                        f"weekday-only previous trading day.")
+            _calendar_warn(f"trading calendar unavailable ({exc}) -- falling back to "
+                           f"weekday-only previous trading day.")
     return _weekday_previous_day(today)
 
 
@@ -1646,6 +1764,20 @@ def select_qualifying_monthly_strike(client, spot: float, expiry_raw: str, optio
         )
 
     ranked = sorted(scanned, key=lambda c: c["diff"])
+    # Hard delta limits: outside monthly_delta_low..high is never sold.
+    in_band = [c for c in ranked
+               if config.monthly_delta_low <= abs(c["delta"]) <= config.monthly_delta_high]
+    out_of_band = [c for c in ranked if c not in in_band]
+    if out_of_band:
+        Log.info(f"[MONTHLY_{option_type}] outside delta {config.monthly_delta_low:.2f}-"
+                 f"{config.monthly_delta_high:.2f}, not considered: "
+                 + ", ".join(f"{c['strike']:.0f} ({c['delta']:.3f})" for c in out_of_band))
+    if not in_band:
+        Log.info(f"[MONTHLY_{option_type}] no strike with delta inside "
+                 f"{config.monthly_delta_low:.2f}-{config.monthly_delta_high:.2f} "
+                 f"(of {len(ranked)} scanned) -- no qualifying strike this cycle.")
+        return None
+    ranked = in_band
     for candidate in ranked:
         strike = candidate["strike"]
         symbol = f"{UNDERLYING_SYMBOL}{_compact_expiry(expiry_raw)}{int(strike)}{option_type}"
@@ -4962,7 +5094,7 @@ def print_banner():
     print(f"Candle interval      : {config.intraday_interval}")
     print(f"Gap threshold        : {config.gap_threshold_pct}%")
     print(f"Monthly delta target : {config.monthly_delta_target} "
-          f"(stop-widening band: {config.monthly_delta_low}-{config.monthly_delta_high})")
+          f"(HARD limits: {config.monthly_delta_low}-{config.monthly_delta_high}, outside is never sold)")
     print(f"SL tier 1            : premium >= entry * {1 + config.sl_tier1_pct / 100.0:.3f}")
     print(f"SL tier 2 (ratchet)  : locks to breakeven once premium <= entry * "
           f"{config.sl_tier2_trigger_pct / 100.0:.2f}")
@@ -5018,6 +5150,7 @@ def main():
 
     broker = Broker(env)
     client = broker.connect()
+    set_calendar_client(client)
     ltp_client = broker.connect_ltp_client()
     hedge_chain_client = broker.connect_hedge_chain_client()
 
@@ -5056,20 +5189,16 @@ def main():
     print(f"State File         : OK ({state_store.path})")
     print(f"Execution ID       : {execution_id}")
     print(f"Price Stream       : starting ({len(already_known)} symbol(s) already known today)")
-    # The previous-close reference and the cycle start both depend on the
-    # platform's holiday list. If it cannot be read, the calendar quietly
-    # degrades to weekends-only (it logs, never raises), and a day after a
-    # holiday would read the holiday's empty history -- so say so at startup.
+    # The previous-close reference, the cycle start and the weekly hedge's
+    # roll day all depend on the holiday list (OpenAlgo API). If it cannot be
+    # read they degrade to weekends-only and log -- so say so at startup.
     try:
-        from utils.trading_calendar import trading_holidays as _th
-        _n_hol = len(_th(datetime.now(IST).date().year))
-    except Exception:
-        _n_hol = -1
-    if _n_hol > 0:
-        print(f"Trading Calendar   : OK ({_n_hol} holidays this year)")
-    else:
-        print("Trading Calendar   : NOT LOADED -- weekends only; the day after a holiday "
-              "will find no reference candle")
+        _closed, _special = _calendar_year(datetime.now(IST).date().year)
+        print(f"Trading Calendar   : OK ({len(_closed)} NFO holidays, {len(_special)} special "
+              f"session(s) this year, from the OpenAlgo API)")
+    except RuntimeError as _exc:
+        print(f"Trading Calendar   : NOT LOADED ({_exc}) -- weekends only; retried every "
+              f"{_CALENDAR_RETRY_SEC / 60:.0f} min")
     print("=" * 70)
 
     engine = StrategyEngine(client, state_store, env, price_stream, execution_id=execution_id,

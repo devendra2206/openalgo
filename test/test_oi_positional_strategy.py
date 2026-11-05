@@ -1685,9 +1685,131 @@ def main():
         finally:
             _uncalendar(orig)
 
+    @case("delta 0.22-0.32 is a hard limit: a weakening strike outside it is never sold")
+    def t40():
+        """Author 2026-11-05: "delta .32 make it hard limit" and 0.22 too.
+        Deltas from the live 05-Nov 13:31 CE scan. Before, 25100CE (0.208)
+        or 24600CE (0.4665) would have been sold had they been weakening."""
+        deltas = {24600: 0.4665, 24700: 0.4102, 24800: 0.3535, 24900: 0.3003,
+                  25000: 0.2505, 25100: 0.2080}
+
+        def run(weak, extra=None):
+            d = {**deltas, **(extra or {})}
+
+            class C:
+                def optionchain(self, **k):
+                    rows = []
+                    for i in range(-k["strike_count"], k["strike_count"] + 1):
+                        s = 24300 + 50 * i
+                        ce = None
+                        if s in d:
+                            ce = {"ltp": 100.0, "bid": 99.9, "ask": 100.1, "oi": 5000.0,
+                                  "delta": d[s]}
+                        rows.append({"strike": float(s), "ce": ce, "pe": None})
+                    return {"status": "success", "chain": rows}
+
+            def ref(client, symbol, exchange, reference):
+                k = int(symbol[len("NIFTY23NOV26"):-2])
+                return ({"premium": 105.0, "oi": 4000.0} if k in weak       # weakening
+                        else {"premium": 95.0, "oi": 4000.0})               # accumulation
+            orig = m.fetch_reference_oi_premium
+            m.fetch_reference_oi_premium = ref
+            try:
+                return m.select_qualifying_monthly_strike(
+                    C(), 24300.0, "23-NOV-26", "CE", m.ReferenceSnapshot(mode="prev_close",
+                                                                        computed=True))
+            finally:
+                m.fetch_reference_oi_premium = orig
+
+        assert run({25100, 24600}) is None, "only out-of-band strikes are weakening: no trade"
+        got = run({25100, 24900, 24600})
+        assert got is not None and got[0] == 24900.0, got
+        got = run({24800}, {24800: 0.32})                 # the edge itself is inside
+        assert got is not None and got[0] == 24800.0, got
+        got = run({25100}, {25100: 0.22})
+        assert got is not None and got[0] == 25100.0, got
+        assert run({24800}, {24800: 0.3201}) is None, "just past 0.32 is refused"
+
+    @case("trading calendar comes from the OpenAlgo API holidays list, NFO rules")
+    def t41():
+        """Live 05-Nov-2026 the server logged "Trading Calendar : NOT LOADED":
+        `from utils.trading_calendar import ...` cannot resolve in a strategy
+        subprocess (only strategies/scripts is on sys.path). The calendar now
+        reads client.holidays(year). Entries copied from the live 2026 list."""
+        LIVE_2026 = [
+            {"date": "2026-02-19", "holiday_type": "SETTLEMENT_HOLIDAY", "closed_exchanges": [],
+             "open_exchanges": []},
+            {"date": "2026-10-20", "holiday_type": "TRADING_HOLIDAY",
+             "closed_exchanges": ["NSE", "BSE", "NFO", "BFO", "CDS", "BCD"], "open_exchanges": []},
+            {"date": "2026-11-08", "holiday_type": "SPECIAL_SESSION", "closed_exchanges": [],
+             "open_exchanges": [{"exchange": "NFO"}]},
+            {"date": "2026-11-10", "holiday_type": "TRADING_HOLIDAY",
+             "closed_exchanges": ["NSE", "BSE", "NFO", "BFO", "CDS", "BCD"], "open_exchanges": []},
+            {"date": "2026-11-24", "holiday_type": "TRADING_HOLIDAY",
+             "closed_exchanges": ["NSE", "BSE", "NFO", "BFO", "CDS", "BCD"], "open_exchanges": []},
+            {"date": "2026-12-11", "holiday_type": "TRADING_HOLIDAY",       # MCX-only: NFO open
+             "closed_exchanges": ["MCX"], "open_exchanges": []},
+        ]
+
+        class C:
+            def __init__(self, data):
+                self.data, self.calls = data, []
+
+            def holidays(self, year=None):
+                self.calls.append(year)
+                return {"status": "success", "year": year, "timezone": "Asia/Kolkata",
+                        "data": list(self.data) if year == 2026 else []}
+
+        def reset(client):
+            m.set_calendar_client(client)
+            with m._CALENDAR_LOCK:
+                m._CALENDAR["years"].clear()
+                m._CALENDAR["retry_at"].clear()
+            m.clear_option_expiry_cache()
+
+        c = C(LIVE_2026)
+        reset(c)
+        try:
+            prev = m.resolve_previous_trading_day
+            assert prev(date(2026, 11, 25)) == date(2026, 11, 23), "24-Nov is closed"
+            assert prev(date(2026, 11, 9)) == date(2026, 11, 6), "Muhurat Sunday skipped"
+            assert prev(date(2026, 11, 11)) == date(2026, 11, 9), "10-Nov is closed"
+            assert prev(date(2026, 2, 20)) == date(2026, 2, 19), "a settlement holiday trades"
+            assert prev(date(2026, 12, 14)) == date(2026, 12, 11), "MCX-only closure: NFO trades"
+            assert m._cycle_next_trading_day(date(2026, 11, 23)) == date(2026, 11, 25)
+            assert m.hedge_roll_day(date(2026, 11, 25)) == date(2026, 11, 23)
+            assert c.calls == [2026], f"one API call for the year, then cached: {c.calls}"
+
+            # an EMPTY list is "not loaded" -- weekends only -- and is not
+            # re-asked every call
+            empty = C([])
+            reset(empty)
+            assert prev(date(2026, 11, 25)) == date(2026, 11, 24), "falls back to weekdays"
+            assert prev(date(2026, 11, 25)) == date(2026, 11, 24)
+            assert empty.calls == [2026], f"retry is held back after a miss: {empty.calls}"
+            assert not m._calendar_loaded(2026)
+            # once the retry window passes and the list is there, it is used
+            empty.data = LIVE_2026
+            with m._CALENDAR_LOCK:
+                m._CALENDAR["retry_at"][2026] = 0.0
+            assert prev(date(2026, 11, 25)) == date(2026, 11, 23)
+            # a roll day computed while the calendar was down is not kept
+            reset(C([]))
+            assert m.hedge_roll_day(date(2026, 11, 11)) == date(2026, 11, 10)   # weekday answer
+            m.set_calendar_client(C(LIVE_2026))         # calendar recovers; roll cache NOT cleared
+            with m._CALENDAR_LOCK:
+                m._CALENDAR["retry_at"].clear()
+            assert m.hedge_roll_day(date(2026, 11, 11)) == date(2026, 11, 9), "recomputed"
+            # and the platform import is gone from the code
+            code = "\n".join(l for l in SCRIPT.read_text(encoding="utf-8").splitlines()
+                             if not l.strip().startswith("#"))
+            assert "from utils.trading_calendar" not in code
+        finally:
+            reset(None)
+
     for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19,
                t20, t21, t22, t23, t24, t25, t26, t27, t28, t29, t30, t31, t32, t33, t34, t35,
-               t36, t37, t38, t39):
+               t36, t37, t38, t39, t40, t41):
         fn()
 
     print("\n" + "=" * 74)

@@ -185,19 +185,99 @@ except ImportError:
         known = set(vars(cls()).keys())
         return {k: v for k, v in raw.items() if k in known}
 
-try:
-    from utils.trading_calendar import is_trading_day
-except ImportError:
-    # Same documented fallback as MCX_CrudeOil_HMRSI_SMA50_Intraday: no
-    # deployed strategy in this project relies on cross-module imports
-    # beyond the openalgo SDK and _strategy_platform_client -- untested
-    # sys.path for this specific module when run as an isolated subprocess.
-    # Degrades to a weekday-only check (no holiday awareness) -- only used
-    # to walk the 18th-of-month hedge roll date back off a holiday/weekend,
-    # so being off by a holiday is a low-consequence gap, not correctness-
-    # critical (worst case: the roll fires one weekday early or late).
-    def is_trading_day(day) -> bool:
-        return day.weekday() < 5
+# Trading calendar, read from the OpenAlgo API (client.holidays) -- the same
+# market_holidays table the platform's own utils.trading_calendar reads.
+#
+# It used to be `from utils.trading_calendar import is_trading_day`, which
+# can never work in a running strategy: the host starts `python -u
+# strategies/scripts/<file>.py`, so only the scripts folder is on sys.path,
+# the import raised, and a weekday-only check ran silently. That is not the
+# "one weekday early or late" its old comment promised: the roll fires only
+# when today == hedge_roll_date_for_month(), so an 18th that is a weekday
+# holiday became a roll date the strategy never runs on, and that month's
+# hedge roll was skipped outright.
+#
+# Rules (author 2026-11-05): closed = TRADING_HOLIDAY with NFO in
+# closed_exchanges. A SETTLEMENT_HOLIDAY closes nothing. A SPECIAL_SESSION
+# (Muhurat, on a weekend) is NOT a roll day. An EMPTY list is treated as not
+# loaded, never as "no holidays": the platform answers success with [] both
+# for a year it has no data for (2027 today) and when its own database read
+# fails. Not loaded means weekends only, with a warning, retried in 5 min.
+_CALENDAR: dict = {"client": None, "years": {}, "retry_at": {}, "warned_at": None}
+_CALENDAR_LOCK = threading.Lock()
+_CALENDAR_RETRY_SEC = 300.0
+
+
+def set_calendar_client(client):
+    """The client the calendar reads holidays with; set once in main()."""
+    with _CALENDAR_LOCK:
+        _CALENDAR["client"] = client
+
+
+def _calendar_closed(year: int) -> frozenset:
+    """NFO trading holidays for `year`, fetched once and kept. Raises
+    RuntimeError when the list is not available."""
+    import time as _t
+    with _CALENDAR_LOCK:
+        if year in _CALENDAR["years"]:
+            return _CALENDAR["years"][year]
+        client = _CALENDAR["client"]
+        retry_at = _CALENDAR["retry_at"].get(year)
+    if client is None:
+        raise RuntimeError("trading calendar not connected")
+    if retry_at is not None and _t.monotonic() < retry_at:
+        raise RuntimeError(f"holiday list for {year} unavailable (retrying shortly)")
+
+    def _fail(why):
+        with _CALENDAR_LOCK:
+            _CALENDAR["retry_at"][year] = _t.monotonic() + _CALENDAR_RETRY_SEC
+        raise RuntimeError(why)
+
+    try:
+        resp = client.holidays(year=year)
+    except Exception as exc:
+        _fail(f"holidays({year}) call failed: {exc}")
+    if not isinstance(resp, dict) or resp.get("status") != "success":
+        _fail(f"holidays({year}) answered {resp}")
+    data = resp.get("data") or []
+    if not data:
+        _fail(f"the OpenAlgo API has no holiday list for {year}")
+    closed = set()
+    for entry in data:
+        try:
+            day = date.fromisoformat(str(entry.get("date"))[:10])
+        except (TypeError, ValueError):
+            continue
+        if (str(entry.get("holiday_type") or "").upper() == "TRADING_HOLIDAY"
+                and OPTIONS_EXCHANGE in (entry.get("closed_exchanges") or [])):
+            closed.add(day)
+    result = frozenset(closed)
+    with _CALENDAR_LOCK:
+        _CALENDAR["years"][year] = result
+        _CALENDAR["retry_at"].pop(year, None)
+    return result
+
+
+def is_trading_day(day) -> bool:
+    """A regular NFO session: a weekday that is not an NFO trading holiday.
+    Weekends only, with a warning at most every 5 min, when the holiday list
+    cannot be read."""
+    if day.weekday() >= 5:
+        return False
+    try:
+        return day not in _calendar_closed(day.year)
+    except RuntimeError as exc:
+        import time as _t
+        now = _t.monotonic()
+        with _CALENDAR_LOCK:
+            last = _CALENDAR["warned_at"]
+            due = last is None or now - last >= _CALENDAR_RETRY_SEC
+            if due:
+                _CALENDAR["warned_at"] = now
+        if due:
+            Log.warning(f"trading calendar unavailable ({exc}) -- treating {day} as a "
+                        f"trading day (weekends only).")
+        return True
 
 load_dotenv()
 
@@ -3305,6 +3385,7 @@ def main():
 
     broker = Broker(env)
     client = broker.connect()
+    set_calendar_client(client)
     ltp_client = broker.connect_ltp_client()
 
     price_stream = PriceStream(client)
@@ -3342,6 +3423,13 @@ def main():
     print(f"State File         : OK ({state_store.path})")
     print(f"Execution ID       : {execution_id}")
     print(f"Price Stream       : starting ({len(already_known)} symbol(s) already known today)")
+    # The 18th-of-month hedge roll date depends on the holiday list.
+    try:
+        _closed = _calendar_closed(datetime.now(IST).date().year)
+        print(f"Trading Calendar   : OK ({len(_closed)} NFO holidays this year, from the OpenAlgo API)")
+    except RuntimeError as _exc:
+        print(f"Trading Calendar   : NOT LOADED ({_exc}) -- weekends only; retried every "
+              f"{_CALENDAR_RETRY_SEC / 60:.0f} min")
     print("=" * 70)
 
     engine = StrategyEngine(client, state_store, env, price_stream, execution_id=execution_id,
