@@ -994,8 +994,9 @@ def main():
             spot_calls.append(1)
             return 24174.0                       # +0.72% over 24001
         eng.get_spot_ltp = spot
-        orig = m.fetch_candle_oi_premium
-        m.fetch_candle_oi_premium = lambda *a, **k: {"premium": 24001.0, "oi": 0.0}
+        orig = m.fetch_previous_session_close
+        m.fetch_previous_session_close = lambda *a, **k: {"close": 24001.0,
+                                                          "timestamp": "2026-11-03 15:29:00+05:30"}
         orig_prev = m.resolve_previous_trading_day
         m.resolve_previous_trading_day = lambda d: date(2026, 11, 3)
         lines = []
@@ -1014,7 +1015,7 @@ def main():
                 m.StrategyEngine._ensure_reference(eng)
         finally:
             m.Log.logger.removeHandler(h)
-            m.fetch_candle_oi_premium = orig
+            m.fetch_previous_session_close = orig
             m.resolve_previous_trading_day = orig_prev
         ref = eng.state.reference
         assert ref.computed and ref.mode == "today_0935", ref
@@ -1062,8 +1063,52 @@ def main():
         finally:
             m._calendar_prev_trading_day, m._calendar_special_sessions = orig
 
+    @case("the gap's previous close ignores the next morning's pre-open print")
+    def t26():
+        """Shoonya, 05-Nov-2026 (real values): the 15m 04-Nov 15:15 candle
+        carried that morning's 09:14 pre-open (24378.05). In the 1m series
+        the pre-open is its own 05-Nov bar and 04-Nov 15:29 is the real close
+        (23960.60). Drives the real fetch_previous_session_close, then the
+        real _ensure_reference, on that data."""
+        import pandas as pd
+        idx = pd.DatetimeIndex(["2026-11-04 15:28", "2026-11-04 15:29", "2026-11-05 09:14",
+                                "2026-11-05 09:15"]).tz_localize("Asia/Kolkata")
+        one_min = pd.DataFrame({"open": [23911.7, 23960.6, 24378.05, 24376.55],
+                                "close": [23911.7, 23960.6, 24378.05, 24340.35]}, index=idx)
+        asked = []
+
+        class C:
+            def history(self, **k):
+                asked.append((k["interval"], k["start_date"], k["end_date"]))
+                return one_min
+        r = m.fetch_previous_session_close(C(), date(2026, 11, 4))
+        assert r and r["close"] == 23960.6, f"must be 04-Nov's own last bar, got {r}"
+        assert asked == [("1m", "2026-11-04", "2026-11-04")], asked
+
+        # end to end: 09:31 on 05-Nov with spot 24340 -> +1.58%, a GAP day
+        eng = types.SimpleNamespace(state=m.StrategyState(), client=C(), _gap_wait_day="",
+                                    get_spot_ltp=lambda: 24340.35)
+        eng.state.reference = m.ReferenceSnapshot()
+        orig_prev = m.resolve_previous_trading_day
+        m.resolve_previous_trading_day = lambda d: date(2026, 11, 4)
+        lines = []
+        h = logging.Handler()
+        h.emit = lambda rec: lines.append(rec.getMessage())
+        m.Log.logger.addHandler(h)
+        try:
+            with _Clock(date(2026, 11, 5), time(9, 31)):
+                m.StrategyEngine._ensure_reference(eng)
+        finally:
+            m.Log.logger.removeHandler(h)
+            m.resolve_previous_trading_day = orig_prev
+        line = next((ln for ln in lines if "[Reference]" in ln), "")
+        assert "gap=+1.585%" in line, line
+        assert "yesterday close=23960.60 (04-Nov 15:29)" in line, line
+        assert "NIFTY at 09:31:00=24340.35" in line, line
+        assert not eng.state.reference.computed, "a gap day waits for 09:45, not prev_close"
+
     for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19,
-               t20, t21, t22, t23, t24, t25):
+               t20, t21, t22, t23, t24, t25, t26):
         fn()
 
     print("\n" + "=" * 74)

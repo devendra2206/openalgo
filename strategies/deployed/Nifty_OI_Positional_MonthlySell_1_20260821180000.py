@@ -1248,6 +1248,47 @@ def _cycle_next_trading_day(d) -> "datetime.date":
     return _next_trading_day(d)
 
 
+def fetch_previous_session_close(client, prev_day) -> Optional[dict]:
+    """NIFTY's closing price for `prev_day`, for the 09:31 gap test.
+
+    Read from 1-MINUTE candles of that day alone, never the 15-minute ones.
+    Shoonya's 15m series folds the NEXT morning's 09:14 pre-open print into
+    the previous day's last candle: on 05-Nov-2026 the 04-Nov 15:15 candle
+    read close 24378.05 (that morning's pre-open) where at 22:11 the night
+    before it read the real 23960.60. The gap test runs after the pre-open,
+    so it always measured spot against the same morning's pre-open price:
+    04-Nov logged +0.73% for a true +0.46%, 05-Nov -0.148% for a true
+    +1.54%, and each day took the wrong reference mode. In the 1m series the
+    pre-open is its own bar dated the new day, and the last bar of the
+    previous day (15:29) carries the official close.
+
+    Returns {"close", "timestamp"} or None on any failure -- the caller
+    retries next cycle, never guesses."""
+    try:
+        bars = client.history(symbol=UNDERLYING_SYMBOL, exchange=UNDERLYING_SPOT_EXCHANGE,
+                              interval="1m", start_date=prev_day.isoformat(),
+                              end_date=prev_day.isoformat())
+    except Exception as exc:
+        Log.warning(f"history() (previous close, 1m) failed for {UNDERLYING_SYMBOL}: {exc}")
+        return None
+    if _is_error_response(bars) or bars is None or getattr(bars, "empty", True):
+        Log.warning(f"No 1m {UNDERLYING_SYMBOL} candles for {prev_day}: {bars if _is_error_response(bars) else 'empty'}")
+        return None
+    try:
+        same_day = [ts.date() == prev_day and ts.time() <= config.market_close for ts in bars.index]
+        day_bars = bars[same_day]
+    except Exception as exc:
+        Log.warning(f"Could not read the 1m {UNDERLYING_SYMBOL} candles for {prev_day}: {exc}")
+        return None
+    if day_bars.empty:
+        Log.warning(f"No 1m {UNDERLYING_SYMBOL} candle on {prev_day} at or before "
+                    f"{config.market_close.strftime('%H:%M')}")
+        return None
+    last_ts = day_bars.index[-1]
+    return {"close": float(day_bars.iloc[-1]["close"]), "timestamp": str(last_ts),
+            "label": last_ts.strftime("%d-%b %H:%M")}
+
+
 def _weekday_previous_day(today) -> "datetime.date":
     d = today - timedelta(days=1)
     while d.weekday() >= 5:
@@ -3805,17 +3846,22 @@ class StrategyEngine:
         # take a reference that ignores the last ten minutes of the previous
         # day -- every premium_change and oi_change all day is measured from
         # this one number.
-        prev_close_at = IST.localize(datetime.combine(prev_day, config.market_close))
-        prev_close_data = fetch_candle_oi_premium(
-            self.client, UNDERLYING_SYMBOL, UNDERLYING_SPOT_EXCHANGE,
-            at_or_before=prev_close_at,
-        )
+        # 1-minute candles of prev_day only -- see fetch_previous_session_close
+        # for why the 15-minute candle is not the previous close on Shoonya.
+        prev_close_data = fetch_previous_session_close(self.client, prev_day)
         if prev_close_data is None:
             Log.warning("[Reference] previous day's close unavailable, retrying next cycle.")
             return
-        prev_close = prev_close_data["premium"]  # field name is generic; this is spot close here
+        prev_close = prev_close_data["close"]
 
         gap_pct = (spot_now - prev_close) / prev_close * 100.0
+        # Both inputs in the log, so a wrong gap can be checked from the log
+        # alone: yesterday's close with the candle it came from, and NIFTY's
+        # price with the time it was read -- 09:31 for the 09:30 check, 09:46
+        # for the 09:45 one on a gap day (author 2026-11-05).
+        prev_label = prev_close_data.get("label") or prev_close_data["timestamp"]
+        gap_inputs = (f"yesterday close={prev_close:.2f} ({prev_label}) | "
+                      f"NIFTY at {datetime.now(IST).strftime('%H:%M:%S')}={spot_now:.2f}")
 
         if abs(gap_pct) <= config.gap_threshold_pct:
             ref.reference_date = today_key
@@ -3823,8 +3869,8 @@ class StrategyEngine:
             ref.mode = "prev_close"
             ref.reference_time_iso = prev_day.isoformat()
             ref.computed = True
-            Log.info(f"[Reference] gap={gap_pct:+.3f}% (<= {config.gap_threshold_pct}%) -> "
-                     f"Reference Time = previous day's close ({prev_day})")
+            Log.info(f"[Reference] gap={gap_pct:+.3f}% (<= {config.gap_threshold_pct}%) "
+                     f"[{gap_inputs}] -> Reference Time = previous day's close ({prev_day})")
             return
 
         # The gap path's 09:45 read is a CANDLE read, so it takes the buffer
@@ -3834,8 +3880,8 @@ class StrategyEngine:
         if now < _with_buffer(config.reference_wait_time):
             if self._gap_wait_day != today_key:
                 self._gap_wait_day = today_key
-                Log.info(f"[Reference] gap={gap_pct:+.3f}% (> {config.gap_threshold_pct}%) -- "
-                         f"reference will be fixed when the "
+                Log.info(f"[Reference] gap={gap_pct:+.3f}% (> {config.gap_threshold_pct}%) "
+                         f"[{gap_inputs}] -- reference will be fixed when the "
                          f"{config.reference_wait_time.strftime('%H:%M')} candle closes; "
                          f"no further checks until then.")
             return
@@ -3851,8 +3897,8 @@ class StrategyEngine:
         ref.reference_time_iso = datetime.now(IST).replace(
             hour=9, minute=30, second=0, microsecond=0).isoformat()
         ref.computed = True
-        Log.info(f"[Reference] gap={gap_pct:+.3f}% (> {config.gap_threshold_pct}%) -> "
-                 f"Reference Time = today 09:30 (5m bootstrap)")
+        Log.info(f"[Reference] gap={gap_pct:+.3f}% (> {config.gap_threshold_pct}%) "
+                 f"[{gap_inputs}] -> Reference Time = today 09:30 (5m bootstrap)")
 
     def _new_candle_closed(self) -> bool:
         boundary = _current_candle_boundary(15)

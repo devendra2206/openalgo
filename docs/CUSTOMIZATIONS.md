@@ -2052,3 +2052,75 @@ dates (author: "skip muhurt trading"), so 09-Nov-2026 measures from Friday
 06-Nov rather than the one-hour Muhurat session on Sunday 08-Nov. If the
 calendar cannot load its holiday list it degrades to weekends-only, so the
 startup health check now prints a `Trading Calendar` line saying which.
+
+## Shoonya history: the previous day's last intraday candle carries the next morning's pre-open (2026-11-05)
+
+**Broker data quirk, not an OpenAlgo bug.** For `NSE_INDEX` and `NSE`
+symbols, Shoonya's intraday history (`TPSeries`, every interval above 1m)
+folds the next morning's 09:14 pre-open price into the PREVIOUS day's last
+candle. OpenAlgo does not build these candles: `broker/shoonya/api/data.py`
+passes the interval straight to the broker (`"15m"` -> `intrv="15"`), so the
+candle arrives already altered.
+
+The candle is correct until the pre-open happens. Read at 22:11 on 04-Nov,
+the 04-Nov 15:15 15m candle closed at 23960.60. Read at 10:55 on 05-Nov,
+after the 05-Nov pre-open, the same candle closed at 24378.05, which is that
+morning's pre-open price, and its high was stretched to match. So a check
+made the same evening passes, and anything read after 09:08 the next day is
+wrong. Measured live on 05-Nov-2026, 04-Nov's last candle:
+
+| Interval | NIFTY (NSE_INDEX) last close | RELIANCE (NSE) last close | NIFTY23NOV2624300CE (NFO) |
+|---|---|---|---|
+| 1m (15:29) | 23960.60 correct | 1311.00 correct | 147.00 correct |
+| 3m (15:27) | 24378.05 **pre-open** | 1324.00 **pre-open** | 147.00 correct |
+| 5m (15:25) | 24378.05 **pre-open** | 1324.00 **pre-open** | 147.00 correct |
+| 15m / 30m / 1h / 2h (15:15) | 24378.05 **pre-open** | 1324.00 **pre-open** | 147.00 correct |
+| D (daily) | 23960.60 correct | 1311.00 correct | 145.15 (official close) |
+
+- **Affected:** every interval above 1m (3m, 5m, 15m, 30m, 1h, 2h) on
+  segments with a pre-open session: NSE equity and NSE indices. Seen on all
+  27 completed days checked (25-Sep to 04-Nov-2026), not just gap days.
+- **Not affected:** the 1m series (there the pre-open is its own bar, dated
+  the new day at 09:14, and the 15:29 bar carries the real close), the daily
+  series, and NFO options (no pre-open session). A today-only read, such as
+  the 5m 09:30 candle, is also unaffected.
+- **Symptom:** any "previous close" or "previous candle" taken from intraday
+  candles is the same morning's pre-open price. A gap measured against it
+  comes out near zero on a gap day; an indicator's last bar of each day jumps.
+
+**Impact on the deployed strategies**
+
+- `Nifty_OI_Positional_MonthlySell_1`: the 09:31 gap test measured spot
+  against the 15m candle, so both live days took the wrong reference mode.
+  04-Nov logged +0.73% for a true +0.46%; 05-Nov logged -0.148% for a true
+  +1.54%. **Fixed:** `fetch_previous_session_close` reads the 1m candles of
+  the previous day only, and the `[Reference]` log line now prints
+  yesterday's close and the NIFTY price used, with their times. Its option
+  references (NFO 15m) were never affected.
+- `Nifty_LEAPS_OptionsSell_1` (RSI 1h): the first check of each morning sees
+  the previous day's 15:15 RSI computed on the altered close. Over 6 weeks,
+  4 of about 28 morning checks went wrong: crossings missed on 09-Oct
+  (up through 32), 21-Oct (up through 52) and 28-Oct (down through 52), and
+  an extra crossing down through 52 on 12-Oct. Its own 05-Nov log showed
+  `candle=2026-11-04 15:15 close=24378.05 rsi=84.29`; the real values are
+  close 23960.60, RSI 76.83.
+- `Nifty_LEAPS_HAMACD_2h_1` (HA-MACD 2h): the values shift (04-Nov 15:15
+  MACD minus signal +66.54 against +55.19 on real closes) but the side
+  differed on 1 bar in 64, not at a morning check.
+- **Both LEAPS scripts fixed** with `_restore_last_candles`, called in the
+  signal function before any indicator is computed. It rebuilds each
+  completed day's last candle (open, high, low, close) from that day's own
+  1m bars, leaves today's candles alone, caches each completed day once
+  (the first check after a start fetches about 40 days of 1m, ~4s; later
+  checks fetch only the newly completed day), and on a 1m failure keeps the
+  broker's candles with a `[Candles]` warning rather than skipping the
+  signal. Run live on 05-Nov it gave RSI 84.79 (prev 76.83) and HA-MACD
+  +288.54 / +233.37, matching an independent rebuild. Tests:
+  `test/test_leaps_last_candle.py`, each guard seen to fail when removed.
+
+**Rule for any new script on Shoonya:** never take a previous day's close
+from intraday candles. Use the 1m series of that day alone, or the daily
+series. If an indicator spans the day boundary on intraday candles, rebuild
+each completed day's last candle from that day's 1m bars before computing.
+The 15:31 same-day check is not a valid test of this: the candle only
+changes the next morning.

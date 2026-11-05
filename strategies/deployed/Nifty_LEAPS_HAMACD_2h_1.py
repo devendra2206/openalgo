@@ -1210,6 +1210,97 @@ def _heikin_ashi(o, h, l, c):
     return ha_open, ha_close
 
 
+# Previous days' last intraday candles, rebuilt from 1-minute bars -- see
+# _restore_last_candles. date -> (bar timestamp, open, high, low, close), or
+# None when that day had no 1m bars at or after its last candle. A completed
+# day's 1m bars never change, so each day is fetched once.
+_LAST_CANDLE_FIX: dict = {}
+_LAST_CANDLE_FIX_LOCK = threading.Lock()
+
+
+def _restore_last_candles(client, bars):
+    """Rebuild each COMPLETED day's last candle from that day's own 1m bars.
+
+    Shoonya folds the next morning's 09:14 pre-open print into the previous
+    day's last intraday candle for NSE indices (every interval above 1m;
+    docs/CUSTOMIZATIONS.md, 2026-11-05). Live on 05-Nov-2026 the 04-Nov 15:15
+    candle closed at 24378.05, that morning's pre-open, against a real close
+    of 23960.60, with its high stretched to match -- and the first check of
+    each morning evaluates exactly that candle, then uses it as the
+    "previous" bar. In the 1m series the pre-open is its own bar dated the
+    new day, so the same-date 1m bars from the candle's start rebuild it
+    exactly: open = first open, high = max, low = min, close = last close.
+
+    Today's candles are left alone: they are not altered until tomorrow's
+    pre-open. If the 1m fetch fails, the candles are returned as the broker
+    served them (the behaviour before this fix) with a warning -- a signal on
+    slightly wrong history beats no signal and a missed exit. Never raises."""
+    if bars is None or getattr(bars, "empty", True):
+        return bars
+    try:
+        today = datetime.now(IST).date()
+        last_ts = {}
+        for ts in bars.index:
+            d = ts.date()
+            if d < today:
+                last_ts[d] = ts                      # index is ascending: the last one wins
+        if not last_ts:
+            return bars
+        with _LAST_CANDLE_FIX_LOCK:
+            missing = sorted(d for d in last_ts if d not in _LAST_CANDLE_FIX)
+        if missing:
+            try:
+                one = client.history(symbol=UNDERLYING_SYMBOL, exchange=UNDERLYING_SPOT_EXCHANGE,
+                                     interval="1m", start_date=missing[0].isoformat(),
+                                     end_date=missing[-1].isoformat())
+            except Exception as exc:
+                Log.warning(f"[Candles] 1m history failed ({exc}) -- using the broker's candles as "
+                            f"served; previous days' last candles may carry the next pre-open.")
+                return bars
+            if _is_error_response(one) or one is None or getattr(one, "empty", True):
+                Log.warning("[Candles] 1m history unavailable -- using the broker's candles as served; "
+                            "previous days' last candles may carry the next pre-open.")
+                return bars
+            one_dates = [ts.date() for ts in one.index]
+            restored = []
+            for d in missing:
+                ts0 = last_ts[d]
+                rows = one[[od == d and ts >= ts0 for od, ts in zip(one_dates, one.index, strict=True)]]
+                if rows.empty:
+                    entry = None
+                else:
+                    entry = (ts0, float(rows["open"].iloc[0]), float(rows["high"].max()),
+                             float(rows["low"].min()), float(rows["close"].iloc[-1]))
+                    old_c = float(bars.loc[ts0, "close"])
+                    if abs(old_c - entry[4]) > 1e-6:
+                        restored.append((ts0, old_c, entry[4]))
+                with _LAST_CANDLE_FIX_LOCK:
+                    _LAST_CANDLE_FIX[d] = entry
+            if restored:
+                # One line per check, not one per day: the first check after a
+                # start restores the whole window (~27 days) at once.
+                ts0, old_c, new_c = restored[-1]
+                more = f" and {len(restored) - 1} earlier day(s)" if len(restored) > 1 else ""
+                Log.info(f"[Candles] {ts0.strftime('%d-%b %H:%M')} close restored {old_c:.2f} -> "
+                         f"{new_c:.2f}{more} from that day's 1m bars (the broker folds the next "
+                         f"pre-open into each day's last candle).")
+        with _LAST_CANDLE_FIX_LOCK:
+            fixes = {d: _LAST_CANDLE_FIX.get(d) for d in last_ts}
+            oldest = min(last_ts)
+            for d in [d for d in _LAST_CANDLE_FIX if d < oldest]:
+                del _LAST_CANDLE_FIX[d]              # bounded: only the window in use
+        fixed = bars.copy()
+        for d, entry in fixes.items():
+            if entry is None or entry[0] != last_ts[d]:
+                continue
+            fixed.loc[entry[0], ["open", "high", "low", "close"]] = list(entry[1:])
+        return fixed
+    except Exception as exc:
+        Log.warning(f"[Candles] could not rebuild previous days' last candles ({exc}) -- "
+                    f"using the broker's candles as served.")
+        return bars
+
+
 def _get_hamacd_signal(client, require_fresh_by: Optional[datetime] = None):
     """Fetch client.history(interval="2h") for NIFTY spot, unconditionally
     drop the still-forming last bar, build Heikin Ashi over the closed bars
@@ -1246,6 +1337,9 @@ def _get_hamacd_signal(client, require_fresh_by: Optional[datetime] = None):
     if bars is None or bars.empty:
         Log.warning("history() returned no data for HA-MACD signal.")
         return None, None, None, None
+    # Before anything reads them: each completed day's last candle as it
+    # really closed, not with the next morning's pre-open folded in.
+    bars = _restore_last_candles(client, bars)
     if len(bars) >= 2:
         bars = bars.iloc[:-1]
     if bars.empty:
