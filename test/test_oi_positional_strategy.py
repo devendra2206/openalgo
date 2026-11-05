@@ -1632,9 +1632,62 @@ def main():
         finally:
             _uncalendar(orig)
 
+    @case("full entry path: hedge BUY goes to the weekly (current, or next on the roll day)")
+    def t38():
+        orig = _calendar()
+        try:
+            for day, want_hx, want_prefix in ((date(2026, 11, 5), "2026-11-09", "NIFTY09NOV26"),
+                                              (date(2026, 11, 6), "2026-11-17", "NIFTY17NOV26")):
+                m.clear_option_expiry_cache()
+                c = RollClient()
+                eng = make_engine(m, c)
+                eng.get_monthly_expiry = lambda: ("29DEC26", "29-Dec-26")
+                eng.get_cycle_expiry_date = lambda: date(2026, 12, 29)
+                side = make_side(m, eng, "CE")
+                side._select_qualifying_strike_with_retry = \
+                    lambda *a, **k: (24300.0, 0.27, 60.0, "weakening", _chain(30))
+                with _Clock(day, time(11, 31)):
+                    side._search_and_enter_fresh(time(11, 30))
+                acts = [(s, a) for s, a, q, o in c.orders]
+                assert len(acts) == 2 and acts[0][1] == "BUY" and acts[0][0].startswith(want_prefix) \
+                    and acts[1] == ("NIFTY29DEC2624300CE", "SELL"), f"{day}: {acts}"
+                pos = side.leg.position
+                assert pos.hedge_expiry == want_hx and pos.expiry_date == "2026-12-29", \
+                    (day, pos.hedge_expiry, pos.expiry_date)
+                assert pos.hedge_entry_time, "the hedge's own buy time is recorded"
+        finally:
+            _uncalendar(orig)
+
+    @case("rollover stops at the cap: a hedge in the square-off week is not rolled")
+    def t39():
+        orig = _calendar()
+        try:
+            # cycle squares off 23-Nov: on Fri 20-Nov a 23-Nov hedge stays put
+            c = RollClient()
+            eng = make_engine(m, c)
+            side = make_side(m, eng, "CE")
+            _rolling_leg(side, hedge_expiry="2026-11-23")
+            side.leg.marked_expiry = "2026-11-23"
+            side._manage_open_position = lambda: None
+            side.leg.last_daily_decision_date = "2026-11-20 13:30"
+            with _Clock(date(2026, 11, 20), time(15, 1)):
+                assert side._roll_target(side.leg.position) is None
+                side.evaluate()
+            assert c.orders == [], f"no roll past the square-off date: {c.orders}"
+            # the same hedge with the cycle running to 29-Dec does roll, to 01-Dec
+            side.leg.marked_expiry = "2026-12-29"
+            side._next_roll_try = None
+            with _Clock(date(2026, 11, 20), time(15, 1)):
+                side.evaluate()
+            buys = [s for s, a, q, o in c.orders if a == "BUY"]
+            assert buys and buys[0].startswith("NIFTY01DEC26"), c.orders
+            assert side.leg.position.hedge_expiry == "2026-12-01"
+        finally:
+            _uncalendar(orig)
+
     for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19,
                t20, t21, t22, t23, t24, t25, t26, t27, t28, t29, t30, t31, t32, t33, t34, t35,
-               t36, t37):
+               t36, t37, t38, t39):
         fn()
 
     print("\n" + "=" * 74)
