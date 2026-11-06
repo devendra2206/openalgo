@@ -1807,9 +1807,121 @@ def main():
         finally:
             reset(None)
 
+    @case("a position check holds on flat; only accumulation closes")
+    def t42():
+        """Author 2026-11-06: "if its flat then dont close"."""
+        for verdict, want_exit in (("weakening", False), ("flat", False), ("accumulation", True)):
+            eng = make_engine(m)
+            side = make_side(m, eng, "PE")
+            _open_leg(side, "PE")
+            exits = []
+            side._exit = lambda p, reason: exits.append(reason)
+            side._reclassify_with_retry = lambda pos, slot: verdict
+            with _Clock(date(2026, 11, 6), time(13, 31)):
+                side._daily_decision(time(13, 30))
+            assert (exits == ["opposite_signal"]) == want_exit, (verdict, exits)
+        # entry still sells weakening only
+        assert m.config.short_verdict == "weakening"
+
+    @case("a new-position search that finds nothing runs ONCE more, 5 minutes later")
+    def t43():
+        """Author 2026-11-06: "wait for 5 mins more and do one more search ...
+        search is for new position ... not for trade closing". Drives the real
+        evaluate() -> slot check -> retry dispatch on a flat leg."""
+        def setup(found_on=None):
+            eng = make_engine(m)
+            side = make_side(m, eng, "CE")
+            side.leg.marked_expiry = "2026-11-23"
+            searches = []
+
+            def once(slot=None):
+                searches.append((m.datetime.now(m.IST).strftime("%H:%M"), slot))
+                if found_on is not None and len(searches) == found_on:
+                    side.leg.position = m.ShortHedgePosition(short_symbol="NEW", quantity=65)
+            side._search_once = once
+            return eng, side, searches
+
+        def tick(side, day, hm):
+            with _Clock(day, hm):
+                side.evaluate()
+
+        d = date(2026, 11, 6)
+        eng, side, searches = setup()
+        for hm in (time(11, 31), time(11, 33), time(11, 35, 59), time(11, 36, 1),
+                   time(11, 38), time(11, 41, 5), time(11, 50)):
+            tick(side, d, hm)
+        assert [s[0] for s in searches] == ["11:31", "11:36"], searches
+        assert all(s[1] == time(11, 30) for s in searches), "the retry keeps its slot"
+
+        # the first search finds a strike: no retry
+        eng, side, searches = setup(found_on=1)
+        for hm in (time(13, 31), time(13, 37)):
+            tick(side, d, hm)
+        assert len(searches) == 1, searches
+
+        # the retry finds one: stops there
+        eng, side, searches = setup(found_on=2)
+        for hm in (time(13, 31), time(13, 36, 5), time(13, 42)):
+            tick(side, d, hm)
+        assert len(searches) == 2 and side.leg.position.short_symbol == "NEW", searches
+
+        # expiry date: the 13:31 search still gets its retry ...
+        eng, side, searches = setup()
+        exp = date(2026, 11, 23)
+        for hm in (time(13, 31), time(13, 36, 5)):
+            tick(side, exp, hm)
+        assert [s[0] for s in searches] == ["13:31", "13:36"], searches
+        # ... but at the 15:30 square-off nothing searches and nothing retries
+        eng, side, searches = setup()
+        side.leg.last_daily_decision_date = "2026-11-23 13:30"
+        for hm in (time(15, 31), time(15, 36, 5)):
+            tick(side, exp, hm)
+        assert searches == [], f"no entry search after the square-off: {searches}"
+
+        # a re-entry search after a close is a new-position search too
+        eng, side, searches = setup()
+        with _Clock(d, time(13, 31)):
+            side._search_and_enter_fresh(time(13, 30))
+        assert side._search_retry is not None and side._search_retry[2] == time(13, 30)
+
+        # author: "09:46, 11:31, 13:31 only not for 3:30"
+        eng, side, searches = setup()
+        for hm in (time(9, 46), time(9, 51, 5), time(9, 57)):
+            tick(side, d, hm)
+        assert [s[0] for s in searches] == ["09:46", "09:51"], searches
+        eng, side, searches = setup()
+        side.leg.last_daily_decision_date = "2026-11-06 13:30"
+        for hm in (time(15, 31), time(15, 36, 5), time(15, 39)):
+            tick(side, d, hm)
+        assert [s[0] for s in searches] == ["15:31"], f"no retry after 15:30: {searches}"
+        eng, side, searches = setup()
+        with _Clock(d, time(15, 31)):          # a 15:30 re-entry search: no retry either
+            side._search_and_enter_fresh(time(15, 30))
+        assert side._search_retry is None
+
+    @case("no 09:30 entry, even on the cycle's first day; the first entry is the 09:46 check")
+    def t44():
+        """Author 2026-11-06: "remove that rule taking position at 9:30 ...
+        we can take position at 9:45"."""
+        eng = make_engine(m)
+        side = make_side(m, eng, "PE")
+        day = date(2026, 11, 25)                   # the new cycle's first day
+        eng.get_cycle_start_date = lambda: day
+        calls = []
+        side._evaluate_entry = lambda: calls.append(("09:30-entry", m.datetime.now(m.IST).strftime("%H:%M")))
+        side._search_once = lambda slot=None: calls.append(("check", slot))
+        for hm in (time(9, 31), time(9, 35), time(9, 44)):
+            with _Clock(day, hm):
+                side.evaluate()
+        assert calls == [], f"nothing opens before the 09:45 check: {calls}"
+        with _Clock(day, time(9, 46)):
+            side.evaluate()
+        assert calls == [("check", time(9, 45))], calls
+        assert m.config.cycle_start_entry_enabled is False
+
     for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19,
                t20, t21, t22, t23, t24, t25, t26, t27, t28, t29, t30, t31, t32, t33, t34, t35,
-               t36, t37, t38, t39, t40, t41):
+               t36, t37, t38, t39, t40, t41, t42, t43, t44):
         fn()
 
     print("\n" + "=" * 74)

@@ -2279,3 +2279,27 @@ host's path: `No module named 'utils'`.
   `database/` in a strategy. Use the OpenAlgo API, and check a dependency
   with the host's import path, not with a test loader.
 - Tests: OI t41; `test/test_leaps_calendar.py` (8, both scripts).
+
+## Nifty_OI_Positional_MonthlySell_1: flat holds; one retry of a new-position search (2026-11-06)
+
+- **Flat holds.** A position check now holds on `weakening` or `flat`
+  (`config.hold_verdicts`) and closes only on `accumulation`. Flat is a
+  premium or OI change of exactly zero against the day's reference. Entry is
+  unchanged: only a weakening strike is sold.
+- **One more search.** When a leg has no position and the search of the
+  09:45, 11:30 or 13:30 check (each run a minute late), or the re-entry
+  search one of them triggers, ends without a new position, the search runs
+  once more `new_position_retry_min` (5) minutes later. Never a third time,
+  never for 15:30 or the 09:30 cycle-start entry, never after the expiry-day
+  square-off, and it applies only to opening a position, not to closing one.
+  The pending retry is in memory: a restart drops it and the next check
+  searches as usual.
+- **Expiry day** needed no change: 11:30 and 13:30 run as normal checks
+  (close on accumulation, then search; past the 15th a new entry takes next
+  month's contract), and 15:30 squares off every open position.
+- Tests t42, t43.
+- **No 09:30 entry.** The cycle-start 09:30 entry evaluation is switched off
+  (`config.cycle_start_entry_enabled = False`; author: "remove that rule
+  taking position at 9:30 ... we can take position at 9:45"). The first entry
+  of every day, a new cycle's first day included, is the 09:45 check (run at
+  09:46). Test t44.

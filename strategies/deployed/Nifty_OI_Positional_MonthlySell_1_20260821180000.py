@@ -238,6 +238,19 @@ class Config:
     # wins averaged +54.8 short points against losses of -35.3.
     short_verdict: str = "weakening"
     hold_verdict: str = "weakening"
+    # A position check HOLDS on any of these (author 2026-11-06: "if its flat
+    # then dont close"). Only accumulation closes. "flat" is a premium or OI
+    # change of exactly zero against the day's reference. Entry is unchanged:
+    # only short_verdict is ever sold.
+    hold_verdicts: tuple = ("weakening", "flat")
+    # A search for a NEW position that ends without one is repeated ONCE,
+    # this many minutes later (author 2026-11-06: "wait for 5 mins more and
+    # do one more search ... search is for new position ... not for trade
+    # closing"). Only for the searches of these checks (author: "09:46, 11:31,
+    # 13:31 only not for 3:30"), including a re-entry search one of them
+    # triggers; never 15:30 and never the 09:30 cycle-start entry.
+    new_position_retry_min: int = 5
+    new_position_retry_slots: tuple = (time(9, 45), time(11, 30), time(13, 30))
     monthly_expiry_roll_day_of_month: int = 15   # today.day > 15 resolves to next month's contract
 
     # Tiered, permanently-ratcheting stop-loss (checked continuously via WS LTP).
@@ -345,6 +358,12 @@ class Config:
     sl_check_start_time: time = time(9, 30)
     sl_check_end_time: time = time(15, 30)
     entry_evaluation_time: time = time(9, 30)     # fires only on a cycle's own start day
+    # The 09:30 cycle-start entry is OFF (author 2026-11-06: "remove that rule
+    # taking position at 9:30 ... we can take position at 9:45"). The first
+    # entry of every day, the cycle's first day included, is the 09:45 check
+    # (run at 09:46). Kept as a switch rather than deleted so it can be
+    # turned back on without re-deriving the cycle-start logic.
+    cycle_start_entry_enabled: bool = False
 
     quantity: int = 65                  # NIFTY's current lot size == 1 lot
     capital_tag: float = 250_000.0      # reporting/return-on-capital display only
@@ -2470,6 +2489,10 @@ class MonthlyShortEngine:
         # alert markers. In-memory: after a restart they simply allow the
         # next attempt and at most one repeat alert.
         self._next_roll_try: Optional[datetime] = None
+        # (date, due datetime, slot) of the one retry of a new-position search
+        # that found nothing. In-memory: a restart drops it, and the next
+        # check searches as usual.
+        self._search_retry: Optional[tuple] = None
         self._roll_alert_day: str = ""
         self._next_leftover_try: Optional[datetime] = None
         self._leftover_alerted: set = set()
@@ -2540,11 +2563,13 @@ class MonthlyShortEngine:
             # check was just dispatched (the guard above holds the leg).
             self._manage_open_position_bg()
         else:
-            # Flat -- a position check's search and the 9:30 entry evaluation
-            # can BOTH apply on an entry day now; see
-            # _maybe_daily_decision_bg for why they cannot double-enter.
+            # Flat -- the position checks search for a new position (09:45
+            # first). The 09:30 cycle-start entry runs only if
+            # config.cycle_start_entry_enabled (off since 2026-11-06).
             self._maybe_daily_decision_bg()
-            self._maybe_evaluate_entry_bg()
+            if config.cycle_start_entry_enabled:
+                self._maybe_evaluate_entry_bg()
+            self._maybe_retry_search_bg()
 
     def _dispatch_bg(self, fn, *args):
         """Shared background-dispatch wrapper -- runs `fn` on
@@ -3613,12 +3638,11 @@ class MonthlyShortEngine:
                 Log.warning(f"[MONTHLY_{self.option_type}] fresh OI re-check unavailable this slot -- "
                             f"holding, will retry at the next position check.")
                 return
-            if verdict == config.hold_verdict:
-                Log.info(f"[MONTHLY_{self.option_type}] position check: still "
-                         f"{config.hold_verdict} -- holding.")
+            if verdict in config.hold_verdicts:
+                Log.info(f"[MONTHLY_{self.option_type}] position check: {verdict} -- holding.")
                 return
             Log.info(f"[MONTHLY_{self.option_type}] position check: no longer "
-                     f"{config.hold_verdict} (verdict={verdict}) -- closing short then hedge, "
+                     f"{'/'.join(config.hold_verdicts)} (verdict={verdict}) -- closing short then hedge, "
                      f"will search for a fresh qualifying strike once closed.")
             # A re-entry is armed unless entries are blocked -- i.e. unless we
             # are at/after the square-off slot on the calendar expiry date.
@@ -3733,7 +3757,58 @@ class MonthlyShortEngine:
             if pos.short_exit_order_id or not pos.short_symbol or pos.error_state:
                 return True
 
-    def _search_and_enter_fresh(self, slot_time: Optional[time] = None):
+    def _search_and_enter_fresh(self, slot_time: Optional[time] = None, is_retry: bool = False):
+        """Search for a NEW position. When it ends without one, one more
+        search follows config.new_position_retry_min later (never a third)."""
+        if not is_retry:
+            self._search_retry = None          # a fresh search replaces any retry still due
+        else:
+            Log.info(f"[MONTHLY_{self.option_type}] one more search for a new position "
+                     f"({config.new_position_retry_min} min after the "
+                     f"{(slot_time or config.daily_decision_time).strftime('%H:%M')} search).")
+        self._search_once(slot_time)
+        self._after_new_position_search(slot_time, is_retry)
+
+    def _after_new_position_search(self, slot_time: Optional[time], is_retry: bool):
+        if self.leg.position.short_symbol:
+            return                              # entered (or entering)
+        if slot_time not in config.new_position_retry_slots:
+            return                              # 15:30 (and 09:30 entry) get no retry
+        anchor = (slot_time or config.daily_decision_time).strftime("%H:%M")
+        if is_retry:
+            Log.info(f"[MONTHLY_{self.option_type}] no new position on the retry either "
+                     f"(searched for the {anchor} check) -- next search at the next check.")
+            return
+        now = datetime.now(IST)
+        at = now + timedelta(minutes=config.new_position_retry_min)
+        self._search_retry = (now.date(), at, slot_time)
+        Log.info(f"[MONTHLY_{self.option_type}] no new position from the {anchor} search -- "
+                 f"one more search at {at.strftime('%H:%M:%S')}.")
+
+    def _maybe_retry_search_bg(self):
+        """Run the one pending retry once it is due (flat leg only)."""
+        retry = getattr(self, "_search_retry", None)
+        if retry is None:
+            return
+        day, at, slot_time = retry
+        now = datetime.now(IST)
+        today = now.date()
+        if day != today or self.leg.position.short_symbol:
+            self._search_retry = None
+            return
+        if self.leg.expiry_closed_date == today.isoformat():
+            self._search_retry = None           # the day is terminal for this leg
+            return
+        if (self.leg.marked_expiry == today.isoformat()
+                and now.time() >= config.expiry_close_time):
+            self._search_retry = None           # no entry at/after the expiry-day square-off
+            return
+        if now < at or self.leg_key in self.engine._eval_pending:
+            return
+        self._search_retry = None
+        self._dispatch_bg(lambda: self._search_and_enter_fresh(slot_time, is_retry=True))
+
+    def _search_once(self, slot_time: Optional[time] = None):
         spot = self.engine.get_spot_ltp()
         if spot is None:
             Log.warning(f"[MONTHLY_{self.option_type}] spot LTP unavailable for daily-decision "
@@ -5110,7 +5185,10 @@ def print_banner():
           f"scheduled time (candle asked for is still the scheduled one)")
     print(f"Current OI source    : {'live quote/chain' if config.use_live_oi_for_current else 'closed candle'}"
           f"   (reference: closed candle, cached once per day)")
-    print(f"Entry evaluation time: {config.entry_evaluation_time.strftime('%H:%M')} (cycle-start day only)")
+    print("Entry evaluation time: "
+          + (f"{config.entry_evaluation_time.strftime('%H:%M')} (cycle-start day only)"
+             if config.cycle_start_entry_enabled
+             else "off -- first entry each day is the 09:45 check (09:46)"))
     if config.expiry_close_time not in config.daily_decision_times:
         raise SystemExit(
             f"config error: expiry_close_time "
@@ -5126,7 +5204,7 @@ def print_banner():
                      for t in config.daily_decision_times)
           + "  (+1 min buffer each)")
     print(f"Short when verdict   : {config.short_verdict}   "
-          f"(hold while {config.hold_verdict})")
+          f"(hold while {' or '.join(config.hold_verdicts)})")
     print(f"SL check window      : {config.sl_check_start_time.strftime('%H:%M')}"
           f"-{config.sl_check_end_time.strftime('%H:%M')}")
     print(f"Expiry-day square-off: {config.expiry_close_time.strftime('%H:%M')} "
