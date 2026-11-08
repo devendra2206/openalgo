@@ -49,6 +49,11 @@ def _raw_ddmmmyy(d: date) -> str:
     return f"{d.day:02d}-{_MONTH_ABBR[d.month]}-{d.strftime('%y')}"
 
 
+def iso_compact(iso: str) -> str:
+    """"2026-08-25" -> "25AUG26", the script's symbol form."""
+    return datetime.strptime(iso, "%Y-%m-%d").strftime("%d%b%y").upper()
+
+
 def _ts_str(ts: pd.Timestamp) -> str:
     return ts.strftime("%Y-%m-%d %H:%M:%S") + IST_SUFFIX
 
@@ -142,6 +147,37 @@ class BacktestClient:
         backtest runtime."""
         return self._realized_vol_pct_cached(as_of.date(), lookback_sessions)
 
+    def _iso_for_symbol(self, symbol: str):
+        parts = data.resolve_option_symbol_parts(symbol, UNDERLYING)
+        if parts is None:
+            return None
+        expiry_compact, strike, opt_type = parts
+        raw = f"{expiry_compact[:2]}-{expiry_compact[2:5].capitalize()}-{expiry_compact[5:]}"
+        iso = self._raw_to_iso.get(raw)
+        return None if iso is None else (iso, strike, opt_type)
+
+    def price_now(self, symbol: str, exchange: str) -> float | None:
+        """Close of the last COMPLETED 1-min bar at clock.current, from
+        today only. At 10:05:00 that is the 10:04 bar, never a bar that has
+        not finished yet (the old 5-min lookup handed back the close of the
+        still-forming 10:05-10:10 candle, i.e. a future price). An option
+        that has not printed today is unpriced (None), as a stale quote
+        would be live."""
+        now = self.clock.current.replace(tzinfo=None)
+        if symbol == UNDERLYING and exchange in ("NSE_INDEX", "NSE"):
+            bars = data.load_spot_1min()
+        else:
+            key = self._iso_for_symbol(symbol)
+            if key is None:
+                return None
+            bars = data.load_option_1min(*key)
+            if bars is None:
+                return None
+        done = bars.loc[:pd.Timestamp(now) - pd.Timedelta(minutes=1)]
+        if done.empty or done.index[-1].date() != now.date():
+            return None
+        return float(done["close"].iloc[-1])
+
     # -- market data ----------------------------------------------------
     def history(self, symbol, exchange, interval, start_date, end_date):
         bars = self._bars_for_symbol(symbol, exchange)
@@ -163,18 +199,18 @@ class BacktestClient:
         # which dominated backtest runtime (profiled: 56s of a 59s run spent
         # in history()/iterrows() alone for just a 3-day window). This does
         # the same conversion in a handful of column-level operations.
-        rows = rows.copy()
-        rows["timestamp"] = rows.index.strftime("%Y-%m-%d %H:%M:%S") + IST_SUFFIX
-        cols = ["timestamp", "open", "high", "low", "close"]
-        if "oi" in rows.columns:
-            rows["volume"] = rows["volume"].fillna(0)
-            rows["oi"] = rows["oi"].fillna(0)
-            cols += ["volume", "oi"]
-        out = rows[cols].to_dict(orient="records")
-        return {"status": "success", "data": out}
+        # The OpenAlgo SDK returns a DataFrame indexed by tz-aware IST
+        # timestamps (openalgo/data.py); the script treats a dict as an error.
+        out = rows.copy()
+        out.index = out.index.tz_localize("Asia/Kolkata")
+        out.index.name = "timestamp"
+        if "oi" in out.columns:
+            out["volume"] = out["volume"].fillna(0)
+            out["oi"] = out["oi"].fillna(0)
+        return out
 
     def quotes(self, symbol, exchange):
-        px = self._last_close_at_or_before(symbol, exchange, self.clock.current)
+        px = self.price_now(symbol, exchange)
         if px is None:
             return {"status": "error", "message": f"no quote for {symbol}.{exchange}"}
         return {"status": "success", "data": {"ltp": px, "bid": px, "ask": px}}
@@ -182,14 +218,39 @@ class BacktestClient:
     def expiry(self, symbol, exchange, instrumenttype):
         return {"status": "success", "data": list(self._expiry_raw_all)}
 
-    def optionchain(self, underlying, exchange, expiry_date, strike_count=20):
-        iso = self._raw_to_iso.get(expiry_date)
+    def optionchain(self, underlying, exchange, expiry_date, strike_count=20, with_quotes=True, **_kw):
+        """Same response shape the live /optionchain gives the script:
+        {"status", "underlying_ltp", "chain": [{"strike", "ce", "pe"}]},
+        strike_count listed strikes each side of ATM. Accepts the compact
+        ("25AUG26") or dash ("25-Aug-26") expiry form. Quotes are the last
+        completed 1-min close with bid = ask = ltp (no spread modelled)."""
+        raw = expiry_date if "-" in expiry_date else             f"{expiry_date[:2]}-{expiry_date[2:5].capitalize()}-{expiry_date[5:]}"
+        iso = self._raw_to_iso.get(raw)
         if iso is None:
             return {"status": "error", "message": f"unknown expiry {expiry_date}"}
-        strikes = sorted({s for s, _ot in data.list_strikes_for_expiry(iso)})
+        listed = data.list_strikes_for_expiry(iso)
+        strikes = sorted({s for s, _ot in listed})
         if not strikes:
             return {"status": "error", "message": f"no strikes listed for {expiry_date}"}
-        return {"status": "success", "data": [{"strike": s} for s in strikes]}
+        spot = self.price_now(UNDERLYING, "NSE_INDEX")
+        if spot is None:
+            return {"status": "error", "message": "no spot price"}
+        atm_i = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
+        window = strikes[max(0, atm_i - strike_count): atm_i + strike_count + 1]
+        have = set(listed)
+        chain = []
+        for k in window:
+            row = {"strike": k}
+            for ot in ("CE", "PE"):
+                leg = None
+                if (k, ot) in have:
+                    leg = {"symbol": f"{UNDERLYING}{iso_compact(iso)}{int(k) if k == int(k) else k}{ot}"}
+                    if with_quotes:
+                        px = self.price_now(leg["symbol"], "NFO")
+                        leg.update({"ltp": px or 0, "bid": px or 0, "ask": px or 0})
+                row[ot.lower()] = leg
+            chain.append(row)
+        return {"status": "success", "underlying_ltp": spot, "chain": chain}
 
     def optiongreeks(self, symbol, exchange, **kwargs):
         parts = data.resolve_option_symbol_parts(symbol, UNDERLYING)
@@ -217,7 +278,7 @@ class BacktestClient:
     # -- orders -----------------------------------------------------------
     def placeorder(self, strategy, symbol, exchange, action, product, price_type,
                     quantity, price, trigger_price, disclosed_quantity):
-        px = self._last_close_at_or_before(symbol, exchange, self.clock.current)
+        px = self.price_now(symbol, exchange)
         if px is None:
             return {"status": "error", "message": f"no fill price available for {symbol}"}
         self._order_seq += 1

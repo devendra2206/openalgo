@@ -59,8 +59,8 @@ at Reference Time:
          Weakening
     -> Sell Selected Monthly <side>.
     Exit: 2 consecutive opposite-verdict candles on that leg's own frozen
-    strike -- ONLY exit condition, no profit target, no stop-loss, exactly
-    as specified (confirmed decision, see plan doc SS7 item 2).
+    strike, OR a 25% stop-loss on the short's premium (added 2026-11-08),
+    OR 15:15. No profit target.
 
   A side's own Weekly signal therefore drives two different outcomes
   depending on which quadrant-group it lands in: Accumulation feeds that
@@ -222,6 +222,16 @@ class Config:
     # still good, so no immediate retry (matches universal_exit_time/
     # opposite_signal's reenter=False, not profit_target's reenter=True).
     weekly_stop_loss_pct: float = 40.0   # % loss on the option's own premium (Weekly Buy only)
+    # 2026-11-08 (author): stop-loss on the Monthly short: its LTP at or
+    # above entry premium x 1.25, on the two-sided LTP. Both stops (this and
+    # weekly_stop_loss_pct) are checked every minute (minute_stop_check_bg)
+    # as well as at each 5-min candle check. A stopped leg is flat and the
+    # normal entry gate decides any later entry, as after its other exits.
+    monthly_stop_loss_pct: float = 25.0
+    # 2026-11-08 (author): each 5-min check runs this many minutes after the
+    # candle closes (09:30-09:35 candle checked at 09:36), so the broker has
+    # finished the candle and its OI before it is read.
+    candle_close_buffer_min: int = 1
     monthly_delta_low: float = 0.20
     monthly_delta_high: float = 0.25
     # 2026-08-11: select_monthly_delta_strike() now picks whichever scanned
@@ -262,8 +272,11 @@ class Config:
     # of clearing before it opens. 15:10 also keeps poll_fill's reprice
     # loop (up to ~5 minutes) comfortably clear of the window and of the
     # 15:30 exchange close.
-    weekly_universal_exit_time: time = time(15, 10)   # spec SS5.B, revised
-    monthly_universal_exit_time: time = time(15, 10)
+    # 2026-11-08 (author): back to 15:15 for both engines. Checked on every
+    # scheduler tick from 15:15, not only at a candle check, so the close is
+    # sent at 15:15 and not at the next 5-min check (15:16 with the buffer).
+    weekly_universal_exit_time: time = time(15, 15)
+    monthly_universal_exit_time: time = time(15, 15)
     # No NEW entries (Weekly or Monthly, either side) from this time onward --
     # existing open legs are still managed/exited normally by their own rules.
     entry_cutoff_time: time = time(14, 45)
@@ -905,25 +918,26 @@ def _compact_expiry(expiry_ddmmmyy_dash: str) -> str:
 def resolve_weekly_expiry(client) -> tuple[str, str]:
     """Nearest upcoming NIFTY options expiry -- rolls to the NEXT expiry if
     today IS the resolved expiry day (same gamma/theta-cliff avoidance every
-    other deployed script in this project uses). Returns
-    (compact_ddmmmyy_for_symbol, raw_ddmmmyy_dash_for_history_lookups)."""
+    other deployed script in this project uses; author 2026-11-08: back to
+    next week's contract on expiry day after briefly trying the current
+    week's). Returns (compact_ddmmmyy_for_symbol,
+    raw_ddmmmyy_dash_for_history_lookups)."""
     resp = client.expiry(symbol=UNDERLYING_SYMBOL, exchange=OPTIONS_EXCHANGE, instrumenttype="options")
     if resp.get("status") != "success" or not resp.get("data"):
         raise RuntimeError(f"Could not resolve weekly options expiry: {resp}")
     today = datetime.now(IST).date()
-    dates_raw = resp["data"]
-    for i, raw in enumerate(dates_raw):
-        d = datetime.strptime(raw, "%d-%b-%y").date()
-        if d >= today:
-            if d == today:
-                if i + 1 < len(dates_raw):
-                    return _compact_expiry(dates_raw[i + 1]), dates_raw[i + 1]
-                raise RuntimeError(
-                    "Today is the nearest weekly expiry and the broker returned no "
-                    "later expiry date to roll to -- refusing to trade today's expiring contract."
-                )
-            return _compact_expiry(raw), raw
-    raise RuntimeError(f"No upcoming weekly expiry found in: {dates_raw}")
+    upcoming = sorted((datetime.strptime(raw, "%d-%b-%y").date(), raw) for raw in resp["data"])
+    upcoming = [(d, raw) for d, raw in upcoming if d >= today]
+    if not upcoming:
+        raise RuntimeError(f"No upcoming weekly expiry found in: {resp['data']}")
+    if upcoming[0][0] == today:
+        if len(upcoming) < 2:
+            raise RuntimeError(
+                "Today is the nearest weekly expiry and the broker returned no "
+                "later expiry date to roll to -- refusing to trade today's expiring contract."
+            )
+        return _compact_expiry(upcoming[1][1]), upcoming[1][1]
+    return _compact_expiry(upcoming[0][1]), upcoming[0][1]
 
 
 def resolve_monthly_expiry(client) -> tuple[str, str]:
@@ -1222,6 +1236,15 @@ def fetch_candle_oi_premium(client, symbol: str, exchange: str,
             Log.warning(f"Only a still-forming candle available for {symbol}.{exchange} -- "
                         f"no closed candle yet.")
             return None
+
+    # The 1-minute buffer (author 2026-11-08) applies to every current read,
+    # not only to the scheduled checks: the first pass after the reference
+    # is fixed (09:30:00) or after a restart just past a close would
+    # otherwise read a candle that closed seconds ago, which the broker may
+    # still be finishing. Skip instead; the next buffered check reads it.
+    if at_or_before is None and (bars.index[-1] + candle_interval
+                                 + timedelta(minutes=config.candle_close_buffer_min) > datetime.now(IST)):
+        return None
 
     last = bars.iloc[-1]
     return {
@@ -1555,11 +1578,115 @@ def _current_candle_boundary(interval_minutes: int) -> datetime:
     for interval_minutes=5 at 10:07:42 IST, returns 10:05:00. Used by
     run_cycle() to evaluate signals exactly once per closed 5-min candle,
     not on every 10s scheduler tick."""
-    now = datetime.now(IST)
+    # Shifted back by candle_close_buffer_min: the boundary changes (and
+    # the candle checks run) that many minutes after each candle closes.
+    now = datetime.now(IST) - timedelta(minutes=config.candle_close_buffer_min)
     total_minutes = now.hour * 60 + now.minute
     bucket_start_minutes = (total_minutes // interval_minutes) * interval_minutes
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight + timedelta(minutes=bucket_start_minutes)
+
+
+def fetch_previous_session_close(client, prev_day) -> Optional[dict]:
+    """NIFTY's real close of the last regular session on or before
+    `prev_day`, for the 09:30 gap test.
+
+    Read from 1-MINUTE candles, never the 5-minute ones. Shoonya folds the
+    NEXT morning's 09:14 pre-open print into the previous day's last
+    intraday candle for every interval above 1m (docs/CUSTOMIZATIONS.md,
+    2026-11-05), so the 5m 15:25 candle read at 09:30 closes at that
+    morning's pre-open price and the gap comes out near zero. In the 1m
+    series the pre-open is its own bar dated the new day, and the previous
+    day's 15:29 bar carries the real close.
+
+    The last bar at or before 15:30 on any day up to `prev_day`, looking
+    back a week: resolve_previous_trading_day() skips weekends only, so
+    after an exchange holiday `prev_day` is the holiday itself; and a
+    Muhurat evening session has no bar before 15:30. Either way the real
+    previous session is found, and its date is returned so the option
+    references are read from that same day.
+
+    Returns {"close", "date", "timestamp"} or None (caller retries)."""
+    start = prev_day - timedelta(days=7)
+    try:
+        bars = client.history(symbol=UNDERLYING_SYMBOL, exchange=UNDERLYING_SPOT_EXCHANGE,
+                              interval="1m", start_date=start.isoformat(), end_date=prev_day.isoformat())
+    except Exception as exc:
+        Log.warning(f"history() (previous close, 1m) failed for {UNDERLYING_SYMBOL}: {exc}")
+        return None
+    if _is_error_response(bars) or bars is None or getattr(bars, "empty", True):
+        Log.warning(f"No 1m {UNDERLYING_SYMBOL} candles up to {prev_day}: "
+                    f"{bars if _is_error_response(bars) else 'empty'}")
+        return None
+    try:
+        keep = [ts.date() <= prev_day and ts.time() <= config.market_close for ts in bars.index]
+        day_bars = bars[keep]
+    except Exception as exc:
+        Log.warning(f"Could not read the 1m {UNDERLYING_SYMBOL} candles up to {prev_day}: {exc}")
+        return None
+    if day_bars.empty:
+        Log.warning(f"No 1m {UNDERLYING_SYMBOL} candle at or before {prev_day} 15:30")
+        return None
+    last_ts = day_bars.index[-1]
+    return {"close": float(day_bars.iloc[-1]["close"]), "date": last_ts.date(), "timestamp": str(last_ts),
+            "label": last_ts.strftime("%d-%b %H:%M")}
+
+
+def minute_stop_check_bg(side, is_short: bool, sl_pct: float, exit_fn) -> None:
+    """Stop-loss check once a minute between the 5-min candle checks
+    (author 2026-11-08: "sl check in one min than 5 mins"). Weekly long:
+    LTP <= entry x (1 - sl_pct/100); Monthly short: LTP >= entry x
+    (1 + sl_pct/100) -- the same levels the candle checks use, on the same
+    two-sided live price. Only the stop: the OI verdict, the Weekly profit
+    target and the candle-based exits stay on the 5-min checks.
+
+    Runs on the fill executor under the leg's _eval_pending guard, the same
+    guard the candle checks take, so a stop check and a candle check never
+    run on one leg at once and an exit is never sent twice. It does NOT go
+    through _dispatch_eval_bg, which would mark the current candle as
+    evaluated and swallow that candle's check."""
+    if sl_pct <= 0:
+        return
+    minute = datetime.now(IST).replace(second=0, microsecond=0)
+    if getattr(side, "_last_stop_check_minute", None) == minute:
+        return
+    engine = side.engine
+    if side.leg_key in engine._eval_pending:
+        return
+    side._last_stop_check_minute = minute
+    engine._eval_pending.add(side.leg_key)
+
+    def _run():
+        try:
+            pos = side.leg.position
+            if (not pos.symbol or not pos.entry_filled or pos.exit_order_id or pos.error_state
+                    or pos.entry_px <= 0):
+                return
+            ltp = engine.price_stream.get_ltp(pos.symbol, OPTIONS_EXCHANGE, config.ws_stale_seconds)
+            if ltp is None:
+                ltp = fetch_symbol_ltp(engine.client, pos.symbol, OPTIONS_EXCHANGE, require_two_sided=True)
+            if ltp is None:
+                return
+            if is_short:
+                level = pos.entry_px * (1 + sl_pct / 100.0)
+                hit = ltp >= level
+            else:
+                level = pos.entry_px * (1 - sl_pct / 100.0)
+                hit = ltp <= level
+            if hit:
+                Log.info(f"[{side.leg_key}] stop-loss hit (1-min check): ltp={ltp} "
+                         f"{'>=' if is_short else '<='} {level:.2f} (entry {pos.entry_px})")
+                exit_fn(pos, ltp)
+        except Exception as exc:
+            Log.exception(f"[{side.leg_key}] 1-min stop-loss check failed: {exc}")
+        finally:
+            engine._eval_pending.discard(side.leg_key)
+
+    try:
+        engine._fill_executor.submit(_run)
+    except Exception as exc:
+        engine._eval_pending.discard(side.leg_key)
+        Log.warning(f"[{side.leg_key}] 1-min stop-loss check not dispatched: {exc}")
 
 
 def resolve_previous_trading_day(today) -> "datetime.date":
@@ -1699,8 +1826,12 @@ class WeeklySideEngine:
                 # actually filled (2026-08-04: fixed).
                 self._finalize_exit(pos, pos.pending_exit_reason, pos.pending_exit_reenter)
                 return
-            if self._due_for_boundary():
+            if (self._due_for_boundary()
+                    or datetime.now(IST).time() >= config.weekly_universal_exit_time):
                 self._manage_open_position_bg()
+            else:
+                minute_stop_check_bg(self, is_short=False, sl_pct=config.weekly_stop_loss_pct,
+                                     exit_fn=lambda p, px: self._exit(p, px, "stop_loss", reenter=False))
         elif self._due_for_boundary():
             self._evaluate_entry_bg()
 
@@ -2362,8 +2493,12 @@ class MonthlySideEngine:
                 # by up to one full candle interval (2026-08-04: fixed).
                 self._finalize_exit(pos, pos.pending_exit_reason)
                 return
-            if self._due_for_boundary():
+            if (self._due_for_boundary()
+                    or datetime.now(IST).time() >= config.monthly_universal_exit_time):
                 self._manage_open_position_bg()
+            else:
+                minute_stop_check_bg(self, is_short=True, sl_pct=config.monthly_stop_loss_pct,
+                                     exit_fn=lambda p, px: self._exit(p, px, "stop_loss"))
         else:
             self._maybe_evaluate_entry_bg()
 
@@ -2770,9 +2905,10 @@ class MonthlySideEngine:
 
     def _manage_open_position(self):
         pos = self.leg.position
-        # No profit target, no stop-loss -- exactly as specified (plan doc
-        # SS7#2). The two exits are 2 consecutive opposite-verdict candles on
-        # this leg's own frozen strike, OR the universal exit time (NRML --
+        # No profit target (plan doc SS7#2). Exits: 2 consecutive
+        # opposite-verdict candles on this leg's own frozen strike, the
+        # stop-loss (monthly_stop_loss_pct, added 2026-11-08), OR the
+        # universal exit time (NRML --
         # no broker auto-square-off backstop, so this is the ONLY thing that
         # closes the position; see config.product's docstring).
         if datetime.now(IST).time() >= config.monthly_universal_exit_time:
@@ -2781,6 +2917,17 @@ class MonthlySideEngine:
                 ltp = fetch_symbol_ltp(self.engine.client, pos.symbol, OPTIONS_EXCHANGE, require_two_sided=True)
             self._exit(pos, ltp if ltp is not None else pos.entry_px, "universal_exit_time")
             return
+
+        # Stop-loss (author 2026-11-08), before the candle's OI verdict.
+        if config.monthly_stop_loss_pct > 0 and pos.entry_px > 0:
+            ltp = self.engine.price_stream.get_ltp(pos.symbol, OPTIONS_EXCHANGE, config.ws_stale_seconds)
+            if ltp is None:
+                ltp = fetch_symbol_ltp(self.engine.client, pos.symbol, OPTIONS_EXCHANGE, require_two_sided=True)
+            if ltp is not None and ltp >= pos.entry_px * (1 + config.monthly_stop_loss_pct / 100.0):
+                Log.info(f"[MONTHLY_{self.option_type}] stop-loss hit: ltp={ltp} >= entry {pos.entry_px} x "
+                         f"{1 + config.monthly_stop_loss_pct / 100.0:.2f}")
+                self._exit(pos, ltp, "stop_loss")
+                return
 
         current = fetch_candle_oi_premium(self.engine.client, pos.symbol, OPTIONS_EXCHANGE)
         if current is None:
@@ -3022,17 +3169,20 @@ class StrategyEngine:
         # a pre-standardization historical offset) instead of the correct
         # +5:30, corrupting every comparison against real IST timestamps.
         # Caught by strategies/test/test_oi_weekly_monthly_simulation.py.
-        prev_close_at = IST.localize(datetime.combine(prev_day, time(15, 30)))
-        prev_close_data = fetch_candle_oi_premium(
-            self.client, UNDERLYING_SYMBOL, UNDERLYING_SPOT_EXCHANGE,
-            at_or_before=prev_close_at,
-        )
+        # 1-minute candles, not 5-minute: see fetch_previous_session_close.
+        prev_close_data = fetch_previous_session_close(self.client, prev_day)
         if prev_close_data is None:
             Log.warning("[Reference] previous day's close unavailable, retrying next cycle.")
             return
-        prev_close = prev_close_data["premium"]  # field name is generic; this is spot close here
+        prev_close = prev_close_data["close"]
+        prev_day = prev_close_data["date"]   # the real previous session (after a holiday too)
 
         gap_pct = (spot_now - prev_close) / prev_close * 100.0
+        # Both inputs in the log, as Nifty_OI_Positional_MonthlySell logs
+        # them: yesterday's close with the candle it came from, and NIFTY's
+        # price with the time it was read.
+        gap_inputs = (f"yesterday close={prev_close:.2f} ({prev_close_data['label']}) | "
+                      f"NIFTY at {datetime.now(IST).strftime('%H:%M:%S')}={spot_now:.2f}")
 
         if abs(gap_pct) <= config.gap_threshold_pct:
             ref.reference_date = today_key
@@ -3040,13 +3190,17 @@ class StrategyEngine:
             ref.mode = "prev_close"
             ref.reference_time_iso = prev_day.isoformat()
             ref.computed = True
-            Log.info(f"[Reference] gap={gap_pct:+.3f}% (<= {config.gap_threshold_pct}%) -> "
-                     f"Reference Time = previous day's close ({prev_day})")
+            Log.info(f"[Reference] gap={gap_pct:+.3f}% (<= {config.gap_threshold_pct}%) "
+                     f"[{gap_inputs}] -> Reference Time = previous day's close ({prev_day})")
             return
 
         if now < config.reference_wait_time:
-            Log.info(f"[Reference] gap={gap_pct:+.3f}% (> {config.gap_threshold_pct}%) -- "
-                     f"waiting for 09:35 candle to close.")
+            if getattr(self, "_gap_wait_day", None) != today_key:
+                self._gap_wait_day = today_key
+                Log.info(f"[Reference] gap={gap_pct:+.3f}% (> {config.gap_threshold_pct}%) "
+                         f"[{gap_inputs}] -- reference will be fixed when the "
+                         f"{config.reference_wait_time.strftime('%H:%M')} candle closes; "
+                         f"no further checks until then.")
             return
 
         ref.reference_date = today_key
@@ -3055,8 +3209,8 @@ class StrategyEngine:
         ref.reference_time_iso = datetime.now(IST).replace(
             hour=9, minute=35, second=0, microsecond=0).isoformat()
         ref.computed = True
-        Log.info(f"[Reference] gap={gap_pct:+.3f}% (> {config.gap_threshold_pct}%) -> "
-                 f"Reference Time = today 09:35")
+        Log.info(f"[Reference] gap={gap_pct:+.3f}% (> {config.gap_threshold_pct}%) "
+                 f"[{gap_inputs}] -> Reference Time = today 09:35")
 
     def _new_candle_closed(self) -> bool:
         boundary = _current_candle_boundary(5)
@@ -3512,12 +3666,17 @@ def print_banner():
     print(f"Gap threshold        : {config.gap_threshold_pct}%")
     print(f"Weekly profit target : {config.weekly_profit_target_pct}%")
     print(f"Weekly stop-loss     : -{config.weekly_stop_loss_pct}%")
+    print(f"Monthly stop-loss    : +{config.monthly_stop_loss_pct}% on the short premium")
+    print("Stop-loss checks     : every minute (both engines), plus each candle check")
+    print(f"Candle checks        : {config.candle_close_buffer_min} min after each 5-min close")
+    print(f"Universal exit       : weekly {config.weekly_universal_exit_time:%H:%M}, "
+          f"monthly {config.monthly_universal_exit_time:%H:%M}")
     print(f"Monthly delta target : {config.monthly_delta_target} (stop-widening band: {config.monthly_delta_low}-{config.monthly_delta_high})")
     print(f"Quantity per leg     : {config.quantity}")
     print(f"Product              : {config.product}")
     print(f"Entry cutoff time    : {config.entry_cutoff_time.strftime('%H:%M')} (no new entries after)")
     print("WEEKLY BUY -- own-side Accumulation only. MONTHLY SELL -- own-side")
-    print("Weakening gate AND own-side Weakening confirmation, no SL/target.")
+    print("Weakening gate AND own-side Weakening confirmation, SL, no target.")
     print("=" * 70)
 
 

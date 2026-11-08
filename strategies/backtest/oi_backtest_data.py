@@ -21,7 +21,7 @@ from pathlib import Path
 import pandas as pd
 
 DATA_ROOT = Path(r"C:\Devendra\OpenAlgo\data23_to_26\data")
-SPOT_CSV = DATA_ROOT / "2023to2026_Nifty_Spot.csv"
+SPOT_CSV = DATA_ROOT / "2021to2026_Nifty_Spot.csv"
 EXPIRY_CSV = DATA_ROOT / "Expiry.csv"
 
 _STRIKE_FILENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_(\d+(?:\.\d+)?)(CE|PE)\.csv$", re.IGNORECASE)
@@ -36,6 +36,27 @@ def load_expiry_dates() -> list[date]:
     which this backtest replays unmodified)."""
     df = pd.read_csv(EXPIRY_CSV)
     return sorted(datetime.strptime(d, "%Y-%m-%d").date() for d in df["Dates"])
+
+
+@lru_cache(maxsize=1)
+def load_spot_1min() -> pd.DataFrame:
+    """Raw 1-min NIFTY spot, tz-naive IST index, lowercase OHLC columns."""
+    df = pd.read_csv(SPOT_CSV)
+    df["timestamp"] = pd.to_datetime(df["Date"] + " " + df["Time"], format="%Y-%m-%d %H:%M:%S")
+    df = df.set_index("timestamp").sort_index()
+    df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close"})
+    return df[["open", "high", "low", "close"]]
+
+
+def regular_trading_days() -> list[date]:
+    """Dates with a real 09:15-15:30 session: at least 300 1-min bars and an
+    open by 09:20 (drops Muhurat evening sessions and short special days)."""
+    df = load_spot_1min()
+    days = []
+    for d, grp in df.groupby(df.index.date):
+        if len(grp) >= 300 and grp.index[0].time() <= datetime.strptime("09:20", "%H:%M").time():
+            days.append(d)
+    return days
 
 
 @lru_cache(maxsize=1)
@@ -78,6 +99,21 @@ def load_spot_daily_close() -> pd.Series:
     date, never resample again."""
     spot = load_spot_5min()
     return spot["close"].resample("1D").last().dropna()
+
+
+@lru_cache(maxsize=2048)
+def load_option_1min(expiry_iso: str, strike: float, option_type: str) -> pd.DataFrame | None:
+    """One strike's raw 1-min OHLC, tz-naive IST index, or None if not listed."""
+    strike_int = int(strike) if strike == int(strike) else strike
+    path = DATA_ROOT / expiry_iso[:4] / expiry_iso / f"{expiry_iso}_{strike_int}{option_type}.csv"
+    if not path.is_file():
+        return None
+    df = pd.read_csv(path)
+    if df.empty:
+        return None
+    df["timestamp"] = pd.to_datetime(df["Date"] + " " + df["Time"], format="%d/%m/%Y %H:%M:%S")
+    df = df.set_index("timestamp").sort_index()
+    return df.rename(columns={"Close": "close"})[["close"]]
 
 
 @lru_cache(maxsize=4096)

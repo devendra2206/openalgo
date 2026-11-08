@@ -158,31 +158,119 @@ def build_engine(module, clock: btc.Clock, trades: list, strategy_tag="oi_backte
     return engine, client
 
 
+def install_monthly_stop_loss(module, sl_pct: float):
+    """Author 2026-11-08: the Monthly short has a stop-loss of sl_pct% of
+    its entry premium (the deployed script has none). Checked where the
+    script checks Weekly's own stop: at each 5-min boundary, on the leg's
+    two-sided LTP, before the candle's OI verdict. Not at/after the
+    universal exit time (that exit runs first, unchanged). After a stop the
+    leg is flat and the script's normal entry gate decides any later entry,
+    exactly as after its other exits."""
+    original = module.MonthlySideEngine._manage_open_position
+
+    def _manage_open_position(self):
+        pos = self.leg.position
+        if (sl_pct > 0 and pos.entry_px > 0
+                and module.datetime.now(module.IST).time() < module.config.monthly_universal_exit_time):
+            ltp = module.fetch_symbol_ltp(self.engine.client, pos.symbol, module.OPTIONS_EXCHANGE,
+                                          require_two_sided=True)
+            if ltp is not None and ltp >= pos.entry_px * (1 + sl_pct / 100.0):
+                module.Log.info(f"[MONTHLY_{self.option_type}] stop-loss hit: ltp={ltp} >= "
+                                f"entry {pos.entry_px} x {1 + sl_pct / 100.0:.2f}")
+                self._exit(pos, ltp, "stop_loss")
+                return
+        return original(self)
+
+    module.MonthlySideEngine._manage_open_position = _manage_open_position
+
+
+def install_gap_reference_0930(module):
+    """Author 2026-11-08, gap days (|gap| > 0.5%): the reference is the
+    candle that closes at 09:30 (bar 09:25-09:30), premium and OI both, and
+    comparisons run on every 5-min close from 09:35. The deployed script
+    instead waits until 09:35 and references the bar stamped 09:35 (09:35-
+    09:40), so its first real comparison is 09:45.
+      * reference_wait_time 09:30: the gap mode is fixed at 09:30, as the
+        no-gap mode already is.
+      * the today-mode reference is read at_or_before 09:25 (bar 09:25-09:30).
+    At 09:30 that same bar is also the current candle, so the change is zero
+    and the verdict is "flat"; 09:35 is the first comparison. No-gap days
+    are untouched."""
+    module.config.reference_wait_time = real_datetime.strptime("09:30", "%H:%M").time()
+    original = module.fetch_reference_oi_premium
+
+    def fetch_reference_oi_premium(client, symbol, exchange, reference):
+        if reference.mode == "today_0935":
+            at = module.datetime.fromisoformat(reference.reference_time_iso)
+            at = at.replace(hour=9, minute=25, second=0, microsecond=0)
+            return module.fetch_candle_oi_premium(client, symbol, exchange, at_or_before=at)
+        return original(client, symbol, exchange, reference)
+
+    module.fetch_reference_oi_premium = fetch_reference_oi_premium
+
+
+def _wait_idle(engine, timeout=600.0):
+    """The script runs every candle evaluation and fill watch on its own
+    executor. The clock must not move until they finish, or a background
+    check would read a later time (and later prices) than its candle."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if (not engine._eval_pending and not engine._pending_fills
+                and engine._fill_executor._work_queue.qsize() == 0):
+            return
+        time.sleep(0.002)
+    raise RuntimeError("strategy engine did not go idle")
+
+
+# The live scheduler ticks every 10s. Each 5-min boundary is replayed as the
+# ticks at +0s, +10s, +20s and +30s: Weekly's background pass completes on
+# one tick and Monthly's same-side gate reads it on a later one, exactly as
+# live. Prices do not move between these ticks (the last completed minute
+# is the same), so nothing is gained or lost by not replaying the rest.
+TICK_OFFSETS_SEC = (0, 10, 20, 30)
+
+
 def run_day(module, engine, client, clock: btc.Clock, day, start_hhmm="09:15", end_hhmm="15:30"):
     h0, m0 = (int(x) for x in start_hhmm.split(":"))
     h1, m1 = (int(x) for x in end_hhmm.split(":"))
     t = real_datetime.combine(day, real_datetime.min.time()).replace(hour=h0, minute=m0)
     end = real_datetime.combine(day, real_datetime.min.time()).replace(hour=h1, minute=m1)
     IST = module.IST
+    module.datetime = _FixedDateTime
+    # The script checks each candle candle_close_buffer_min after it closes
+    # (09:36 for 09:30-09:35) and will not read a younger candle, so the
+    # ticks land that long after each 5-min mark, as the live scheduler's do.
+    buffer = timedelta(minutes=getattr(module.config, "candle_close_buffer_min", 0))
+    # One tick at the start of every minute (the live script's 1-minute
+    # stop-loss check needs one), and the extra same-candle ticks after each
+    # buffered candle check so Monthly's gate sees Weekly's verdict, as live.
+    check_minute = buffer.seconds // 60 % 5
     while t <= end:
-        now = IST.localize(t)
-        clock.current = now
-        module.datetime = _FixedDateTime
-        _FixedDateTime._current = now
-        try:
-            engine.run_cycle()
-        except Exception as exc:
-            module.Log.exception(f"run_cycle crashed at {now}: {exc}")
-        _settle(module, engine)
-        t += timedelta(minutes=5)
+        if t.minute % 5 == check_minute:
+            offsets = [timedelta(seconds=off) for off in TICK_OFFSETS_SEC]
+        else:
+            offsets = [timedelta(0)]
+        for delta in offsets:
+            now = IST.localize(t + delta)
+            clock.current = now
+            _FixedDateTime._current = now
+            try:
+                engine.run_cycle()
+            except Exception as exc:
+                module.Log.exception(f"run_cycle crashed at {now}: {exc}")
+            _wait_idle(engine)
+            _settle(module, engine)
+        t += timedelta(minutes=1)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--start", default="2023-01-02")
-    ap.add_argument("--end", default="2026-03-24")
+    ap.add_argument("--start", default="2021-01-04")
+    ap.add_argument("--end", default="2026-08-25")   # last day of local weekly option data
     ap.add_argument("--out", default=str(Path(__file__).resolve().parent / "results"))
     ap.add_argument("--strategy-tag", default="oi_backtest")
+    ap.add_argument("--monthly-sl-pct", type=float, default=25.0,
+                    help="Monthly short stop-loss, %% above entry premium (0 = none)")
     args = ap.parse_args()
 
     out_dir = Path(args.out)
@@ -190,13 +278,21 @@ def main():
 
     module = _load_script_module()
     module.Log.logger.setLevel(30)  # WARNING -- a multi-year run logs an INFO line every candle otherwise
+    # Author 2026-11-08: universal exit at 15:15 for both engines in this
+    # backtest (the deployed script uses 15:10). Every other rule is the
+    # deployed script's own, unmodified.
+    module.config.weekly_universal_exit_time = real_datetime.strptime("15:15", "%H:%M").time()
+    module.config.monthly_universal_exit_time = real_datetime.strptime("15:15", "%H:%M").time()
+    install_monthly_stop_loss(module, args.monthly_sl_pct)
+    install_gap_reference_0930(module)
 
-    spot = data.load_spot_5min()
-    all_days = sorted({ts.date() for ts in spot.index})
+    all_days = data.regular_trading_days()   # no Muhurat / short special sessions
     start_d = real_datetime.strptime(args.start, "%Y-%m-%d").date()
     end_d = real_datetime.strptime(args.end, "%Y-%m-%d").date()
     trading_days = [d for d in all_days if start_d <= d <= end_d]
-    print(f"Backtest range: {args.start} .. {args.end} -- {len(trading_days)} trading days")
+    print(f"Backtest range: {args.start} .. {args.end} -- {len(trading_days)} trading days; "
+          f"universal exit {module.config.weekly_universal_exit_time:%H:%M}; "
+          f"monthly SL {args.monthly_sl_pct}%")
 
     trades: list[dict] = []
     clock = btc.Clock(module.IST.localize(real_datetime.combine(trading_days[0], real_datetime.min.time())))
@@ -216,12 +312,12 @@ def main():
     for ot in engine.weekly:
         pos = engine.weekly[ot].leg.position
         if pos.symbol and pos.entry_filled:
-            ltp = client._last_close_at_or_before(pos.symbol, module.OPTIONS_EXCHANGE, clock.current) or pos.entry_px
+            ltp = client.price_now(pos.symbol, module.OPTIONS_EXCHANGE) or pos.entry_px
             engine.weekly[ot]._exit(pos, ltp, "backtest_window_end", reenter=False)
     for ot in engine.monthly:
         pos = engine.monthly[ot].leg.position
         if pos.symbol and pos.entry_filled:
-            ltp = client._last_close_at_or_before(pos.symbol, module.OPTIONS_EXCHANGE, clock.current) or pos.entry_px
+            ltp = client.price_now(pos.symbol, module.OPTIONS_EXCHANGE) or pos.entry_px
             engine.monthly[ot]._exit(pos, ltp, "backtest_window_end")
     _settle(module, engine)
 

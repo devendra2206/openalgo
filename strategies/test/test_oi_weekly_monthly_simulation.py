@@ -593,8 +593,13 @@ def _run_day(module, engine, clock, day: str, start_hhmm: str, end_hhmm: str):
     h1, m1 = (int(x) for x in end_hhmm.split(":"))
     t = real_datetime.strptime(f"{day} {h0:02d}:{m0:02d}", "%Y-%m-%d %H:%M")
     end = real_datetime.strptime(f"{day} {h1:02d}:{m1:02d}", "%Y-%m-%d %H:%M")
+    # 2026-11-08: the script checks each candle candle_close_buffer_min
+    # after it closes (09:36 for the 09:30-09:35 candle) and refuses to read
+    # a candle younger than that, so each step lands that long after the
+    # nominal 5-min mark, as the live scheduler's first tick past it does.
+    buffer = timedelta(minutes=module.config.candle_close_buffer_min)
     while t <= end:
-        clock._current = IST.localize(t)
+        clock._current = IST.localize(t + buffer)
         engine.run_cycle()
         _settle(engine)
         # A real scheduler fires roughly every scheduler_interval (10s)
@@ -717,7 +722,9 @@ def test_monthly_gate_sees_fresh_weakening_even_on_the_candle_weekly_exits_by_un
         script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
         WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
     )
-    clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY1} 15:20", "%Y-%m-%d %H:%M"))
+    # 15:21: the 15:15-15:20 candle is one minute old (the 2026-11-08 read
+    # buffer), and it is past the 15:15 universal exit time.
+    clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY1} 15:21", "%Y-%m-%d %H:%M"))
     engine.state.legs["WEEKLY_CE"].position = script_module.LegPosition(
         symbol=sim.WEEKLY_CE_SYMBOL, quantity=65, entry_px=112.0, entry_filled=True,
         entry_order_id="SIM-entry", reference_oi=50_000.0, reference_premium=100.0,
@@ -1099,10 +1106,18 @@ def test_fetch_candle_oi_premium_discards_a_still_forming_candle(script_module, 
     assert result["premium"] == pytest.approx(101.0)
     assert result["oi"] == pytest.approx(50_000.0)
 
-    # Wall clock reaches the 09:35 candle's own close (09:40) -- now
-    # genuinely closed, so it's trusted as the last row.
+    # Exactly at the 09:35 candle's own close (09:40:00): closed, but younger
+    # than the 1-minute buffer (2026-11-08) -- not read yet, nothing returned
+    # (never the older 09:30 row as if it were current).
     clock._current = script_module.IST.localize(
         real_datetime.strptime(f"{sim.DAY1} 09:40:00", "%Y-%m-%d %H:%M:%S")
+    )
+    assert script_module.fetch_candle_oi_premium(
+        client, sim.WEEKLY_CE_SYMBOL, script_module.OPTIONS_EXCHANGE) is None
+
+    # One minute after its close (09:41) it is trusted as the last row.
+    clock._current = script_module.IST.localize(
+        real_datetime.strptime(f"{sim.DAY1} 09:41:00", "%Y-%m-%d %H:%M:%S")
     )
     result = script_module.fetch_candle_oi_premium(client, sim.WEEKLY_CE_SYMBOL, script_module.OPTIONS_EXCHANGE)
     assert result["premium"] == pytest.approx(105.0)
@@ -1226,16 +1241,16 @@ def test_day4_weekly_pe_force_closed_by_universal_exit_time_only(script_module, 
     """No OI-based exit condition and no profit target ever fires in this
     window (see oi_simulation_data.py's Day 4 PE note -- the reading stays
     perpetually Accumulation vs. its own fixed reference, resetting any
-    weakening streak to 0 every cycle) -- confirms 15:20 alone force-closes
-    the leg."""
+    weakening streak to 0 every cycle) -- confirms the universal exit time
+    (15:15 since 2026-11-08) alone force-closes the leg."""
     engine, client, _store = _build_engine(
         script_module, clock, _CSV_CANDLES, "13-Aug-26", "27-Aug-26",
         WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
     )
-    _run_day(script_module, engine, clock, sim.DAY4, "09:15", "15:15")
+    _run_day(script_module, engine, clock, sim.DAY4, "09:15", "15:10")
     assert engine.state.legs["WEEKLY_PE"].position.symbol == sim.WEEKLY_PE_SYMBOL_DAY4  # still open right up to 15:15
 
-    _run_day(script_module, engine, clock, sim.DAY4, "15:20", "15:20")
+    _run_day(script_module, engine, clock, sim.DAY4, "15:15", "15:15")
     pe_orders = [o for o in client.placed_orders if o[0] == sim.WEEKLY_PE_SYMBOL_DAY4]
     assert pe_orders == [
         (sim.WEEKLY_PE_SYMBOL_DAY4, "BUY", 65),
@@ -1382,8 +1397,13 @@ def test_day1_sequential_pe_then_ce_both_weekly_and_monthly(script_module, clock
         (sim.MONTHLY_CE_SYMBOL, "SELL", 65), (sim.MONTHLY_CE_SYMBOL, "BUY", 65),   # 2nd cycle
     ]
     monthly_pe_orders = [o for o in client.placed_orders if o[0] == sim.MONTHLY_PE_SYMBOL]
+    # 2026-11-08: the Monthly 25% stop-loss. This data takes the short from
+    # 200 to 250 (exactly +25%), so it is stopped out, and the same-side
+    # gate still holds on the next candle, so it is sold again and later
+    # closed by the opposite signal.
     assert monthly_pe_orders == [
-        (sim.MONTHLY_PE_SYMBOL, "SELL", 65), (sim.MONTHLY_PE_SYMBOL, "BUY", 65),   # only fires once (gate closed until 10:00)
+        (sim.MONTHLY_PE_SYMBOL, "SELL", 65), (sim.MONTHLY_PE_SYMBOL, "BUY", 65),   # 1st: stop-loss at 250
+        (sim.MONTHLY_PE_SYMBOL, "SELL", 65), (sim.MONTHLY_PE_SYMBOL, "BUY", 65),   # 2nd: opposite signal
     ]
 
     # The key sequencing assertion: WEEKLY_PE's 2nd-cycle exit (10:05)
@@ -2018,8 +2038,11 @@ def test_entry_cutoff_does_not_block_managing_an_already_open_position(script_mo
     )
     clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY1} 15:00", "%Y-%m-%d %H:%M"))
     leg = engine.state.legs["WEEKLY_CE"]
+    # entry 80 against a live price of 55 (-31%): inside the -40% stop, which
+    # since 2026-11-08 is also checked every minute (an entry of 112 is -51%
+    # and is correctly stopped out).
     leg.position = script_module.LegPosition(
-        symbol=sim.WEEKLY_CE_SYMBOL, quantity=65, entry_px=112.0, entry_filled=True,
+        symbol=sim.WEEKLY_CE_SYMBOL, quantity=65, entry_px=80.0, entry_filled=True,
         entry_order_id="SIM-entry", reference_oi=50_000.0, reference_premium=100.0,
     )
 
@@ -2135,3 +2158,179 @@ def test_pnl_snapshot_excludes_a_leg_still_awaiting_entry_confirmation(script_mo
     by_leg = {p["leg_key"] for p in open_positions}
     assert "WEEKLY_CE" not in by_leg  # still mid-entry -- excluded
     assert "WEEKLY_PE" in by_leg      # confirmed filled -- included
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-08: previous close from 1m candles, 1-min candle buffer, 15:15 exit
+# on every tick, Monthly 25% stop-loss (covered by
+# test_day1_sequential_pe_then_ce_both_weekly_and_monthly's Monthly PE orders).
+# ---------------------------------------------------------------------------
+class _OneMinuteHistoryClient:
+    """history() only, returning the given 1m bars the way the SDK does
+    (tz-aware IST index, lowercase OHLC)."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = []
+
+    def history(self, symbol, exchange, interval, start_date, end_date):
+        import pandas as pd
+        self.calls.append((symbol, exchange, interval, start_date, end_date))
+        idx = pd.DatetimeIndex([pd.Timestamp(ts).tz_localize("Asia/Kolkata") for ts, _ in self.rows])
+        closes = [c for _, c in self.rows]
+        return pd.DataFrame({"open": closes, "high": closes, "low": closes, "close": closes}, index=idx)
+
+
+def test_previous_close_is_the_1m_15_29_close_not_a_preopen_folded_candle(script_module):
+    """Shoonya's 5m 15:25 candle read the next morning closes at the
+    pre-open price (docs/CUSTOMIZATIONS.md 2026-11-05). The 1m series
+    carries the real close on the 15:29 bar; that is what must be used."""
+    from datetime import date
+    client = _OneMinuteHistoryClient([
+        ("2026-11-04 15:28:00", 23955.10),
+        ("2026-11-04 15:29:00", 23960.60),
+    ])
+    got = script_module.fetch_previous_session_close(client, date(2026, 11, 4))
+    assert client.calls[0][2] == "1m"
+    assert got["close"] == 23960.60
+    assert got["date"] == date(2026, 11, 4)
+    assert got["label"] == "04-Nov 15:29"
+
+
+def test_previous_close_after_a_holiday_is_the_last_real_session(script_module):
+    """resolve_previous_trading_day() skips weekends only, so after a
+    holiday it names the holiday. The close must still be the last real
+    session's, and its date is what the option references then read."""
+    from datetime import date
+    client = _OneMinuteHistoryClient([
+        ("2026-11-23 15:29:00", 24100.00),   # Monday, last real session
+    ])
+    got = script_module.fetch_previous_session_close(client, date(2026, 11, 24))   # Tuesday holiday
+    assert got["close"] == 24100.00
+    assert got["date"] == date(2026, 11, 23)
+
+
+def test_previous_close_ignores_an_evening_muhurat_session(script_module):
+    from datetime import date
+    client = _OneMinuteHistoryClient([
+        ("2026-11-06 15:29:00", 24500.00),
+        ("2026-11-08 18:59:00", 24620.00),   # Muhurat evening bars, after 15:30
+    ])
+    got = script_module.fetch_previous_session_close(client, date(2026, 11, 8))
+    assert got["close"] == 24500.00
+    assert got["date"] == date(2026, 11, 6)
+
+
+def test_candle_checks_run_one_minute_after_the_candle_closes(script_module, clock):
+    IST = script_module.IST
+    clock._current = IST.localize(real_datetime(2026, 8, 6, 9, 35, 30))
+    assert script_module._current_candle_boundary(5).strftime("%H:%M") == "09:30"
+    clock._current = IST.localize(real_datetime(2026, 8, 6, 9, 35, 59))
+    assert script_module._current_candle_boundary(5).strftime("%H:%M") == "09:30"
+    clock._current = IST.localize(real_datetime(2026, 8, 6, 9, 36, 0))
+    assert script_module._current_candle_boundary(5).strftime("%H:%M") == "09:35"
+
+
+def test_universal_exit_fires_on_the_first_tick_at_the_exit_time_not_the_next_candle(
+    script_module, clock, tmp_path, monkeypatch
+):
+    """The exit must not wait for the next candle check. With an exit time
+    of 15:12, the 15:11 tick is the candle check for 15:05-15:10 and the next
+    one is 15:16; a tick at 15:12 (no new candle) must still close the leg."""
+    from datetime import time as dtime
+    monkeypatch.setattr(script_module.config, "weekly_universal_exit_time", dtime(15, 12))
+    engine, client, _store = _build_engine(
+        script_module, clock, _CSV_CANDLES, "13-Aug-26", "27-Aug-26",
+        WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
+    )
+    _run_day(script_module, engine, clock, sim.DAY4, "09:15", "15:10")
+    clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY4} 15:11", "%Y-%m-%d %H:%M"))
+    engine.run_cycle()
+    _settle(engine)
+    assert engine.state.legs["WEEKLY_PE"].position.symbol == sim.WEEKLY_PE_SYMBOL_DAY4
+
+    clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY4} 15:12:20", "%Y-%m-%d %H:%M:%S"))
+    assert engine._new_candle_closed() is False      # no candle check at 15:12
+    engine._last_candle_boundary = None               # undo the probe above
+    engine._new_candle_closed()                       # re-record the 15:10 boundary as the engine had it
+    for _ in range(3):
+        engine.run_cycle()
+        _settle(engine)
+    assert engine.state.legs["WEEKLY_PE"].position.symbol == ""
+    pe_orders = [o for o in client.placed_orders if o[0] == sim.WEEKLY_PE_SYMBOL_DAY4]
+    assert pe_orders[-1] == (sim.WEEKLY_PE_SYMBOL_DAY4, "SELL", 65)
+
+
+def _open_leg_between_checks(script_module, clock, tmp_path, leg_key, symbol, entry_px):
+    engine, client, _store = _build_engine(
+        script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
+        WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
+    )
+    # 15:03:20 -- between the 15:01 and 15:06 candle checks.
+    clock._current = script_module.IST.localize(real_datetime.strptime(f"{sim.DAY1} 15:03:20", "%Y-%m-%d %H:%M:%S"))
+    engine.state.legs[leg_key].position = script_module.LegPosition(
+        symbol=symbol, quantity=65, entry_px=entry_px, entry_filled=True,
+        entry_order_id="SIM-entry", reference_oi=50_000.0, reference_premium=100.0,
+    )
+    return engine, client
+
+
+def _ltp(script_module, client, symbol):
+    return float(client.quotes(symbol=symbol, exchange=script_module.OPTIONS_EXCHANGE)["data"]["ltp"])
+
+
+def test_weekly_stop_is_checked_every_minute_between_candle_checks(script_module, clock, tmp_path):
+    engine, client = _open_leg_between_checks(script_module, clock, tmp_path, "WEEKLY_CE", sim.WEEKLY_CE_SYMBOL, 1.0)
+    ltp = _ltp(script_module, client, sim.WEEKLY_CE_SYMBOL)
+    engine.state.legs["WEEKLY_CE"].position.entry_px = round(ltp / 0.55, 2)   # price now -45%: past -40%
+    engine.weekly["CE"].evaluate()
+    _settle(engine)
+    assert engine.state.legs["WEEKLY_CE"].position.symbol == ""
+    assert [o for o in client.placed_orders if o[0] == sim.WEEKLY_CE_SYMBOL] == [(sim.WEEKLY_CE_SYMBOL, "SELL", 65)]
+
+
+def test_monthly_stop_is_checked_every_minute_between_candle_checks(script_module, clock, tmp_path):
+    engine, client = _open_leg_between_checks(script_module, clock, tmp_path, "MONTHLY_CE", sim.MONTHLY_CE_SYMBOL, 1.0)
+    ltp = _ltp(script_module, client, sim.MONTHLY_CE_SYMBOL)
+    engine.state.legs["MONTHLY_CE"].position.entry_px = round(ltp / 1.30, 2)  # price now +30%: past +25%
+    engine.monthly["CE"].evaluate()
+    _settle(engine)
+    assert engine.state.legs["MONTHLY_CE"].position.symbol == ""
+    assert [o for o in client.placed_orders if o[0] == sim.MONTHLY_CE_SYMBOL] == [(sim.MONTHLY_CE_SYMBOL, "BUY", 65)]
+
+
+def test_minute_stop_check_leaves_a_position_inside_its_stop_and_runs_once_a_minute(
+    script_module, clock, tmp_path
+):
+    engine, client = _open_leg_between_checks(script_module, clock, tmp_path, "MONTHLY_CE", sim.MONTHLY_CE_SYMBOL, 1.0)
+    ltp = _ltp(script_module, client, sim.MONTHLY_CE_SYMBOL)
+    engine.state.legs["MONTHLY_CE"].position.entry_px = round(ltp / 1.20, 2)  # +20%: inside the stop
+    calls = []
+    original = client.quotes
+    client.quotes = lambda **kw: (calls.append(kw["symbol"]), original(**kw))[1]
+    for _ in range(3):                                # three ticks in the same minute
+        engine.monthly["CE"].evaluate()
+        _settle(engine)
+    assert engine.state.legs["MONTHLY_CE"].position.symbol == sim.MONTHLY_CE_SYMBOL
+    assert calls.count(sim.MONTHLY_CE_SYMBOL) == 1
+    clock._current = clock._current + timedelta(minutes=1)
+    engine.monthly["CE"].evaluate()
+    _settle(engine)
+    assert calls.count(sim.MONTHLY_CE_SYMBOL) == 2
+
+
+def test_weekly_expiry_rolls_to_next_week_on_expiry_day(script_module, clock):
+    """On a weekly expiry day the Weekly Buy trades next week's contract,
+    never the one expiring that afternoon (author 2026-11-08). The list
+    arrives unsorted, as a broker may return it."""
+    class _C:
+        def expiry(self, symbol, exchange, instrumenttype):
+            return {"status": "success", "data": ["01-Sep-26", "25-Aug-26", "29-Sep-26"]}
+
+    IST = script_module.IST
+    clock._current = IST.localize(real_datetime(2026, 8, 25, 9, 31))      # expiry day
+    assert script_module.resolve_weekly_expiry(_C()) == ("01SEP26", "01-Sep-26")
+    clock._current = IST.localize(real_datetime(2026, 8, 24, 9, 31))      # day before
+    assert script_module.resolve_weekly_expiry(_C()) == ("25AUG26", "25-Aug-26")
+    clock._current = IST.localize(real_datetime(2026, 8, 26, 9, 31))      # day after
+    assert script_module.resolve_weekly_expiry(_C()) == ("01SEP26", "01-Sep-26")
