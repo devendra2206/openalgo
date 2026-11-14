@@ -2736,6 +2736,14 @@ class MonthlyShortEngine:
         pos = self.leg.position
         if pos.error_state or not pos.short_symbol:
             return
+        # Book a close as soon as both exits have filled, as evaluate() does.
+        # Author 2026-11-14: on 13-Nov a gap day held the reference until
+        # 09:45; the stop fired and both legs were bought/sold at 09:31:41,
+        # but the trade rows, the realized P&L and "Position closed" waited
+        # for evaluate() at 09:46:02. Finalizing needs no reference.
+        if pos.short_exit_filled and pos.hedge_exit_filled:
+            self._finalize_exit(pos, pos.pending_exit_reason)
+            return
         if not (pos.entry_filled and pos.hedge_entry_filled):
             return
         if pos.short_exit_order_id or pos.hedge_exit_order_id:

@@ -2402,3 +2402,24 @@ host's path: `No module named 'utils'`.
   taking position at 9:30 ... we can take position at 9:45"). The first entry
   of every day, a new cycle's first day included, is the 09:45 check (run at
   09:46). Test t44.
+
+## OI Positional and both LEAPS strategies: two timing fixes (2026-11-14)
+
+**`Nifty_OI_Positional_MonthlySell_1`: a stop-loss close is booked straight
+away.** Before the day's reference is set (a gap day waits for 09:45), each
+tick runs only `manage_sl_only()`. On 13-Nov the stop fired at 09:31:41 and
+both exits filled then (short bought back at 162.55), but the trade rows,
+the realized P&L and "Position closed" waited for `evaluate()` at 09:46:02.
+`manage_sl_only()` now finalizes a leg whose two exits have filled. Test:
+`test/test_oi_positional_strategy.py` t45, which replays the 13-Nov trade
+(-3,165.50).
+
+**`Nifty_LEAPS_HAMACD_2h_1` and `Nifty_LEAPS_OptionsSell_1` (RSI 1h): no
+exit or entry before the session's first candle closes.** At 09:17 the
+candle boundary moving from yesterday's last candle to today's 09:15 bucket
+read as a new candle, so both strategies closed or opened a position on
+yesterday's last candle. `_new_candle_closed()` now returns False while the
+boundary is still 09:15. First decision of the day: 11:17 for 2h
+(11:15 close + 2 min settle), 10:17 for RSI 1h; the restart path waits the
+same way. The hedge roll already waited. Test:
+`test/test_leaps_first_decision_time.py`.

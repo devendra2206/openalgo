@@ -1919,9 +1919,38 @@ def main():
         assert calls == [("check", time(9, 45))], calls
         assert m.config.cycle_start_entry_enabled is False
 
+    # 45 ------------------------------------------------------------------
+    @case("a stop before the reference is fixed books its close on the next tick, not at 09:46")
+    def t45():
+        """Author 2026-11-14. 13-Nov: gap day, reference held until 09:45. The
+        stop fired at 09:31:41 and both exits filled, but the trade rows, the
+        P&L and "Position closed" waited for evaluate() at 09:46:02.
+        manage_sl_only() -- the only path that runs before the reference --
+        must finalize a leg whose exits have both filled."""
+        TRADE_LOG.clear()
+        c = FakeClient({"NIFTY23NOV2624900PE": ("complete", 162.55),
+                        "NIFTY17NOV2624400PE": ("complete", 9.25)})
+        eng = make_engine(m, c)
+        side = make_side(m, eng, "PE")
+        side.leg.position = m.ShortHedgePosition(
+            short_symbol="NIFTY23NOV2624900PE", quantity=65, entry_px=116.8, entry_filled=True,
+            hedge_symbol="NIFTY17NOV2624400PE", hedge_entry_px=12.2, hedge_entry_filled=True,
+            entry_time="2026-11-06T09:46:00", execution_id="EX1", expiry_date="2026-11-23",
+        )
+        side._exit(side.leg.position, "stop_loss")
+        pos = side.leg.position
+        assert pos.short_exit_filled and pos.hedge_exit_filled, "both exits should have filled"
+        assert eng.state.reference.computed is False, "the reference is not fixed yet"
+        side.manage_sl_only()
+        assert side.leg.position.short_symbol == "", "the leg should be flat after the next SL-only tick"
+        assert len(TRADE_LOG) == 2, f"two trade rows expected, got {len(TRADE_LOG)}"
+        want = (116.8 - 162.55) * 65 + (9.25 - 12.2) * 65      # -3165.50, the 13-Nov figure
+        got = eng.state.today_realized_pnl
+        assert abs(got - want) < 0.01, f"realized PnL {got} != {want}"
+
     for fn in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19,
                t20, t21, t22, t23, t24, t25, t26, t27, t28, t29, t30, t31, t32, t33, t34, t35,
-               t36, t37, t38, t39, t40, t41, t42, t43, t44):
+               t36, t37, t38, t39, t40, t41, t42, t43, t44, t45):
         fn()
 
     print("\n" + "=" * 74)

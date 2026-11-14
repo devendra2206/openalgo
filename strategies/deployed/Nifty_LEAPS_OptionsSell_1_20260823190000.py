@@ -1811,6 +1811,18 @@ class StrategyEngine:
 
     def _new_candle_closed(self) -> bool:
         boundary = _current_hourly_candle_boundary()
+        # No decision on the session's first, still-open candle. Author
+        # 2026-11-14: "we should not close position at 9:16 ... trade closing,
+        # new trade taking should happen at 10:16 only". The boundary only
+        # moves past 09:15 once the first candle of the day has closed
+        # (10:15), so the earliest exit or entry is 10:17 (that close plus
+        # candle_settle_sec). Before this, the boundary changing from
+        # yesterday's last candle to today's 09:15 bucket read as a new candle,
+        # and the strategy closed or opened a position at 09:17 on yesterday's
+        # last candle. The hedge roll already waited the same way.
+        session_start = datetime.now(IST).replace(hour=9, minute=15, second=0, microsecond=0)
+        if boundary <= session_start:
+            return False
         # Do not read the candle at the instant it closes -- wait
         # candle_settle_sec (2 min) for the broker to publish it. Reading on
         # the boundary is the single most likely moment to be served the PRIOR
