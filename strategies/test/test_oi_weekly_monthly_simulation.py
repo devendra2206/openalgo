@@ -628,6 +628,19 @@ def clock(script_module):
     script_module.datetime = original
 
 
+@pytest.fixture
+def old_rules(script_module, monkeypatch):
+    """The rules these scenarios were written for, before 2026-11-09:
+    2-opposite-candles exit on both engines, Weekly stop at -40%, Weekly
+    expiry rolled only on the expiry day. Those mechanisms are still in the
+    script behind config flags, so the scenarios keep testing them."""
+    cfg = script_module.config
+    monkeypatch.setattr(cfg, "weekly_opposite_exit_enabled", True)
+    monkeypatch.setattr(cfg, "monthly_opposite_exit_enabled", True)
+    monkeypatch.setattr(cfg, "weekly_stop_loss_pct", 40.0)
+    monkeypatch.setattr(cfg, "weekly_min_days_to_expiry", 1)
+
+
 WEEKLY_CHAIN_STRIKES = [23100.0, 23400.0, 23700.0, 24300.0, 24600.0, 24900.0]
 
 GREEKS = {
@@ -652,6 +665,7 @@ def test_classify_oi_premium_covers_every_table_quadrant(script_module, premium_
     assert script_module.classify_oi_premium(premium_change, oi_change) == expected, label
 
 
+@pytest.mark.usefixtures("old_rules")
 def test_day1_weekly_ce_entry_then_exit_on_two_opposite_signals(script_module, clock, tmp_path):
     engine, client, _store = _build_engine(
         script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
@@ -805,6 +819,7 @@ def test_day1_monthly_ce_enters_when_gate_and_confirmation_both_weaken(script_mo
     assert engine.state.legs["MONTHLY_CE"].position.delta_at_entry == pytest.approx(0.22)
 
 
+@pytest.mark.usefixtures("old_rules")
 def test_day1_monthly_ce_exits_on_two_consecutive_opposite_signals_no_target_no_sl(
     script_module, clock, tmp_path
 ):
@@ -857,6 +872,7 @@ def test_day1_reference_mode_is_previous_close_for_small_gap(script_module, cloc
     assert engine.state.reference.computed is True
 
 
+@pytest.mark.usefixtures("old_rules")
 def test_day2_reference_mode_is_today_0935_for_large_gap_and_day1_state_does_not_leak(
     script_module, clock, tmp_path
 ):
@@ -889,6 +905,7 @@ def test_day2_reference_mode_is_today_0935_for_large_gap_and_day1_state_does_not
     assert engine.state.legs["WEEKLY_CE"].position.symbol == sim.WEEKLY_CE_SYMBOL
 
 
+@pytest.mark.usefixtures("old_rules")
 def test_day3_reference_mode_is_today_0935_for_a_gap_DOWN(script_module, clock, tmp_path):
     """Day 2 already proved today_0935 mode for a gap UP; this proves the
     same mode for a gap DOWN, which a gap-up-only test could never catch
@@ -916,6 +933,7 @@ def test_day3_reference_mode_is_today_0935_for_a_gap_DOWN(script_module, clock, 
     assert engine.state.legs["WEEKLY_PE"].position.symbol == sim.WEEKLY_PE_SYMBOL
 
 
+@pytest.mark.usefixtures("old_rules")
 def test_restart_resumes_already_open_leg_without_reentering(script_module, clock, tmp_path):
     """The common restart case: a leg fully entered and confirmed BEFORE
     the process stopped. A true reload-from-disk (fresh StateStore.load(),
@@ -1204,6 +1222,7 @@ def test_day4_reference_mode_is_prev_close_for_a_small_gap_DOWN(script_module, c
     assert abs(engine.state.reference.gap_pct) <= script_module.config.gap_threshold_pct
 
 
+@pytest.mark.usefixtures("old_rules")
 def test_day4_weekly_ce_streak_interruption_requires_two_TRUE_consecutive_candles(
     script_module, clock, tmp_path
 ):
@@ -1324,6 +1343,7 @@ def test_weekly_leg_force_closed_by_stop_loss(script_module, clock, tmp_path):
     assert engine.state.legs["WEEKLY_PE"].position.symbol == ""
 
 
+@pytest.mark.usefixtures("old_rules")
 def test_weekly_leg_not_closed_by_stop_loss_above_threshold(script_module, clock, tmp_path):
     """Mirror/negative case: a loss that hasn't yet reached -40% must NOT
     trigger the stop-loss (or anything else) -- confirms the threshold is
@@ -1350,6 +1370,7 @@ def test_weekly_leg_not_closed_by_stop_loss_above_threshold(script_module, clock
     assert engine.state.legs["WEEKLY_PE"].position.symbol == sim.WEEKLY_PE_SYMBOL_DAY4
 
 
+@pytest.mark.usefixtures("old_rules")
 def test_day1_sequential_pe_then_ce_both_weekly_and_monthly(script_module, clock, tmp_path):
     """"weekly PE buy then exit then weekly CE buy... similar for selling
     side": proves leg-slot independence holds for SEQUENTIAL hand-off, not
@@ -2029,6 +2050,7 @@ def test_no_new_entry_after_cutoff_time_even_when_signal_holds(script_module, cl
     assert engine.state.legs["MONTHLY_CE"].position.symbol == ""
 
 
+@pytest.mark.usefixtures("old_rules")
 def test_entry_cutoff_does_not_block_managing_an_already_open_position(script_module, clock, tmp_path):
     """The cutoff only gates NEW entries -- an already-open leg must still
     be fully managed (exit checks, profit target, etc.) past 14:45."""
@@ -2319,18 +2341,50 @@ def test_minute_stop_check_leaves_a_position_inside_its_stop_and_runs_once_a_min
     assert calls.count(sim.MONTHLY_CE_SYMBOL) == 2
 
 
-def test_weekly_expiry_rolls_to_next_week_on_expiry_day(script_module, clock):
-    """On a weekly expiry day the Weekly Buy trades next week's contract,
-    never the one expiring that afternoon (author 2026-11-08). The list
-    arrives unsorted, as a broker may return it."""
+def test_weekly_expiry_moves_to_next_week_with_two_or_fewer_days_left(script_module, clock):
+    """Author 2026-11-09: the Weekly Buy trades the nearest contract with at
+    least 3 calendar days left -- next week's on the expiry day and the two
+    days before it. The list arrives unsorted, as a broker may return it."""
+    assert script_module.config.weekly_min_days_to_expiry == 3
+
     class _C:
         def expiry(self, symbol, exchange, instrumenttype):
-            return {"status": "success", "data": ["01-Sep-26", "25-Aug-26", "29-Sep-26"]}
+            return {"status": "success", "data": ["01-Sep-26", "25-Aug-26", "08-Sep-26"]}
 
     IST = script_module.IST
-    clock._current = IST.localize(real_datetime(2026, 8, 25, 9, 31))      # expiry day
-    assert script_module.resolve_weekly_expiry(_C()) == ("01SEP26", "01-Sep-26")
-    clock._current = IST.localize(real_datetime(2026, 8, 24, 9, 31))      # day before
-    assert script_module.resolve_weekly_expiry(_C()) == ("25AUG26", "25-Aug-26")
-    clock._current = IST.localize(real_datetime(2026, 8, 26, 9, 31))      # day after
-    assert script_module.resolve_weekly_expiry(_C()) == ("01SEP26", "01-Sep-26")
+    for day, want in ((21, "25AUG26"), (22, "25AUG26"), (23, "01SEP26"), (24, "01SEP26"), (25, "01SEP26"),
+                      (26, "01SEP26"), (29, "01SEP26"), (30, "08SEP26")):
+        clock._current = IST.localize(real_datetime(2026, 8, day, 9, 31))
+        assert script_module.resolve_weekly_expiry(_C())[0] == want, day
+
+
+def test_new_defaults_2026_11_09(script_module):
+    cfg = script_module.config
+    assert cfg.weekly_stop_loss_pct == 25.0
+    assert cfg.weekly_opposite_exit_enabled is False
+    assert cfg.monthly_opposite_exit_enabled is False
+
+
+def test_monthly_short_not_closed_by_two_opposite_candles_by_default(script_module, clock, tmp_path):
+    """Same Day-1 data that closes MONTHLY_CE on two opposite candles under
+    the old rules (test_day1_monthly_ce_exits_on_two_consecutive_opposite_
+    signals_no_target_no_sl): with the 2026-11-09 defaults the short stays
+    open -- one SELL, no covering BUY."""
+    engine, client, _store = _build_engine(
+        script_module, clock, _CSV_CANDLES, "06-Aug-26", "27-Aug-26",
+        WEEKLY_CHAIN_STRIKES, GREEKS, tmp_path,
+    )
+    _run_day(script_module, engine, clock, sim.DAY1, "09:15", "10:35")
+    orders = [o for o in client.placed_orders if o[0] == sim.MONTHLY_CE_SYMBOL]
+    assert orders == [(sim.MONTHLY_CE_SYMBOL, "SELL", 65)]
+    assert engine.state.legs["MONTHLY_CE"].position.symbol == sim.MONTHLY_CE_SYMBOL
+
+
+def test_weekly_stop_is_25_pct_by_default(script_module, clock, tmp_path):
+    """-29% is past the 25% stop (it was inside the old 40%)."""
+    engine, client = _open_leg_between_checks(script_module, clock, tmp_path, "WEEKLY_CE", sim.WEEKLY_CE_SYMBOL, 1.0)
+    ltp = _ltp(script_module, client, sim.WEEKLY_CE_SYMBOL)
+    engine.state.legs["WEEKLY_CE"].position.entry_px = round(ltp / 0.71, 2)   # -29%
+    engine.weekly["CE"].evaluate()
+    _settle(engine)
+    assert engine.state.legs["WEEKLY_CE"].position.symbol == ""

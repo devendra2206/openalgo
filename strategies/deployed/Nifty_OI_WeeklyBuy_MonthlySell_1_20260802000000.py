@@ -221,7 +221,13 @@ class Config:
     # unlike the profit target, a stop-out isn't a signal the thesis is
     # still good, so no immediate retry (matches universal_exit_time/
     # opposite_signal's reenter=False, not profit_target's reenter=True).
-    weekly_stop_loss_pct: float = 40.0   # % loss on the option's own premium (Weekly Buy only)
+    # 2026-11-09 (author): 40% -> 25%.
+    weekly_stop_loss_pct: float = 25.0   # % loss on the option's own premium (Weekly Buy only)
+    # 2026-11-09 (author): the Weekly Buy trades next week's contract when
+    # the current week's has fewer than this many calendar days left (the
+    # backtest lost on 1-2 days to expiry and made money from 3 days out).
+    # 3 = next week's on the expiry day and the two days before it.
+    weekly_min_days_to_expiry: int = 3
     # 2026-11-08 (author): stop-loss on the Monthly short: its LTP at or
     # above entry premium x 1.25, on the two-sided LTP. Both stops (this and
     # weekly_stop_loss_pct) are checked every minute (minute_stop_check_bg)
@@ -245,6 +251,13 @@ class Config:
     # Consecutive OPPOSITE-verdict candles (relative to the leg's own entry
     # trigger verdict) required to exit -- both engines, per spec.
     consecutive_opposite_exit: int = 2
+    # 2026-11-09 (author): the 2-opposite-candles exit is switched OFF for
+    # both engines -- a position now closes only on its stop-loss, the Weekly
+    # +100% target, or the 15:15 universal exit. The verdict and streak are
+    # still logged every candle; set a flag True to restore that engine's
+    # signal exit.
+    weekly_opposite_exit_enabled: bool = False
+    monthly_opposite_exit_enabled: bool = False
 
     quantity: int = 65                  # NIFTY's current lot size (docs/prompt/LotSize.md) == 1 lot
     weekly_capital_tag: float = 50_000.0     # reporting/return-on-capital display only
@@ -916,28 +929,23 @@ def _compact_expiry(expiry_ddmmmyy_dash: str) -> str:
 
 
 def resolve_weekly_expiry(client) -> tuple[str, str]:
-    """Nearest upcoming NIFTY options expiry -- rolls to the NEXT expiry if
-    today IS the resolved expiry day (same gamma/theta-cliff avoidance every
-    other deployed script in this project uses; author 2026-11-08: back to
-    next week's contract on expiry day after briefly trying the current
-    week's). Returns (compact_ddmmmyy_for_symbol,
+    """The nearest NIFTY options expiry at least weekly_min_days_to_expiry
+    calendar days away (author 2026-11-09: 3 -- next week's contract on the
+    expiry day and the two days before it; it used to roll only on the
+    expiry day itself). Returns (compact_ddmmmyy_for_symbol,
     raw_ddmmmyy_dash_for_history_lookups)."""
     resp = client.expiry(symbol=UNDERLYING_SYMBOL, exchange=OPTIONS_EXCHANGE, instrumenttype="options")
     if resp.get("status") != "success" or not resp.get("data"):
         raise RuntimeError(f"Could not resolve weekly options expiry: {resp}")
     today = datetime.now(IST).date()
     upcoming = sorted((datetime.strptime(raw, "%d-%b-%y").date(), raw) for raw in resp["data"])
-    upcoming = [(d, raw) for d, raw in upcoming if d >= today]
-    if not upcoming:
-        raise RuntimeError(f"No upcoming weekly expiry found in: {resp['data']}")
-    if upcoming[0][0] == today:
-        if len(upcoming) < 2:
-            raise RuntimeError(
-                "Today is the nearest weekly expiry and the broker returned no "
-                "later expiry date to roll to -- refusing to trade today's expiring contract."
-            )
-        return _compact_expiry(upcoming[1][1]), upcoming[1][1]
-    return _compact_expiry(upcoming[0][1]), upcoming[0][1]
+    min_days = max(int(config.weekly_min_days_to_expiry), 1)   # never today's expiring contract
+    for d, raw in upcoming:
+        if (d - today).days >= min_days:
+            return _compact_expiry(raw), raw
+    raise RuntimeError(
+        f"No NIFTY expiry at least {min_days} days away in: {resp['data']} -- refusing to trade a "
+        f"contract that close to expiry.")
 
 
 def resolve_monthly_expiry(client) -> tuple[str, str]:
@@ -2339,7 +2347,7 @@ class WeeklySideEngine:
             f"consecutive_opposite={pos.consecutive_opposite}/{config.consecutive_opposite_exit}"
         )
 
-        if pos.consecutive_opposite >= config.consecutive_opposite_exit:
+        if config.weekly_opposite_exit_enabled and pos.consecutive_opposite >= config.consecutive_opposite_exit:
             self._exit(pos, ltp if ltp is not None else current["premium"], "opposite_signal", reenter=False)
 
     def _exit(self, pos, exit_px, reason, reenter: bool):
@@ -2948,7 +2956,7 @@ class MonthlySideEngine:
             f"consecutive_opposite={pos.consecutive_opposite}/{config.consecutive_opposite_exit}"
         )
 
-        if pos.consecutive_opposite >= config.consecutive_opposite_exit:
+        if config.monthly_opposite_exit_enabled and pos.consecutive_opposite >= config.consecutive_opposite_exit:
             ltp = self.engine.price_stream.get_ltp(pos.symbol, OPTIONS_EXCHANGE, config.ws_stale_seconds)
             if ltp is None:
                 ltp = fetch_symbol_ltp(self.engine.client, pos.symbol, OPTIONS_EXCHANGE, require_two_sided=True)
@@ -3666,6 +3674,9 @@ def print_banner():
     print(f"Gap threshold        : {config.gap_threshold_pct}%")
     print(f"Weekly profit target : {config.weekly_profit_target_pct}%")
     print(f"Weekly stop-loss     : -{config.weekly_stop_loss_pct}%")
+    print(f"Weekly expiry        : nearest with >= {config.weekly_min_days_to_expiry} days left")
+    print(f"Opposite-signal exit : weekly {'on' if config.weekly_opposite_exit_enabled else 'off'}, "
+          f"monthly {'on' if config.monthly_opposite_exit_enabled else 'off'}")
     print(f"Monthly stop-loss    : +{config.monthly_stop_loss_pct}% on the short premium")
     print("Stop-loss checks     : every minute (both engines), plus each candle check")
     print(f"Candle checks        : {config.candle_close_buffer_min} min after each 5-min close")
