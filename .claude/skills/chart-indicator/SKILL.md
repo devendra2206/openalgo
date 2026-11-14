@@ -59,6 +59,147 @@ The descriptor contract has only gained optional fields since this skill was
 written, so an existing indicator keeps working on the pinned build. What
 changed, newest first:
 
+- **2.7.2: nothing for a descriptor to change.** Elliott wave counts leave
+  their origin unlabelled and number their waves from the second anchor,
+  default to the Intermediate degree, `(1)` to `(5)`, centre each label on
+  its point and are drawn as they are placed. The drawing tool contract
+  gains an optional `progressive` field for that; the indicator descriptor
+  is untouched, the registry stays at 112 and the index at 438 names.
+
+- **2.7.1: nothing for a descriptor to change.** Three Elliott wave drawing
+  tools (triangle, double and triple combination) join the impulse and the
+  correction, every count starts at an origin anchor, and a count is labelled
+  by degree (`props.degree`, `props.labelStyle`). The impulse and the
+  correction take 6 and 4 anchors where they took 5 and 3; a saved count is
+  given its origin on load. No indicator, descriptor field or export is added
+  or removed: the registry stays at 112 and the index at 438 names.
+
+- **2.7.0: nothing for a descriptor to change.** The drawing tool icons are
+  redrawn with an open ring at each anchor, and `DRAWING_TOOL_ACCENTS` now
+  fills only the magnet. The packaged widget and the reference host get
+  interface fixes. No indicator, descriptor field or export is added or
+  removed: the registry stays at 112 and the index at 438 names.
+
+- **2.6.9: nothing for a descriptor to change.** A security release for the
+  library's build toolchain and documentation site; the published code is
+  2.6.8's apart from the version string. The registry stays at 112 and the
+  index at 438 names.
+
+- **2.6.8: volume on price-driven elements.** Renko, range bar, line break
+  and point and figure elements now carry the volume traded while they
+  formed (all of a source bar's volume on the first element it completes, 0
+  on the rest), so a custom study reading `bar.volume` on Chart bars sees
+  real volume there instead of nothing. Kagi still keeps its line thickness
+  in `volume`, so a volume study on a Kagi chart needs Underlying bars. An
+  instrument that reports no volume, such as an index, still leaves it
+  undefined: guard for that. Higher-timeframe warmup now crosses weekends and
+  holidays instead of failing with "Insufficient confirmed history", and OHLC
+  bars widen with the zoom. No descriptor field or export changed.
+
+- **2.6.7: independent confirmed study history.** `/trading` and Historify
+  attach `createTimeframeProvider`, so built-in higher-timeframe studies fetch
+  their own warmup, including daily EMA 200 on a five-minute chart. Custom
+  requested descriptors can declare `historyBars`; consume snapshot availability
+  rather than assuming the last source candle is closed. A live-only provider
+  is not a historical replay snapshot. Hosts derive custom intervals through
+  `withTimeframes` using real source capabilities and exchange sessions. Shared
+  favorites are UI preferences, not proof that a broker supplies an interval.
+  Existing descriptors and legacy providers remain supported.
+
+- **2.6.6: nothing for a descriptor to change.** Legend actions now sit
+  before changing readings, so crosshair movement and live ticks keep the
+  same click targets. The packaged widget opens the selected study's settings;
+  `/trading` keeps its existing host dialog. The registry stays at 112 and
+  the generated index at 433 names.
+
+- **2.6.5: nothing for a descriptor to change.** The packaged widget puts
+  running studies before its catalog and adds searchable, grouped mobile
+  drawing tools with shared favorites. Historify uses the widget's drawing
+  controls; both pages keep their custom indicator pickers. The trade-feed adapter
+  also serializes order modifications and requires reconciliation after an
+  uncertain outcome. Indicator calculations and saved descriptors are unchanged.
+
+- **2.6.4: nothing for a descriptor to change.** An order flow release in the
+  profile tier: the footprint compares a cell beside an untraded row with
+  zero, gains a delta-shaded volume view, zone alerts (`onZoneAlert`), a
+  choice of zone kinds and lookback, part colours and six named themes
+  (`FOOTPRINT_THEMES`). The registry stays at 112, the index below at 433
+  names, and all thirteen examples pass the validator on 2.6.4 unchanged.
+
+- **2.6.3: nothing for a descriptor to change.** A finish release: drawing
+  tool and chrome glyphs at one finer line (`/trading` regenerates its rail
+  metadata from the installed build), a smoother wheel zoom, a log scale that
+  pads in log space, and widget drag and zoom defaults. Indicators are not
+  affected; the registry and the index are unchanged.
+
+- **2.6.2: nothing for a descriptor to change.** A fix in the widget tier:
+  the bottom bar's ranges and Go to no longer report missing history across a
+  gap no session trades in. The registry stays at 112, the index below at 433
+  names, and all thirteen examples pass the validator on 2.6.2 unchanged.
+
+- **2.6.1: nothing for a descriptor to change.** No built-in was added or
+  removed (the registry stays at 112, so pitfall 13's collision list is
+  unchanged), the export index below still lists 433 names, and all thirteen
+  examples pass the validator on 2.6.1 unchanged. The release is host-side:
+  the footprint gains order flow analytics, and Renko and point and figure
+  gain sizing methods. A study computed on the elements of a Renko chart
+  (`IndicatorCalcContext.transformed` set) can now see bricks sized as a
+  percent of price or from the ATR, and built from each bar's high and low
+  rather than its close, when the trader chooses those in `/trading`'s Renko
+  settings. The bricks are still elements with `open`, `high`, `low` and
+  `close`, so nothing a descriptor reads changes shape.
+
+- **2.5.2 to 2.6.0: seven more built-ins, a timeframe on 29 of them, and a
+  wider descriptor.** Every existing descriptor keeps working, and all twelve
+  examples below pass the validator on 2.6.0 unchanged. The index below grew
+  from 387 names to 433 and lost none.
+
+  **2.6.0.** `zigzag`, `high-low-52-week`, `zlema`, `vidya`, `elder-ray`,
+  `schaff-trend-cycle` and `volatility-squeeze` take the registry to 112, so a
+  custom file that already used one of those ids now overrides it (pitfall
+  13). Twenty-nine built-ins (most averages, the bands, `supertrend`, `atr`,
+  `rsi`, `macd`, `stochastic`, `cci`, `adx` and others) gain an input
+  `{ key: 'timeframe', type: 'interval', default: '' }`: `indicatorDefaults()`
+  of those now includes `timeframe: ''`, their `calc` folds to a timeframe set
+  there, and a descriptor that copies their `inputs` copies a row only their
+  `calc` honours (pitfall 24). `withTimeframe(descriptor)` gives your own study
+  the same input. Every built-in now rounds a fractional window length (14.5
+  reads as 15); the exported helpers still do not, so coerce before calling
+  `sma` and friends (pitfall 6). An alert's `when` and `message` run once for
+  each bar a pass appended, each seeing the bars and values through the bar it
+  judges. On a reload, a study whose first pass throws `IndicatorInputError`
+  comes back in its error status, while any other throw still stops the
+  restore. `/trading` has the chart apply Heikin Ashi, Renko, range bars, line
+  break, point and figure and Kagi itself, so on those chart types a study's
+  `calc` receives the elements drawn with `ctx.transformed` set, unless the
+  trader sets its Compute on row to Underlying bars, when it receives the time
+  bars and its values are read onto the elements; its hooks still run on the
+  elements, indexed by element (pitfall 20). `chart.on` is typed from
+  `ChartEventMap`: an event of your own is declared into it with
+  `declare module 'openalgo-charts'`, and `chart.emit` is deprecated for 3.0.0.
+
+  **2.5.4 to 2.5.8.** Optional fields, all usable here unless noted: an
+  `overlay: true` or `plot: key` target on a `draws()` shape or a marker, which
+  is how a study in its own pane puts a signal under the candle's low; font,
+  size, emphasis and alignment on labels, box captions and marker text;
+  `curve: 'smooth'` on a polyline; `tooltip`, spans and font fields on table
+  cells, and a `tables()` hook for several named grids; `gradient`,
+  `gradientBy` and `colorBy` on a fill; `frequency` on an alert (all 2.5.4).
+  New helpers `crossesAbove`, `crossesBelow`, `crosses`, `rising` and
+  `falling` read a missing value as no signal, which is pitfall 4 done for
+  you. What the library has and `/trading` does not take is in pitfall 25: the
+  input types `symbol`, `session`, `multiline`, `price` and `timestamp`
+  (2.5.4), `visibleWhen`, `activeWhen` and `inline` on inputs, and
+  `background` returned as a list of targeted columns (2.5.6). 2.5.8 gave
+  sixteen built-ins a `calcTail` that a spread does not copy. 2.5.4 and 2.5.5
+  corrected several calculations around missing data, and HMA at odd lengths,
+  so a study measured against a built-in re-derives its expectations.
+
+  **2.5.2, 2.5.3, 2.5.7, 2.5.9 and 2.5.10** changed nothing an indicator
+  declares. From 2.5.10, text markers on neighbouring bars are laid out in
+  lanes instead of overlapping, and `roc` and `williams-vix-fix` carry new
+  display names, so match a built-in by id, never by name.
+
 - **2.5.1: a finished alert can stop drawing its line.** Nothing an indicator
   declares changed and no export was added or removed: the index below counts
   the same 387 names it counted on 2.5.0.
@@ -157,15 +298,13 @@ changed, newest first:
   bars ahead, the tail landing in the right margin, with fills and the legend
   following. A `calc` that throws once installed is reported on the study's
   data status instead of thrown into the render loop; throw
-  `IndicatorInputError` for a condition the user can fix (Pine
-  `runtime.error`). `alerts[].message` may be a function of the firing bar.
-  Marker shapes `cross` and `xcross`, positions `paneTop` and `paneBottom`
-  (Pine `location.top` / `location.bottom`). `fills[].overlay` for a band on
-  the price pane (Pine `force_overlay` on `fill`). `plot.colorParts` for a
-  wick and border coloured apart from the body (Pine `plotcandle` wick
-  colour). `tooltip` and `id` on `draws()` labels and boxes. Inputs
-  `interval` and `time` (Pine `input.timeframe` / `input.time`).
-  `table` options `fontSize: 'auto'` (Pine `size.auto`). And
+  `IndicatorInputError` for a condition the user can fix.
+  `alerts[].message` may be a function of the firing bar. Marker shapes
+  `cross` and `xcross`, positions `paneTop` and `paneBottom`, pinned to the
+  plot's edges. `fills[].overlay` for a band drawn on the price pane.
+  `plot.colorParts` for a wick and border coloured apart from the body.
+  `tooltip` and `id` on `draws()` labels and boxes. Inputs `interval` and
+  `time`. `table` options `fontSize: 'auto'`. And
   `ctx.requestBars` on the attach context for another instrument's bars,
   which `/trading` serves from the terminal's own cached feed: the same broker
   session and the same bar cache the chart uses, so a benchmark costs no
@@ -268,7 +407,7 @@ changed, newest first:
    resets per day or per session.
 2. **Before writing a formula, check `reference/cookbook.md`.** Every
    author-facing call is demonstrated there, and the first section is the one
-   that saves the most work: the 105 built-ins are descriptors, so
+   that saves the most work: the 112 built-ins are descriptors, so
    `getIndicator('macd').calc(bars, settings, {})` gives you MACD's own columns
    rather than a reimplementation that can drift from the chart's.
 3. **Load the context you need.** `reference/contract.md` for the descriptor
@@ -278,6 +417,9 @@ changed, newest first:
    something in it.
 4. **Pick the closest example** in `examples/` and work from it:
    - `simple_zscore.js` — one pane, one plot, rolling window, levels, range
+   - `ema_cross_signals.js` (2.5.4) — `crossesAbove`, `crossesBelow`,
+     `crosses`, `rising` and `falling` turning two averages into filtered
+     Buy and Sell markers
    - `intermediate_keltner_squeeze.js` — several plots, `fills`, `colorBy`, a
      second price scale, a boolean that hides part of the drawing
    - `shaded_trend_zone.js` — shading between two series, where the ribbon

@@ -10,6 +10,12 @@ from database.auth_db import get_auth_token
 from database.token_db import get_br_symbol, get_oa_symbol, get_token
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
+from utils.position_read import (
+    PositionReadError,
+    read_position_book,
+    refuse_smart_order_on_read_failure,
+)
+from utils.smart_order_guard import PositionBookCache, SymbolLocks
 
 from ..mapping.order_data import (
     map_trade_data,
@@ -21,6 +27,7 @@ from ..mapping.order_data import (
     transform_tradebook_data,
 )
 from ..mapping.transform_data import (
+    SymbolNotFoundError,
     map_product_type,
     reverse_map_product_type,
     transform_data,
@@ -364,12 +371,15 @@ def get_trade_book(auth):
         return []
 
 
-def get_positions(auth):
+def get_positions(auth, strict=False):
     """
     Get list of positions using Tradejini API.
 
     Args:
         auth (str): Authentication token
+        strict (bool): Fail the whole read when a row cannot be transformed,
+            instead of leaving that row out. The smart order passes True,
+            because a row left out reads as a flat position.
 
     Returns:
         dict: Positions data in OpenAlgo format
@@ -488,6 +498,11 @@ def get_positions(auth):
 
                 except Exception as e:
                     logger.error(f"Error transforming position: {str(e)}", exc_info=True)
+                    if strict:
+                        return {
+                            "status": "error",
+                            "message": f"A position row could not be read: {e}",
+                        }
                     continue
 
             # Return in OpenAlgo format - same pattern as orderbook and tradebook
@@ -660,46 +675,51 @@ def get_holdings(auth):
 # --- Per-Symbol Smart Order Lock ---
 # Ensures only one smart order per symbol executes at a time.
 # Others queue and execute sequentially, each getting a fresh position book.
-_symbol_locks = {}  # {symbol_key: threading.Lock}
-_symbol_locks_lock = threading.Lock()
+# The registry forgets a symbol once nobody holds or waits on it, and under the
+# gthread worker a wait is bounded (utils/smart_order_guard.py).
+_SMART_ORDER_LOCKS = SymbolLocks()
 
 # --- Position Book Cache ---
 # Caches get_positions() for 1 second. Invalidated after each smart order placement.
-_position_cache = {}  # {auth_token: {"data": ..., "timestamp": ...}}
-_position_cache_lock = threading.Lock()
-_POSITION_CACHE_TTL = 1.0  # seconds
+# A fetch still in flight when an order invalidates the cache is returned to its
+# own caller but never cached, so the next order cannot read the book from
+# before the previous fill (utils/smart_order_guard.py).
+_POSITION_BOOK = PositionBookCache()
 
 
 def _get_symbol_lock(symbol, exchange, product):
-    """Get or create a per-symbol lock for serializing smart orders."""
-    key = f"{symbol}:{exchange}:{product}"
-    with _symbol_locks_lock:
-        if key not in _symbol_locks:
-            _symbol_locks[key] = threading.Lock()
-        return _symbol_locks[key]
+    """Hold the smart order lock for one symbol, as a context manager.
+
+    Yields True while holding it. Yields False when the wait ran out, which
+    happens only under the gthread worker; the caller must then return
+    ``SymbolLocks.busy(symbol)`` without placing an order.
+    """
+    return _SMART_ORDER_LOCKS.hold(symbol, exchange, product)
+
+
+def _position_book_ok(positions_data):
+    """get_positions answers {"status": "success", "data": [...]} for a book it
+    read, "no-data" included, and {"status": "error"} for every failure."""
+    return isinstance(positions_data, dict) and positions_data.get("status") == "success"
 
 
 def _get_cached_positions(auth):
     """Get positions from cache if fresh, otherwise fetch from broker API."""
-    with _position_cache_lock:
-        now = time.monotonic()
-        cached = _position_cache.get(auth)
-        if cached and (now - cached["timestamp"]) < _POSITION_CACHE_TTL:
-            return cached["data"]
-
-    # Cache miss or expired - fetch from broker
-    positions_data = get_positions(auth)
-
-    with _position_cache_lock:
-        _position_cache[auth] = {"data": positions_data, "timestamp": time.monotonic()}
-
-    return positions_data
+    return _POSITION_BOOK.get(
+        auth,
+        lambda: read_position_book(
+            "tradejini", lambda: get_positions(auth, strict=True), _position_book_ok
+        ),
+    )
 
 
 def _invalidate_position_cache(auth):
-    """Invalidate the position cache so the next queued order fetches fresh data."""
-    with _position_cache_lock:
-        _position_cache.pop(auth, None)
+    """Invalidate the position cache so the next queued order fetches fresh data.
+
+    Also stops a fetch that started before this order from caching the book
+    it read.
+    """
+    _POSITION_BOOK.invalidate(auth)
 
 
 def get_open_position(tradingsymbol, exchange, producttype, auth):
@@ -746,7 +766,21 @@ def get_open_position(tradingsymbol, exchange, producttype, auth):
 
                 pos_symbol = str(position.get("symbol", "")).upper().strip()
                 pos_exch = str(position.get("exchange", "")).upper().strip()
-                pos_qty = int(float(position.get("quantity", 0)))
+                try:
+                    pos_qty = int(float(position.get("quantity", 0)))
+                except (TypeError, ValueError) as exc:
+                    if pos_exch == exchange and pos_symbol == tradingsymbol:
+                        # The row for this very symbol cannot be read, so its
+                        # position is unknown, not flat.
+                        raise PositionReadError(
+                            "tradejini",
+                            f"quantity {position.get('quantity')!r} of {pos_symbol}: {exc}",
+                        ) from exc
+                    logger.warning(
+                        f"get_open_position - Skipping {pos_symbol} on {pos_exch}: "
+                        f"quantity {position.get('quantity')!r} is not a number"
+                    )
+                    continue
 
                 logger.debug(
                     f"get_open_position - Checking OpenAlgo position: {pos_symbol} on {pos_exch}, qty: {pos_qty}"
@@ -857,9 +891,43 @@ def get_open_position(tradingsymbol, exchange, producttype, auth):
         )
         return "0"
 
+    except PositionReadError:
+        raise
     except Exception as e:
+        # The book was read, but something in it could not be: the position
+        # is unknown, and reading it as flat would size the order against
+        # nothing.
         logger.exception(f"get_open_position - Exception: {str(e)}")
-        return "0"
+        raise PositionReadError("tradejini", f"{type(e).__name__}: {e}") from e
+
+
+class _OrderResponse:
+    """Response object returned by place_order_api.
+
+    The order services decide success from ``.status == 200`` alone, so a
+    refusal must never carry 200: Tradejini can answer a refused order with its
+    error envelope over HTTP 200, which was reported as a placed order with
+    order id None (issue #2385). ``None`` is never returned either, because the
+    services read ``.status`` without a check.
+    """
+
+    def __init__(self, status):
+        self.status = status
+        self.status_code = status
+
+
+# The order may exist: Tradejini said ok, or sent a 200 that could not be read.
+NO_ORDER_ID_MESSAGE = (
+    "Tradejini accepted the order but did not return an order id. "
+    "Check the order book before placing it again."
+)
+
+
+def _order_refused(status, message):
+    """Build the (response, data, order_id) answer for an order that was not placed."""
+    if status == 200:
+        status = 400
+    return _OrderResponse(status), {"status": "error", "message": message}, None
 
 
 def place_order_api(data, auth):
@@ -872,7 +940,8 @@ def place_order_api(data, auth):
 
     Returns:
         tuple: (response_obj, response_data, order_id)
-            - response_obj: Object with status attribute
+            - response_obj: Object with status attribute; 200 only when the
+              order was placed and Tradejini returned its order id
             - response_data: Dict with status and message
             - order_id: String order ID if successful, None otherwise
     """
@@ -885,7 +954,7 @@ def place_order_api(data, auth):
         if missing_fields:
             error_msg = f"Missing required fields: {', '.join(missing_fields)}"
             logger.error(f"place_order_api - {error_msg}")
-            return None, {"status": "error", "message": error_msg}, None
+            return _order_refused(400, error_msg)
 
         AUTH_TOKEN = auth
         logger.debug(f"place_order_api - Placing order for {data['symbol']} on {data['exchange']}")
@@ -901,10 +970,16 @@ def place_order_api(data, auth):
             token = get_token(data["symbol"], data["exchange"])
             transformed_data = transform_data(data, token)
             logger.debug(f"place_order_api - Transformed data: {transformed_data}")
+        except SymbolNotFoundError as e:
+            logger.warning(
+                f"place_order_api - {data['symbol']} on {data['exchange']} is not in the "
+                "master contract; order not sent"
+            )
+            return _order_refused(400, str(e))
         except Exception as e:
             error_msg = f"Error transforming order data: {str(e)}"
             logger.exception(error_msg)
-            return None, {"status": "error", "message": error_msg}, None
+            return _order_refused(400, error_msg)
 
         # httpx form-encodes the dict, so values containing spaces or '&'
         # (remarks, for instance) are escaped correctly.
@@ -915,7 +990,7 @@ def place_order_api(data, auth):
         api_key = get_api_key()
         if not api_key:
             logger.error(API_KEY_MISSING_ERROR)
-            return None, {"status": "error", "message": API_KEY_MISSING_ERROR}, None
+            return _order_refused(500, API_KEY_MISSING_ERROR)
 
         # Prepare authorization
         auth_header = f"{api_key}:{AUTH_TOKEN}"
@@ -949,62 +1024,77 @@ def place_order_api(data, auth):
             logger.debug(f"place_order_api - Response header fields: {list(response.headers)}")
 
             response.raise_for_status()
-            response_data = response.json()
+            try:
+                response_data = response.json()
+            except ValueError:
+                # A 2xx we cannot read: the order may have been placed.
+                logger.exception(
+                    f"place_order_api - Unreadable response (HTTP {response.status_code}): "
+                    f"{response.text[:500]}"
+                )
+                return _order_refused(502, NO_ORDER_ID_MESSAGE)
             logger.debug(f"place_order_api - API response: {response_data}")
+            if not isinstance(response_data, dict):
+                logger.error(f"place_order_api - Unexpected response shape: {response_data!r}")
+                return _order_refused(502, NO_ORDER_ID_MESSAGE)
 
-            # Create a response-like object with status attribute
-            class ResponseLike:
-                def __init__(self, status_code):
-                    self.status = status_code
-
-            response_obj = ResponseLike(response.status_code)
-
-            # Parse successful response
-            if response_data.get("s") == "ok" and "d" in response_data:
-                order_id = response_data["d"].get("orderId")
-                message = response_data["d"].get("msg", "Order placed successfully")
+            # Parse successful response. Any "ok" may be a placed order, whatever
+            # shape its payload has, so it is never reported as a refusal.
+            if response_data.get("s") == "ok":
+                payload_d = response_data.get("d")
+                if not isinstance(payload_d, dict):
+                    payload_d = {}
+                order_id = payload_d.get("orderId")
+                message = payload_d.get("msg", "Order placed successfully")
 
                 if not order_id:
+                    # Tradejini said ok, so the order may exist: send the trader
+                    # to the order book rather than reporting a refusal or a
+                    # placed order with no id.
                     logger.warning(f"place_order_api - No order ID in response: {response_data}")
-                    return (
-                        response_obj,
-                        {"status": "error", "message": "No order ID in response"},
-                        None,
-                    )
+                    return _order_refused(502, NO_ORDER_ID_MESSAGE)
 
                 logger.debug(f"place_order_api - Order placed successfully. Order ID: {order_id}")
                 return (
-                    response_obj,
+                    _OrderResponse(200),
                     {"status": "success", "message": message, "orderid": str(order_id)},
                     str(order_id),
                 )
-            else:
-                # Error envelope carries the message at the top level as 'msg'
-                error_msg = _envelope_error(response_data)
-                logger.error(f"place_order_api - Order placement failed: {error_msg}")
-                return response_obj, {"status": "error", "message": error_msg}, None
+
+            # Error envelope ({"s": "error", "msg": ...}), even over HTTP 200
+            error_msg = _envelope_error(response_data, "Tradejini refused the order")
+            logger.error(
+                f"place_order_api - Order placement failed (HTTP {response.status_code}): "
+                f"{error_msg}"
+            )
+            return _order_refused(response.status_code, error_msg)
 
         except httpx.HTTPStatusError as e:
-            error_msg = f"HTTP error: {str(e)}"
+            status = e.response.status_code if e.response is not None else 502
+            error_msg = "Tradejini refused the order"
             if e.response is not None:
                 try:
-                    error_msg = _envelope_error(e.response.json())
+                    error_msg = _envelope_error(e.response.json(), error_msg)
                 except Exception:
-                    error_msg = f"HTTP {e.response.status_code}: {e.response.text}"
-            logger.error(f"place_order_api - {error_msg}")
-            return None, {"status": "error", "message": error_msg}, None
+                    logger.error(
+                        f"place_order_api - Unreadable error body (HTTP {status}): "
+                        f"{e.response.text[:500]}"
+                    )
+            logger.error(f"place_order_api - HTTP {status}: {error_msg}")
+            return _order_refused(status, error_msg)
 
         except Exception as e:
             error_msg = f"Error placing order: {str(e)}"
             logger.exception(error_msg)
-            return None, {"status": "error", "message": error_msg}, None
+            return _order_refused(500, error_msg)
 
     except Exception as e:
         error_msg = f"Unexpected error in place_order_api: {str(e)}"
         logger.exception(error_msg)
-        return None, {"status": "error", "message": error_msg}, None
+        return _order_refused(500, error_msg)
 
 
+@refuse_smart_order_on_read_failure
 def place_smartorder_api(data, auth):
     """
     Place a smart order using Tradejini API.
@@ -1035,9 +1125,9 @@ def place_smartorder_api(data, auth):
         product = data.get("product", "MIS")
 
         # Per-symbol lock: serialize smart orders per symbol
-        symbol_lock = _get_symbol_lock(symbol, exchange, product)
-
-        with symbol_lock:
+        with _get_symbol_lock(symbol, exchange, product) as symbol_lock:
+            if not symbol_lock:
+                return SymbolLocks.busy(symbol)
             # Target position size - this is the key parameter for SmartOrder
             try:
                 position_size = int(float(data.get("position_size", "0")))
@@ -1059,6 +1149,8 @@ def place_smartorder_api(data, auth):
                     f"(from get_open_position)"
                 )
 
+            except PositionReadError:
+                raise
             except Exception as e:
                 logger.exception(f"place_smartorder_api - Error getting position: {str(e)}")
                 return None, {"status": "error", "message": f"Failed to get position: {str(e)}"}, ""
@@ -1198,13 +1290,17 @@ def place_smartorder_api(data, auth):
                             f"place_smartorder_api - Invalid response format from place_order_api: {response}"
                         )
 
-                    return None, {"status": "error", "message": error_msg}, None
+                    # Pass place_order_api's response object on (never 200 for a
+                    # failure) so the caller gets Tradejini's real status.
+                    return res, {"status": "error", "message": error_msg}, None
 
             except Exception as e:
                 error_msg = f"Exception in place_order_api: {str(e)}"
                 logger.exception(error_msg)
                 return None, {"status": "error", "message": error_msg}, None
 
+    except PositionReadError:
+        raise
     except Exception as e:
         error_msg = f"Smart order placement failed: {str(e)}"
         logger.exception(f"place_smartorder_api - Exception occurred: {error_msg}")

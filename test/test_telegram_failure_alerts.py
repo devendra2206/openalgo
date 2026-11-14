@@ -4,10 +4,13 @@ Regression tests for the 2026-08-13 Telegram failure-only alert change:
 - services/telegram_alert_service.py: send_failure_alert()/format_failure_details()
   (new) -- the Telegram channel now only ever sends when an order
   placement/modify/cancel genuinely fails.
-- subscribers/telegram_subscriber.py: every success/completion handler is
-  now a no-op; the three *_failed handlers call send_failure_alert().
-- subscribers/whatsapp_subscriber.py: every handler is now a no-op
-  (WhatsApp order alerts disabled entirely).
+- Success alerts: upstream replaced the per-channel subscribers with one
+  alert router (/alerts page, 2026-11 merge). Telegram and WhatsApp now
+  default to NO success groups (services/alerts/settings.py), which keeps
+  this fork's behaviour for an install that never opens /alerts.
+- Failure alerts: subscribers/telegram_failure_subscriber.py sends the three
+  *_failed events to send_failure_alert(), unless Telegram is switched off
+  on the /alerts page.
 
 Run: uv run pytest test/test_telegram_failure_alerts.py -v
 """
@@ -17,8 +20,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from services.telegram_alert_service import TelegramAlertService
-import subscribers.telegram_subscriber as telegram_subscriber
-import subscribers.whatsapp_subscriber as whatsapp_subscriber
+import subscribers.telegram_failure_subscriber as telegram_subscriber
+from services.alerts import settings as alert_settings
+from services.alerts.categories import CATEGORY_IDS
+from services.alerts.registry import get_channel
 
 
 class FakeEvent:
@@ -117,26 +122,43 @@ def test_send_failure_alert_skips_when_no_linked_telegram_user(service):
     print("Correctly skipped: no linked telegram user PASS")
 
 
-@pytest.mark.parametrize("handler_name", [
-    "on_order_placed", "on_smart_order_no_action", "on_order_modified",
-    "on_order_cancelled", "on_all_orders_cancelled", "on_position_closed",
-    "on_basket_completed", "on_split_completed", "on_options_completed",
-    "on_multiorder_completed", "on_analyzer_error",
-])
-def test_telegram_success_handlers_are_all_no_ops(handler_name):
-    """This channel is now failure-only end to end -- every non-failure
-    handler must not call send_failure_alert/send_order_alert at all."""
-    handler = getattr(telegram_subscriber, handler_name)
-    with patch.object(telegram_subscriber.telegram_alert_service, "send_order_alert") as mock_send, \
-         patch.object(telegram_subscriber.telegram_alert_service, "send_failure_alert") as mock_fail:
-        handler(FakeEvent(api_type="placeorder", request_data={}, response_data={}, api_key="k"))
-    assert not mock_send.called and not mock_fail.called, (
-        f"FAIL: {handler_name} should be a no-op but dispatched an alert"
-    )
-    print(f"{handler_name} correctly does nothing PASS")
+@pytest.fixture
+def telegram_on():
+    with patch.object(telegram_subscriber, "_telegram_on", return_value=True):
+        yield
 
 
-def test_telegram_on_order_failed_calls_send_failure_alert():
+@pytest.fixture
+def nothing_saved(monkeypatch):
+    """No /alerts settings stored: every channel uses its defaults."""
+    import database.alert_channels_db as alert_channels_db
+
+    monkeypatch.setattr(alert_channels_db, "load_channel", lambda name: None)
+    alert_settings.clear_cache()
+    yield
+    alert_settings.clear_cache()
+
+
+@pytest.mark.parametrize("name", ["telegram", "whatsapp"])
+@pytest.mark.parametrize("category", sorted(CATEGORY_IDS))
+def test_no_success_group_reaches_telegram_or_whatsapp_by_default(nothing_saved, name, category):
+    """Every success/completion group is off for these two channels unless
+    the trader turns it on at /alerts."""
+    assert not alert_settings.settings_for(get_channel(name)).receives(category)
+
+
+def test_failure_alert_respects_the_alerts_page_switch(monkeypatch):
+    """Telegram switched off at /alerts sends nothing, failures included."""
+    monkeypatch.setattr(telegram_subscriber, "_telegram_on", lambda: False)
+    with patch.object(telegram_subscriber.telegram_alert_service, "send_failure_alert") as mock_fail:
+        telegram_subscriber.on_order_failed(FakeEvent(
+            api_type="placeorder", symbol="X", exchange="NFO", error_message="err",
+            request_data={}, api_key="k",
+        ))
+    assert not mock_fail.called
+
+
+def test_telegram_on_order_failed_calls_send_failure_alert(telegram_on):
     event = FakeEvent(
         api_type="placeorder", symbol="NIFTY18AUG2624350PE", exchange="NFO",
         error_message="Rejected : ALGO_CHK: MKT Order type not allowed for API order",
@@ -152,7 +174,7 @@ def test_telegram_on_order_failed_calls_send_failure_alert():
     print("on_order_failed correctly calls send_failure_alert with the right fields PASS")
 
 
-def test_telegram_on_order_modify_failed_calls_send_failure_alert():
+def test_telegram_on_order_modify_failed_calls_send_failure_alert(telegram_on):
     event = FakeEvent(
         api_type="modifyorder", error_message="Order not found",
         request_data={}, api_key="key123", orderid="ORD1",
@@ -165,7 +187,7 @@ def test_telegram_on_order_modify_failed_calls_send_failure_alert():
     print("on_order_modify_failed correctly calls send_failure_alert with orderid PASS")
 
 
-def test_telegram_on_order_cancel_failed_calls_send_failure_alert():
+def test_telegram_on_order_cancel_failed_calls_send_failure_alert(telegram_on):
     event = FakeEvent(
         api_type="cancelorder", error_message="Order already complete",
         request_data={}, api_key="key123", orderid="ORD2",
@@ -174,23 +196,3 @@ def test_telegram_on_order_cancel_failed_calls_send_failure_alert():
         telegram_subscriber.on_order_cancel_failed(event)
     assert mock_fail.called
     print("on_order_cancel_failed correctly calls send_failure_alert PASS")
-
-
-@pytest.mark.parametrize("handler_name", [
-    "on_order_placed", "on_order_failed", "on_smart_order_no_action",
-    "on_order_modified", "on_order_modify_failed", "on_order_cancelled",
-    "on_order_cancel_failed", "on_all_orders_cancelled", "on_position_closed",
-    "on_basket_completed", "on_split_completed", "on_options_completed",
-    "on_multiorder_completed", "on_analyzer_error",
-])
-def test_whatsapp_handlers_are_all_no_ops(handler_name):
-    """WhatsApp order alerts disabled entirely (2026-08-13) -- every
-    handler, including the failure ones, must do nothing."""
-    handler = getattr(whatsapp_subscriber, handler_name)
-    with patch("services.whatsapp_alert_service.whatsapp_alert_service.send_order_alert") as mock_send:
-        handler(FakeEvent(
-            api_type="placeorder", symbol="X", exchange="NFO", error_message="err",
-            request_data={}, response_data={}, api_key="k", orderid="O1",
-        ))
-    assert not mock_send.called, f"FAIL: whatsapp {handler_name} should be a no-op"
-    print(f"whatsapp.{handler_name} correctly does nothing PASS")

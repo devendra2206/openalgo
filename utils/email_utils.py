@@ -11,10 +11,92 @@ from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import certifi
+
 from database.settings_db import get_smtp_settings
+from utils import runtime
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+#: Seconds an SMTP connection may wait on the mail server under the gthread
+#: worker. Password reset and the test email run on a request thread, and with
+#: no timeout (the socket default) a mail server that accepts the connection
+#: and never answers held that thread, one of a fixed pool, for good. Under
+#: eventlet and on the development server the default is kept, as before.
+SMTP_TIMEOUT_SECONDS = 20.0
+
+#: What a send that timed out under that bound is told.
+MAIL_SERVER_UNREACHABLE_MESSAGE = (
+    "Could not reach the mail server. Check the SMTP host and port in settings."
+)
+
+#: What a connection refused for a certificate that does not check out is told.
+#: An SMTP host entered as an IP address is the cause an operator can check for
+#: themselves, because a certificate names the server, never its address.
+CERTIFICATE_UNVERIFIED_MESSAGE = (
+    "The mail server's security certificate could not be verified, so OpenAlgo did "
+    "not connect. Enter the SMTP host by its name, for example smtp.gmail.com, not "
+    "by an IP address. If it is your own mail server, it needs a certificate from a "
+    "recognised authority."
+)
+
+#: What Google Workspace's SMTP relay refusing a message is told. The relay
+#: accepts mail only from addresses allowed in the Admin console, and the one it
+#: sees is this OpenAlgo server's own public address, different on every
+#: install, so the message names the server rather than a fixed IP.
+GMAIL_RELAY_DENIED_MESSAGE = (
+    "Google refused to relay this email. In the Google Admin console, open the "
+    "SMTP relay settings for Gmail and allow the public IP address of your "
+    "OpenAlgo server. Or use smtp.gmail.com on port 587 with an app password "
+    "instead."
+)
+
+
+def mail_tls_context() -> ssl.SSLContext:
+    """A TLS context that verifies the mail server's certificate and host name.
+
+    The SMTP login and every email, password reset links included, travel over
+    this connection. Verification was once switched off here, which let anyone
+    on the network path between this server and the mail server present a
+    certificate of their own and read the password and the reset link. It
+    stays on: a certificate that does not check out ends the connection before
+    anything is sent.
+
+    The operating system's trusted roots are loaded, and certifi's on top, so a
+    host with no usable store of its own (a slim container, some Python builds)
+    still verifies the public mail providers.
+    """
+    context = ssl.create_default_context()
+    try:
+        context.load_verify_locations(cafile=certifi.where())
+    except OSError:
+        logger.debug("certifi bundle unavailable; using the system store", exc_info=True)
+    return context
+
+
+def _smtp_timeout_kwargs() -> dict:
+    """The ``timeout`` for an SMTP constructor: bounded only under gthread."""
+    return {"timeout": SMTP_TIMEOUT_SECONDS} if runtime.gthread_active() else {}
+
+
+def _timed_out(exc: BaseException) -> bool:
+    """True for a send that ran into the gthread SMTP bound."""
+    return isinstance(exc, TimeoutError) and runtime.gthread_active()
+
+
+def _close_quietly(server) -> None:
+    """Close an SMTP connection on the way out, whatever state it is in.
+
+    ``quit()`` closes it on success; on a failure nothing did, and the socket
+    stayed open until garbage collection in a worker that never restarts.
+    """
+    if server is None:
+        return
+    try:
+        server.close()
+    except Exception:
+        logger.debug("Closing the SMTP connection failed", exc_info=True)
 
 
 class EmailSendError(Exception):
@@ -336,6 +418,7 @@ def send_email(recipient_email, subject, text_content, html_content=None, smtp_s
     Returns:
         dict: Result dictionary with success status and message
     """
+    server = None
     try:
         if not smtp_settings:
             smtp_settings = get_smtp_settings()
@@ -361,24 +444,22 @@ def send_email(recipient_email, subject, text_content, html_content=None, smtp_s
         smtp_port = smtp_settings["smtp_port"]
         use_tls = smtp_settings.get("smtp_use_tls", True)
 
-        # Create SSL context
-        context = ssl.create_default_context()
-        # For Gmail relay, we might need to be less strict about certificates
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
+        context = mail_tls_context()
 
         # Choose connection method based on port
         if smtp_port == 465:
             # Port 465 uses SSL from the start (SMTPS)
             logger.info(f"Using SMTP_SSL for port {smtp_port}")
-            server = smtplib.SMTP_SSL(smtp_settings["smtp_server"], smtp_port, context=context)
+            server = smtplib.SMTP_SSL(
+                smtp_settings["smtp_server"], smtp_port, context=context, **_smtp_timeout_kwargs()
+            )
             # Send EHLO after SSL connection
             helo_hostname = smtp_settings.get("smtp_helo_hostname") or smtp_settings["smtp_server"]
             server.ehlo(helo_hostname)
         else:
             # Port 587 or others use SMTP with STARTTLS
             logger.info(f"Using SMTP with STARTTLS for port {smtp_port}")
-            server = smtplib.SMTP(smtp_settings["smtp_server"], smtp_port)
+            server = smtplib.SMTP(smtp_settings["smtp_server"], smtp_port, **_smtp_timeout_kwargs())
 
             # Send initial EHLO
             helo_hostname = smtp_settings.get("smtp_helo_hostname") or smtp_settings["smtp_server"]
@@ -390,8 +471,8 @@ def send_email(recipient_email, subject, text_content, html_content=None, smtp_s
                 # MUST send EHLO again after STARTTLS
                 server.ehlo(helo_hostname)
 
-        # Enable debug output for troubleshooting (uncomment if needed)
-        # server.set_debuglevel(1)
+        # Never server.set_debuglevel() here: smtplib prints every command to
+        # stderr, and the AUTH line carries the password into the server log.
 
         # Login and send email
         server.login(smtp_settings["smtp_username"], smtp_settings["smtp_password"])
@@ -417,20 +498,25 @@ def send_email(recipient_email, subject, text_content, html_content=None, smtp_s
         if "Mail relay denied" in error_str and "smtp-relay.gmail.com" in smtp_settings.get(
             "smtp_server", ""
         ):
-            error_msg = """Gmail Workspace relay denied. Solutions:
-            1. Register your server IP (49.207.195.248) in Google Admin Console → Apps → Gmail → SMTP relay
-            2. Or switch to personal Gmail: smtp.gmail.com:587 with App Password
-            3. See: https://support.google.com/a/answer/6140680"""
+            error_msg = GMAIL_RELAY_DENIED_MESSAGE
         elif "Authentication failed" in error_str:
             error_msg = "SMTP Authentication failed. For Gmail, use App Password instead of regular password."
         else:
             error_msg = f"SMTP Error: {error_str}"
 
         return {"success": False, "message": error_msg}
+    except ssl.SSLCertVerificationError as e:
+        logger.exception(f"Mail server certificate could not be verified: {e}")
+        return {"success": False, "message": CERTIFICATE_UNVERIFIED_MESSAGE}
     except Exception as e:
+        if _timed_out(e):
+            logger.error(f"Email sending timed out after {SMTP_TIMEOUT_SECONDS}s: {e}")
+            return {"success": False, "message": MAIL_SERVER_UNREACHABLE_MESSAGE}
         error_msg = f"Failed to send email: {str(e)}"
         logger.exception(f"Email sending failed: {e}")
         return {"success": False, "message": error_msg}
+    finally:
+        _close_quietly(server)
 
 
 def validate_smtp_settings(smtp_settings):
@@ -443,6 +529,7 @@ def validate_smtp_settings(smtp_settings):
     Returns:
         dict: Validation result
     """
+    server = None
     try:
         required_fields = [
             "smtp_server",
@@ -463,21 +550,20 @@ def validate_smtp_settings(smtp_settings):
         smtp_port = smtp_settings["smtp_port"]
         use_tls = smtp_settings.get("smtp_use_tls", True)
 
-        # Create SSL context
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
+        context = mail_tls_context()
 
         # Choose connection method based on port
         if smtp_port == 465:
             # Port 465 uses SSL from the start (SMTPS)
-            server = smtplib.SMTP_SSL(smtp_settings["smtp_server"], smtp_port, context=context)
+            server = smtplib.SMTP_SSL(
+                smtp_settings["smtp_server"], smtp_port, context=context, **_smtp_timeout_kwargs()
+            )
             # Send EHLO after SSL connection
             helo_hostname = smtp_settings.get("smtp_helo_hostname") or smtp_settings["smtp_server"]
             server.ehlo(helo_hostname)
         else:
             # Port 587 or others use SMTP with STARTTLS
-            server = smtplib.SMTP(smtp_settings["smtp_server"], smtp_port)
+            server = smtplib.SMTP(smtp_settings["smtp_server"], smtp_port, **_smtp_timeout_kwargs())
 
             # Send initial EHLO
             helo_hostname = smtp_settings.get("smtp_helo_hostname") or smtp_settings["smtp_server"]
@@ -494,5 +580,12 @@ def validate_smtp_settings(smtp_settings):
 
         return {"success": True, "message": "SMTP connection successful"}
 
+    except ssl.SSLCertVerificationError as e:
+        logger.exception(f"Mail server certificate could not be verified: {e}")
+        return {"success": False, "message": CERTIFICATE_UNVERIFIED_MESSAGE}
     except Exception as e:
+        if _timed_out(e):
+            return {"success": False, "message": MAIL_SERVER_UNREACHABLE_MESSAGE}
         return {"success": False, "message": f"SMTP validation failed: {str(e)}"}
+    finally:
+        _close_quietly(server)

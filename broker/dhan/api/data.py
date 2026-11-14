@@ -12,10 +12,51 @@ import pandas as pd
 from broker.dhan.api.baseurl import get_url
 from broker.dhan.mapping.transform_data import map_exchange_type
 from database.token_db import get_br_symbol, get_oa_symbol, get_token
+from utils.broker_backpressure import BrokerBusyError, check_queue_wait
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Index exchanges share the session of their cash exchange.
+_SESSION_EXCHANGE = {"NSE_INDEX": "NSE", "BSE_INDEX": "BSE", "MCX_INDEX": "MCX"}
+
+# Listed under an exchange whose calendar is not theirs. GIFT NIFTY (NSE IFSC)
+# trades about 06:30 to 02:45, so NSE's 15:30 close would cut real bars.
+_OWN_HOURS = {("NSE_INDEX", "GIFTNIFTY")}
+
+
+def _drop_bars_after_close(df: pd.DataFrame, symbol: str, exchange: str) -> pd.DataFrame:
+    """Drop intraday bars that start at or after the session close of their day.
+
+    After the close, Dhan's /v2/charts/intraday appends one flat, zero-volume
+    bar stamped at the request time to NSE and BSE index series (SENSEX 15m:
+    15:15, then 16:00). No session contains it, so the /trading chart's
+    resampler refuses the whole series ("Unknown source candle boundaries")
+    on 30m. Its shape cannot single it out: Dhan sends no index volume, and a
+    quiet GIFT NIFTY bar is flat too. A day with no session in the calendar is
+    left as it is, and special sessions (Muhurat) close when the calendar says.
+    """
+    from datetime import date as _date
+
+    from database.market_calendar_db import get_market_timings_for_date
+
+    if df.empty or (exchange, symbol) in _OWN_HOURS:
+        return df
+    session_exchange = _SESSION_EXCHANGE.get(exchange, exchange)
+    days = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.date
+    keep = pd.Series(True, index=df.index)
+    for day in days.unique():
+        sessions = get_market_timings_for_date(_date.fromisoformat(str(day)))
+        closes = [s["end_time"] for s in sessions if s.get("exchange") == session_exchange]
+        if closes:
+            on_day = days == day
+            keep &= ~(on_day & (df["timestamp"] * 1000 >= max(closes)))
+    dropped = int((~keep).sum())
+    if dropped:
+        logger.debug(f"Dropped {dropped} Dhan bar(s) after the {session_exchange} close")
+    return df[keep].reset_index(drop=True)
+
 
 # Rate limiters for Dhan API. Dhan enforces different limits per API class:
 #   - Data/History APIs (/v2/charts/*):   5 req/s -> 0.2s spacing
@@ -34,7 +75,17 @@ MCX_INDEX_UNDERLYINGS = ("MCXBULLDEX", "MCXMETLDEX", "MCXENRGDEX")
 
 
 def _apply_rate_limit(category="data"):
-    """Apply per-category rate limiting to avoid Dhan API error 805 (too many requests)"""
+    """Apply per-category rate limiting to avoid Dhan API error 805 (too many requests).
+
+    Each caller books the slot after the last one, so more quote calls than
+    one a second queue without limit. Under the gthread worker every queued
+    caller holds a request thread, so one whose slot is further away than
+    ``utils.broker_backpressure.max_queue_wait("data")`` is refused before it
+    books anything. Under eventlet and the dev server there is no bound.
+
+    Raises:
+        BrokerBusyError: Under gthread, when the slot is too far away.
+    """
     global _last_api_call_time
     interval = DHAN_DATA_INTERVAL if category == "data" else DHAN_QUOTE_INTERVAL
     sleep_time = 0
@@ -44,6 +95,8 @@ def _apply_rate_limit(category="data"):
         time_since_last_call = current_time - _last_api_call_time[category]
         if time_since_last_call < interval:
             sleep_time = interval - time_since_last_call
+        # Refused before the slot is reserved, so it delays nobody behind it.
+        check_queue_wait(sleep_time, "data")
         # Update timestamp immediately to reserve this slot
         _last_api_call_time[category] = current_time + sleep_time
 
@@ -541,6 +594,8 @@ class BrokerData:
                                     "oi": int(float(openinterest[i])) if openinterest[i] else 0,
                                 }
                             )
+                    except BrokerBusyError:
+                        raise
                     except Exception as e:
                         logger.error(f"Error fetching intraday data: {str(e)}")
                 else:
@@ -643,6 +698,8 @@ class BrokerData:
                                 chunk_candle_count = len(chunk_rows)
                                 last_error = None
                                 break
+                            except BrokerBusyError:
+                                raise
                             except Exception as e:
                                 last_error = e
                                 if attempt < CHUNK_MAX_RETRIES - 1:
@@ -731,9 +788,13 @@ class BrokerData:
                     .drop_duplicates(subset=["timestamp"])
                     .reset_index(drop=True)
                 )
+                if interval != "D":
+                    df = _drop_bars_after_close(df, symbol, exchange)
 
             return df
 
+        except BrokerBusyError:
+            raise
         except Exception as e:
             logger.error(f"Error fetching historical data: {str(e)}")
             raise Exception(f"Error fetching historical data: {str(e)}")
@@ -834,6 +895,8 @@ class BrokerData:
                     }
                 raise
 
+        except BrokerBusyError:
+            raise
         except Exception as e:
             logger.error(f"Error in get_quotes: {str(e)}", exc_info=True)
             raise Exception(f"Error fetching quotes: {str(e)}")
@@ -880,6 +943,8 @@ class BrokerData:
                 # Single batch processing
                 return self._process_quotes_batch(symbols)
 
+        except BrokerBusyError:
+            raise
         except Exception as e:
             logger.exception("Error fetching multiquotes")
             raise Exception(f"Error fetching multiquotes: {e}")
@@ -985,6 +1050,8 @@ class BrokerData:
                     logger.warning(
                         f"Unexpected response format for segment '{seg}': {type(seg_data)}"
                     )
+        except BrokerBusyError:
+            raise
         except Exception as e:
             logger.error(f"API Error: {str(e)}")
             raise Exception(f"API Error: {str(e)}")
@@ -1173,6 +1240,8 @@ class BrokerData:
                     }
                 raise
 
+        except BrokerBusyError:
+            raise
         except Exception as e:
             logger.error(f"Error in get_depth: {str(e)}", exc_info=True)
             raise Exception(f"Error fetching market depth: {str(e)}")

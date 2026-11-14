@@ -66,7 +66,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -74,8 +73,10 @@ from typing import Any, Protocol
 
 import httpx
 
+from services.agent import litellm_loader
 from utils.logging import get_logger
 from utils.real_threading import Event, Lock, Thread, join
+from utils.runtime import original as _original_module
 
 logger = get_logger(__name__)
 
@@ -191,12 +192,7 @@ _MIN_POLL_SECONDS = 0.01
 # primitives. The poll thread is a real OS thread and has no business waking the
 # hub's timers; under eventlet `time.sleep` is the hub's, and using it here
 # would hand the poll loop's cadence to a scheduler it does not belong to.
-if "eventlet" in sys.modules:
-    import eventlet
-
-    _real_sleep = eventlet.patcher.original("time").sleep
-else:
-    _real_sleep = time.sleep
+_real_sleep = _original_module("time").sleep
 
 
 class ChatGptOAuthError(RuntimeError):
@@ -279,19 +275,20 @@ def _bits() -> _LiteLlmChatGpt:
         return _litellm_bits
 
     try:
-        from litellm.llms.chatgpt.authenticator import (
-            DEVICE_CODE_POLL_SLEEP_SECONDS,
-            DEVICE_CODE_TIMEOUT_SECONDS,
-            Authenticator,
-        )
-        from litellm.llms.chatgpt.common_utils import (
-            CHATGPT_AUTH_BASE,
-            CHATGPT_CLIENT_ID,
-            CHATGPT_DEVICE_CODE_URL,
-            CHATGPT_DEVICE_TOKEN_URL,
-            CHATGPT_DEVICE_VERIFY_URL,
-            CHATGPT_OAUTH_TOKEN_URL,
-        )
+        # Through the loader, never a bare `from litellm... import`: this runs
+        # beside the catalogue's own first import when /agent/config opens,
+        # and the two deadlock in Python's import system (see litellm_loader).
+        authenticator = litellm_loader.load("litellm.llms.chatgpt.authenticator")
+        common = litellm_loader.load("litellm.llms.chatgpt.common_utils")
+        DEVICE_CODE_POLL_SLEEP_SECONDS = authenticator.DEVICE_CODE_POLL_SLEEP_SECONDS
+        DEVICE_CODE_TIMEOUT_SECONDS = authenticator.DEVICE_CODE_TIMEOUT_SECONDS
+        Authenticator = authenticator.Authenticator
+        CHATGPT_AUTH_BASE = common.CHATGPT_AUTH_BASE
+        CHATGPT_CLIENT_ID = common.CHATGPT_CLIENT_ID
+        CHATGPT_DEVICE_CODE_URL = common.CHATGPT_DEVICE_CODE_URL
+        CHATGPT_DEVICE_TOKEN_URL = common.CHATGPT_DEVICE_TOKEN_URL
+        CHATGPT_DEVICE_VERIFY_URL = common.CHATGPT_DEVICE_VERIFY_URL
+        CHATGPT_OAUTH_TOKEN_URL = common.CHATGPT_OAUTH_TOKEN_URL
     except Exception as exc:
         logger.exception("LiteLLM's ChatGPT subscription provider is not available")
         raise ChatGptOAuthUnavailable(
@@ -1062,6 +1059,13 @@ _lock = Lock()
 _login = LoginStatus()
 _thread: Thread | None = None
 _cancel: Event | None = None
+#: Set, under _lock, by the start that is requesting a device code, and cleared
+#: once it has published the code or failed. A second start (a double click)
+#: sees it and returns the snapshot instead of requesting a second code.
+_claim: object | None = None
+
+#: What the login snapshot says while a start is requesting its device code.
+REQUESTING_MESSAGE = "Requesting a sign-in code from ChatGPT..."
 
 
 def login_status() -> LoginStatus:
@@ -1091,6 +1095,31 @@ def _set_login(**changes: Any) -> LoginStatus:
     with _lock:
         _login = replace(_login, **changes)
         return _login
+
+
+def _set_login_if_current(cancel: Event, **changes: Any) -> bool:
+    """Replace fields on the snapshot only while ``cancel`` is the live login's.
+
+    A poll worker writes through this, so one that has been replaced (by a
+    forced restart, or before the start was single flight, by a second start)
+    cannot overwrite the newer login's snapshot, for example with ``expired``
+    after the newer one was authorised. Identity on the cancel Event is the
+    same test :func:`_retire` uses.
+
+    Args:
+        cancel: The Event the writing worker was started with.
+        **changes: Fields of :class:`LoginStatus` to change.
+
+    Returns:
+        True when the snapshot was written.
+    """
+    global _login
+
+    with _lock:
+        if _cancel is not cancel:
+            return False
+        _login = replace(_login, **changes)
+        return True
 
 
 def start_login(
@@ -1136,7 +1165,7 @@ def start_login(
         ChatGptOAuthError: When the device code could not be issued. The state
             is also set to `failed`, so a client that only polls still sees it.
     """
-    global _thread, _cancel
+    global _claim, _login
 
     bits = _bits()
     configure_token_dir()
@@ -1153,12 +1182,62 @@ def start_login(
         # second time. Starting a new login there is correct and safe: `_retire`
         # matches on the cancel Event's identity, so the departing worker leaves
         # the new one's handles alone.
+        #
+        # A start that is still requesting its device code holds _claim, and
+        # counts as a login in flight even with force: the code it is about to
+        # publish is the fresh one a "start over" asks for.
+        if _claim is not None:
+            return _login
         running = _thread is not None and _thread.is_alive() and _login.state == LOGIN_PENDING
         if running and not force:
             return _login
+        if not running:
+            # Claimed before any I/O, in the same hold as the check, so a
+            # second start cannot pass the check while this one is still
+            # asking for a code. The snapshot says so meanwhile.
+            claim = _claim = object()
+            _login = replace(_login, state=LOGIN_PENDING, user_code="", message=REQUESTING_MESSAGE)
 
     if running:
         cancel_login()
+        with _lock:
+            if _claim is not None:
+                return _login
+            claim = _claim = object()
+            _login = replace(_login, state=LOGIN_PENDING, user_code="", message=REQUESTING_MESSAGE)
+
+    try:
+        return _start_claimed_login(
+            bits,
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            poll_interval=poll_interval,
+        )
+    finally:
+        with _lock:
+            if _claim is claim:
+                _claim = None
+
+
+def _start_claimed_login(
+    bits: _LiteLlmChatGpt,
+    *,
+    transport: Transport | None,
+    timeout_seconds: float | None,
+    poll_interval: float | None,
+) -> LoginStatus:
+    """Request the device code and start the poll thread. Holds the claim.
+
+    Args:
+        bits: LiteLLM's chatgpt provider pieces.
+        transport: As :func:`start_login`.
+        timeout_seconds: As :func:`start_login`.
+        poll_interval: As :func:`start_login`.
+
+    Returns:
+        The snapshot, carrying the verification URL and the user code.
+    """
+    global _thread, _cancel
 
     deadline = float(timeout_seconds if timeout_seconds is not None else bits.timeout_seconds)
     interval = float(poll_interval if poll_interval is not None else bits.poll_seconds)
@@ -1297,7 +1376,8 @@ def _poll_worker(
                 f"{auth_file().parent}. Check the directory is writable and try again."
             )
         stored = store_tokens()
-        _set_login(
+        _set_login_if_current(
+            cancel,
             state=LOGIN_AUTHORISED,
             user_code="",
             message=(
@@ -1311,10 +1391,10 @@ def _poll_worker(
     except DeviceCodeExpired as exc:
         # Not a failure: the operator simply did not finish in time, and the
         # fix is to start again rather than to investigate anything.
-        _set_login(state=LOGIN_EXPIRED, user_code="", message=str(exc))
+        _set_login_if_current(cancel, state=LOGIN_EXPIRED, user_code="", message=str(exc))
         logger.info("ChatGPT subscription sign-in code expired unapproved")
     except ChatGptOAuthError as exc:
-        _set_login(state=LOGIN_FAILED, user_code="", message=str(exc))
+        _set_login_if_current(cancel, state=LOGIN_FAILED, user_code="", message=str(exc))
         logger.error("ChatGPT subscription login failed: %s", exc)
     except Exception as exc:
         # Same carve-out as ensure_ready, and for the same reason: the frames
@@ -1322,7 +1402,8 @@ def _poll_worker(
         # message can quote the material it rejected. The class name locates
         # the bug without quoting anything.
         logger.error("The ChatGPT subscription login thread failed: %s", type(exc).__name__)
-        _set_login(
+        _set_login_if_current(
+            cancel,
             state=LOGIN_FAILED,
             user_code="",
             message="The sign-in failed unexpectedly. Try again.",

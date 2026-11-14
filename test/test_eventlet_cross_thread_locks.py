@@ -393,3 +393,368 @@ def test_a_result_from_the_loop_thread_wakes_its_caller_promptly():
         """
     )
     assert "OK" in result.stdout, result.stderr
+
+
+def test_run_on_hub_carries_a_real_threads_call_onto_the_hub_promptly():
+    """A real OS thread (the agent, the Telegram bot) calling green-guarded code.
+
+    Called directly, the real thread would take a green lock a greenlet holds,
+    which is the crossing this file opens with. Through run_on_hub the call runs
+    on the hub, where that lock is an ordinary green one, and only a result
+    crosses back. Measured on elapsed time and hub liveness, not just on the
+    value, which a direct call might also have produced.
+    """
+    result = run(
+        """
+        import utils.real_threading as rt
+
+        assert rt.start_hub_worker() is True
+        assert rt.start_hub_worker() is True  # idempotent
+        eventlet.sleep(0.05)
+        hub_ident = rt._real_get_ident()
+        assert rt.on_hub_thread() is True
+
+        green_lock = threading.Lock()  # green: patched before this ran
+        ticks = []
+
+        def hub_alive():
+            while True:
+                ticks.append(1)
+                eventlet.sleep(0.02)
+
+        def holder():
+            with green_lock:
+                eventlet.sleep(0.3)
+
+        def guarded(value):
+            with green_lock:
+                return (value * 2, rt._real_get_ident())
+
+        g = eventlet.spawn(hub_alive)
+        h = eventlet.spawn(holder)
+        eventlet.sleep(0.05)
+
+        out = {}
+
+        def real_thread_side():
+            assert rt.on_hub_thread() is False
+            t0 = time.monotonic()
+            out["value"], out["ran_on"] = rt.run_on_hub(guarded, 21, timeout=5)
+            out["took"] = time.monotonic() - t0
+            try:
+                rt.run_on_hub(lambda: 1 / 0, timeout=5)
+            except ZeroDivisionError:
+                out["raised"] = True
+            t0 = time.monotonic()
+            try:
+                rt.run_on_hub(eventlet.sleep, 5, timeout=0.3)
+            except TimeoutError:
+                out["timed_out"] = time.monotonic() - t0
+
+        t = _orig.Thread(target=real_thread_side, daemon=True)
+        before = len(ticks)
+        t.start()
+        assert rt.join(t, timeout=10), "the real thread never finished"
+        during = len(ticks) - before
+        g.kill()
+        h.wait()
+
+        assert out["value"] == 42, out
+        assert out["ran_on"] == hub_ident, "the call did not run on the hub"
+        assert out["took"] < 1.5, f"took {out['took']:.2f}s; the hub never picked it up"
+        assert out.get("raised") is True, "an exception did not cross back"
+        assert out.get("timed_out", 99) < 2, "the timeout was not honoured"
+        assert during > 5, f"the hub froze: only {during} ticks"
+        print("OK")
+        """
+    )
+    assert "OK" in result.stdout, result.stdout + result.stderr
+
+
+def test_an_idle_hub_drainer_leaves_the_hub_alone():
+    """The drainer sleeps until a real thread wakes it, never on a timer.
+
+    start_hub_worker runs at import on every eventlet worker, including the
+    default installs that have no caller for it yet. Polling the queue every
+    20 ms woke the worker's only hub fifty times a second, forever, raising
+    and catching Empty each time. Measured on how often the queue is read
+    while nothing is queued, then on how fast a real thread's call still runs.
+    """
+    result = run(
+        """
+        import utils.real_threading as rt
+
+        reads = []
+        real_get_nowait = rt._hub_queue.get_nowait
+
+        def counting_get_nowait():
+            reads.append(1)
+            return real_get_nowait()
+
+        rt._hub_queue.get_nowait = counting_get_nowait
+        assert rt.start_hub_worker() is True
+        eventlet.sleep(1.0)
+        idle_reads = len(reads)
+
+        out = {}
+
+        def real_thread_side():
+            t0 = time.monotonic()
+            out["value"] = rt.run_on_hub(lambda: 7, timeout=5)
+            out["took"] = time.monotonic() - t0
+            t0 = time.monotonic()
+            out["second"] = rt.run_on_hub(lambda: 8, timeout=5)
+            out["took_second"] = time.monotonic() - t0
+
+        t = _orig.Thread(target=real_thread_side, daemon=True)
+        t.start()
+        assert rt.join(t, timeout=10), "the real thread never finished"
+
+        assert idle_reads <= 1, f"the idle drainer read the queue {idle_reads} times in 1s"
+        assert out["value"] == 7 and out["second"] == 8, out
+        assert out["took"] < 0.5 and out["took_second"] < 0.5, out
+        assert rt.hub_worker_running() is True
+        print("OK")
+        """
+    )
+    assert "OK" in result.stdout, result.stdout + result.stderr
+
+
+def test_submit_to_hub_and_emit_from_any_thread_leave_the_real_thread_at_once():
+    """Fire-and-forget from a real thread, including a Socket.IO emit.
+
+    SerializedSocketIO takes no lock under eventlet (green emitters cannot
+    interleave, and a green lock is exactly what a real thread must not take),
+    so a real thread's emit has to reach the hub instead: emit_from_any_thread.
+    """
+    result = run(
+        """
+        import utils.real_threading as rt
+        import extensions
+        from flask_socketio import SocketIO
+
+        assert rt.start_hub_worker() is True
+        hub_ident = rt._real_get_ident()
+        seen = []
+
+        def fake_emit(self, event, *args, **kwargs):
+            seen.append((event, args, kwargs, rt._real_get_ident()))
+
+        SocketIO.emit = fake_emit
+
+        # A green emit takes no lock under eventlet and still reaches the server.
+        extensions.socketio.emit("green", {"n": 1})
+        assert seen and seen[0][0] == "green"
+        seen.clear()
+
+        done = _orig.Event()
+
+        def real_thread_side():
+            rt.submit_to_hub(seen.append, ("submitted", (), {}, rt._real_get_ident()))
+            extensions.emit_from_any_thread("bot_status", {"running": True}, to="room")
+            done.set()
+
+        _orig.Thread(target=real_thread_side, daemon=True).start()
+        assert rt.wait_for(done, 5), "the real thread was held up"
+        deadline = time.monotonic() + 5
+        while len(seen) < 2 and time.monotonic() < deadline:
+            eventlet.sleep(0.02)
+
+        assert [item[0] for item in seen] == ["submitted", "bot_status"], seen
+        assert seen[1][1] == ({"running": True},) and seen[1][2] == {"to": "room"}
+        assert seen[1][3] == hub_ident, "the emit ran on the real thread, not the hub"
+        print("OK")
+        """
+    )
+    assert "OK" in result.stdout, result.stdout + result.stderr
+
+
+def test_real_threading_sleep_is_the_unpatched_one():
+    """For real threads only: it must block the thread, not schedule on the hub."""
+    result = run(
+        """
+        import utils.real_threading as rt
+        from utils import runtime
+
+        assert runtime.is_monkey_patched() is True
+        assert rt.sleep is eventlet.patcher.original("time").sleep
+        assert rt.sleep is not time.sleep
+        assert rt.Lock is _orig.Lock
+        print("OK")
+        """
+    )
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_staged_broker_keys_stay_with_their_own_greenlet():
+    """A login's callback stages its broker's keys for its own request
+    (utils.broker_keys.stage_broker_keys); under eventlet every request is a
+    greenlet on one OS thread, so the staging must follow the greenlet, not
+    the thread. Another greenlet that runs while the callback waits on the
+    broker, a greenlet started afterwards, and a real OS thread all keep
+    reading the process's keys."""
+    result = run(
+        """
+        import os
+        import utils.broker_keys as bk
+        from types import SimpleNamespace
+
+        os.environ["BROKER_API_KEY"] = "process-key"
+        os.environ.pop("BROKER_API_KEY_MARKET", None)
+        keys = SimpleNamespace(
+            broker="fyers", api_key="staged-key", api_secret="s", api_key_market="",
+            api_secret_market="", redirect_url="", source="saved",
+        )
+        bk._resolve_or_refuse = lambda broker: keys
+        seen = {}
+
+        def login():
+            _keys, token = bk.stage_broker_keys("fyers")
+            try:
+                seen["login_before"] = os.getenv("BROKER_API_KEY")
+                eventlet.sleep(0.1)  # the exchange with the broker
+                seen["login_after"] = os.environ["BROKER_API_KEY"]
+                seen["market"] = "BROKER_API_KEY_MARKET" in os.environ
+                seen["later"] = eventlet.spawn(lambda: os.getenv("BROKER_API_KEY")).wait()
+            finally:
+                bk.unstage_broker_keys(token)
+            seen["login_done"] = os.getenv("BROKER_API_KEY")
+
+        def other_request():
+            eventlet.sleep(0.05)
+            seen["other"] = os.getenv("BROKER_API_KEY")
+            got = []
+            t = _orig.Thread(target=lambda: got.append(os.getenv("BROKER_API_KEY")))
+            t.start()
+            while t.is_alive():
+                eventlet.sleep(0.01)
+            seen["thread"] = got[0]
+
+        a, b = eventlet.spawn(login), eventlet.spawn(other_request)
+        a.wait(); b.wait()
+        assert seen == {
+            "login_before": "staged-key",
+            "login_after": "staged-key",
+            "market": False,
+            "later": "process-key",
+            "login_done": "process-key",
+            "other": "process-key",
+            "thread": "process-key",
+        }, seen
+        print("OK")
+        """
+    )
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_the_auth_commit_guard_lets_the_hub_run_while_a_holder_waits():
+    """database.auth_db.auth_commit_guard is taken by request greenlets around a
+    login's token write and every sign-out, and the holder yields on the
+    database. Under eventlet it must be green: a real lock would block the
+    whole worker while a second greenlet waited for it."""
+    result = run(
+        """
+        import database.auth_db as auth_db
+
+        guard = auth_db.auth_commit_guard()
+        order = []
+
+        def holder():
+            with guard:
+                order.append("held")
+                eventlet.sleep(0.2)  # the token write yields on the database
+                order.append("released")
+
+        def waiter():
+            eventlet.sleep(0.05)
+            with guard:
+                order.append("waiter")
+
+        ticks = []
+
+        def ticker():
+            for _ in range(5):
+                ticks.append(time.monotonic())
+                eventlet.sleep(0.03)
+
+        a, b, c = eventlet.spawn(holder), eventlet.spawn(waiter), eventlet.spawn(ticker)
+        a.wait(); b.wait(); c.wait()
+        assert order == ["held", "released", "waiter"], order
+        assert len(ticks) == 5, ticks  # the hub kept running while the waiter waited
+        print("OK")
+        """
+    )
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_alert_delivery_runs_on_the_hub_without_stalling_it():
+    """Alerts travel order event -> alert subscriber -> one bus callback per
+    channel -> the shared webhook pool (services/alerts/channels/webhook.py),
+    which takes a stdlib lock and posts through httpx. Under eventlet every one
+    of those is green; nothing in the path may block the hub or cross into a
+    real thread. Fifty order events must reach Slack and Discord fifty times
+    each while a ticker on the hub keeps its 10 ms rhythm."""
+    result = run(
+        """
+        import os, tempfile
+        tmp = tempfile.mkdtemp()
+        os.environ["DATABASE_URL"] = "sqlite:///" + os.path.join(tmp, "alerts.db")
+        import httpx
+        import utils.httpx_client as hc
+        import database.alert_channels_db as db
+        from events import OrderPlacedEvent
+        from services.alerts import settings
+        from services.alerts.channels.discord import DiscordChannel
+        from services.alerts.channels.slack import SlackChannel
+        from subscribers import alert_subscriber
+        from utils.event_bus import EventBus
+
+        posts = []
+
+        def provider(request):
+            eventlet.sleep(0.05)  # a network round trip yields to the hub
+            posts.append(request.url.host)
+            return httpx.Response(200 if request.url.host == "hooks.slack.com" else 204)
+
+        client = httpx.Client(transport=httpx.MockTransport(provider))
+        hc.get_httpx_client = lambda: client
+        db.Base.metadata.create_all(db.engine)
+        slack, discord = SlackChannel(), DiscordChannel()
+        settings.save_webhook(slack, "https://hooks.slack.com/services/TFAKE/BFAKE/notarealslacktoken")
+        settings.save_webhook(discord, "https://discord.com/api/webhooks/1234/not-a-real-discord-token")
+
+        bus = EventBus(workers=10)
+        alert_subscriber.bus = bus
+        alert_subscriber.CHANNELS = (slack, discord)
+        alert_subscriber.register()
+
+        gaps = []
+
+        def ticker():
+            last = time.monotonic()
+            while len(posts) < 100:
+                eventlet.sleep(0.01)
+                now = time.monotonic()
+                gaps.append(now - last)
+                last = now
+
+        tick = eventlet.spawn(ticker)
+        for i in range(50):
+            bus.publish(OrderPlacedEvent(
+                api_type="placeorder",
+                request_data={"symbol": "SBIN"},
+                response_data={"status": "success", "orderid": str(i)},
+            ))
+        deadline = time.monotonic() + 20
+        while len(posts) < 100 and time.monotonic() < deadline:
+            eventlet.sleep(0.02)
+        tick.kill()
+
+        assert posts.count("hooks.slack.com") == 50, posts.count("hooks.slack.com")
+        assert posts.count("discord.com") == 50, posts.count("discord.com")
+        assert bus.stats()["dropped"] == 0, bus.stats()
+        assert max(gaps) < 0.5, max(gaps)  # the hub was never held
+        print("OK")
+        """
+    )
+    assert "OK" in result.stdout, result.stderr

@@ -36,7 +36,6 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from cachetools import TTLCache
 from sqlalchemy import (
     JSON,
     Boolean,
@@ -51,12 +50,15 @@ from sqlalchemy import (
     Time,
     UniqueConstraint,
     exists,
+    func,
 )
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from database.engine_factory import create_db_engine
 from utils.logging import get_logger
+from utils.thread_safe_cache import MISSING, LockedTTLCache
 
 logger = get_logger(__name__)
 
@@ -72,19 +74,29 @@ Base.query = db_session.query_property()
 # by token hash on every request, so it is cached the way flow_db caches its
 # own webhook lookups. Bounded and short-lived: a rotated or deleted token must
 # stop working quickly, and the cache is invalidated explicitly on both.
-_webhook_token_cache: TTLCache = TTLCache(maxsize=2000, ttl=300)
+#
+# Both caches are LockedTTLCache: request threads, webhook threads and tick
+# evaluation read them at once under the gthread worker. Readers fill with the
+# generation they read before their query and writers invalidate after their
+# commit, so a read that raced a change is never cached.
+_webhook_token_cache: LockedTTLCache = LockedTTLCache(maxsize=2000, ttl=300)
 
 # What each strategy has banked this session, read on every tick by the daily
 # loss limit. Bounded by strategy count rather than by tick rate, and
 # invalidated whenever a run's realized figure changes, so the TTL only covers
 # a path that forgot to invalidate.
-_session_pnl_cache: TTLCache = TTLCache(maxsize=512, ttl=60)
+_session_pnl_cache: LockedTTLCache = LockedTTLCache(maxsize=512, ttl=60)
 
 
 def _forget_session_pnl(strategy_id: int | None) -> None:
-    """Drop the cached session total for one strategy, or all of them."""
-    for key in [k for k in list(_session_pnl_cache) if strategy_id is None or k[0] == strategy_id]:
-        _session_pnl_cache.pop(key, None)
+    """Drop the cached session total for one strategy, or all of them.
+
+    Called after the commit that changed a run's realized figure. It also
+    moves the cache's generation, so a tick that summed the runs just before
+    that commit cannot store the total that leaves the run out, which would
+    have delayed a daily loss limit by up to the TTL.
+    """
+    _session_pnl_cache.invalidate_where(lambda key: strategy_id is None or key[0] == strategy_id)
 
 
 # Webhook token prefix, so a leaked string is recognisable in a log or a paste.
@@ -104,6 +116,12 @@ STRATEGY_KINDS = ("batch", "signal")
 DIRECTIONS = ("both", "long_only", "short_only")
 STRATEGY_TYPES = ("intraday", "positional")
 RUN_MODES = ("live", "sandbox")
+
+#: What a Live run's broker column holds before the run knows its broker: ""
+#: from a batch start with no session, "live" from a signal run opened before
+#: the day's login. order_dispatch.UNBOUND_BROKERS is the same set.
+UNBOUND_RUN_BROKERS = ("", "live")
+
 STRATEGY_STATUSES = ("stopped", "running", "paused", "errored")
 TRIGGER_SOURCES = ("manual", "webhook", "scheduler")
 
@@ -341,6 +359,12 @@ class SmStrategyRun(Base):
     )
     mode = Column(String(10), nullable=False)
     broker = Column(String(50), nullable=False, default="")
+    # The broker account id the session carried when the run started, for the
+    # brokers whose login records one (auth.user_id). Every Live order the run
+    # sends is held to this broker and, when both are known, this account.
+    # NULL means not recorded: the run predates the column, or the broker's
+    # login names no account, and the run is then bound by broker alone.
+    broker_account = Column(String(255), nullable=True)
 
     started_at = Column(
         DateTime, nullable=False, default=lambda: datetime.now(UTC).replace(tzinfo=None)
@@ -525,7 +549,7 @@ class SmStrategyEvent(Base):
 
 def init_db() -> None:
     """Create the strategy-module tables if they do not exist."""
-    logger.info("Initializing Strategy Module DB")
+    logger.debug("Initializing Strategy Module DB")
     Base.metadata.create_all(bind=engine)
 
 
@@ -811,6 +835,64 @@ def list_strategies(user_id: str, status: str | None = None, q: str | None = Non
         return []
 
 
+def count_live_running_strategies(user_id: str) -> int:
+    """How many of a user's strategies are running a Live run now.
+
+    Asked before the logged-in broker's session ends for a switch: a Live run
+    places its orders through that session.
+    """
+    try:
+        return (
+            db_session.query(SmStrategy)
+            .join(SmStrategyRun, SmStrategyRun.id == SmStrategy.current_run_id)
+            .filter(
+                SmStrategy.user_id == user_id,
+                SmStrategy.status == "running",
+                SmStrategyRun.mode == "live",
+            )
+            .count()
+        )
+    except OperationalError as exc:
+        # No strategy table yet: nothing can be running.
+        if "no such table" in str(exc).lower():
+            return 0
+        raise
+    finally:
+        db_session.remove()
+
+
+def live_run_brokers(user_id: str) -> list[str]:
+    """The brokers a user's running Live runs trade on, as each run recorded it.
+
+    Asked before a login to another broker: a run on one broker must not be
+    left behind by a switch, whatever the session and the login records say.
+    A run that has not recorded its broker yet (UNBOUND_RUN_BROKERS) is not
+    listed: it is bound by its first order, so it holds no broker to switch from.
+    """
+    try:
+        rows = (
+            db_session.query(SmStrategyRun.broker)
+            .join(SmStrategy, SmStrategyRun.id == SmStrategy.current_run_id)
+            .filter(
+                SmStrategy.user_id == user_id,
+                SmStrategy.status == "running",
+                SmStrategyRun.mode == "live",
+                SmStrategyRun.broker.isnot(None),
+                SmStrategyRun.broker.notin_(UNBOUND_RUN_BROKERS),
+            )
+            .distinct()
+            .all()
+        )
+        return sorted(row[0] for row in rows)
+    except OperationalError as exc:
+        # No strategy table yet: nothing can be running.
+        if "no such table" in str(exc).lower():
+            return []
+        raise
+    finally:
+        db_session.remove()
+
+
 def get_strategy(strategy_id: int, user_id: str) -> SmStrategy | None:
     """One strategy, scoped to its owner.
 
@@ -956,9 +1038,10 @@ def delete_strategy(strategy_id: int, user_id: str) -> tuple[bool, str | None]:
             synchronize_session=False
         )
 
-        _webhook_token_cache.pop(row.webhook_token_hash, None)
+        token_hash = row.webhook_token_hash
         db_session.delete(row)
         db_session.commit()
+        _webhook_token_cache.invalidate(token_hash)
         return True, None
     except Exception:
         db_session.rollback()
@@ -1038,10 +1121,13 @@ def rotate_webhook_token(strategy_id: int, user_id: str) -> tuple[str | None, st
         if not row:
             return None, "Strategy not found"
 
-        _webhook_token_cache.pop(row.webhook_token_hash, None)
+        old_hash = row.webhook_token_hash
         token = generate_webhook_token()
         row.webhook_token_hash = hash_webhook_token(token)
         db_session.commit()
+        # After the commit: a lookup of the old token that read the row before
+        # it cannot then cache the old token as still valid.
+        _webhook_token_cache.invalidate(old_hash)
         return token, None
     except Exception:
         db_session.rollback()
@@ -1074,7 +1160,7 @@ def set_webhook_locked(strategy_id: int, user_id: str, locked: bool) -> tuple[bo
             return False, "Strategy not found"
         row.webhook_locked = bool(locked)
         db_session.commit()
-        _webhook_token_cache.pop(row.webhook_token_hash, None)
+        _webhook_token_cache.invalidate(row.webhook_token_hash)
         return True, None
     except Exception:
         db_session.rollback()
@@ -1091,14 +1177,20 @@ def get_strategy_by_webhook_token(token: str) -> SmStrategy | None:
     """
     try:
         digest = hash_webhook_token(token)
-        if digest in _webhook_token_cache:
-            strategy_id = _webhook_token_cache[digest]
+        # One get with a sentinel, because a cached None (an unknown token) has
+        # to stay distinguishable from a miss. A membership test followed by a
+        # subscript could lose the entry in between, and the KeyError was
+        # swallowed below as an unknown token: a TradingView alert, entry or
+        # exit, rejected for a strategy that exists.
+        strategy_id = _webhook_token_cache.get(digest, MISSING)
+        if strategy_id is not MISSING:
             if strategy_id is None:
                 return None
             return db_session.query(SmStrategy).filter_by(id=strategy_id).first()
 
+        generation = _webhook_token_cache.generation
         row = db_session.query(SmStrategy).filter_by(webhook_token_hash=digest).first()
-        _webhook_token_cache[digest] = row.id if row else None
+        _webhook_token_cache.fill(digest, row.id if row else None, generation)
         return row
     except Exception:
         logger.exception("Could not resolve a webhook token")
@@ -1107,7 +1199,7 @@ def get_strategy_by_webhook_token(token: str) -> SmStrategy | None:
 
 def clear_strategy_module_cache() -> None:
     """Drop the webhook lookup cache. Called on logout and session teardown."""
-    _webhook_token_cache.clear()
+    _webhook_token_cache.invalidate()
 
 
 # ---------------------------------------------------------------------------
@@ -1122,6 +1214,7 @@ def create_run(
     trigger_source: str = "manual",
     webhook_event_id: int | None = None,
     resolved_expiries: dict | None = None,
+    broker_account: str | None = None,
 ) -> SmStrategyRun | None:
     """Open a new run for a strategy."""
     try:
@@ -1129,6 +1222,7 @@ def create_run(
             strategy_id=strategy_id,
             mode=mode,
             broker=broker or "",
+            broker_account=broker_account or None,
             trigger_source=trigger_source,
             webhook_event_id=webhook_event_id,
             resolved_expiries=resolved_expiries,
@@ -1140,6 +1234,38 @@ def create_run(
         db_session.rollback()
         logger.exception("Could not create a run for strategy %s", strategy_id)
         return None
+
+
+def bind_run_broker(run_id: int, broker: str, broker_account: str | None) -> bool:
+    """Record the broker of a Live run that started without one. Says whether it did.
+
+    A signal run opened while no broker was logged in records its mode in place
+    of a broker, and its first Live order is what binds it. Conditional, so
+    only the first caller binds and a run that already has a broker keeps it:
+    two orders racing on an unbound run cannot bind it to two brokers.
+    """
+    if not broker:
+        return False
+    try:
+        updated = (
+            db_session.query(SmStrategyRun)
+            .filter(
+                SmStrategyRun.id == run_id,
+                SmStrategyRun.mode == "live",
+                SmStrategyRun.stopped_at.is_(None),
+                SmStrategyRun.broker.in_(UNBOUND_RUN_BROKERS),
+            )
+            .update(
+                {"broker": broker, "broker_account": broker_account or None},
+                synchronize_session=False,
+            )
+        )
+        db_session.commit()
+        return updated == 1
+    except Exception:
+        db_session.rollback()
+        logger.exception("Could not record the broker of run %s", run_id)
+        return False
 
 
 def finish_run(
@@ -1445,6 +1571,17 @@ def finish_unlinked_run_and_release_claim(
 
 def request_run_stop(run_id: int, reason: str) -> bool:
     """Persist a stop request while leaving the run active until it is flat."""
+    return record_run_stop_request(run_id, reason) is not None
+
+
+def record_run_stop_request(run_id: int, reason: str) -> str | None:
+    """Persist a stop request, and say whether this call is the one that made it.
+
+    Returns:
+        str | None: "new" when this call recorded the request, "existing" when
+        one was already recorded (a retry of a pending stop, or a second stop),
+        None when it could not be recorded.
+    """
     try:
         updated = (
             db_session.query(SmStrategyRun)
@@ -1465,7 +1602,7 @@ def request_run_stop(run_id: int, reason: str) -> bool:
         db_session.commit()
         db_session.expire_all()
         if updated == 1:
-            return True
+            return "new"
         existing = (
             db_session.query(SmStrategyRun.id)
             .filter(
@@ -1476,11 +1613,11 @@ def request_run_stop(run_id: int, reason: str) -> bool:
             )
             .first()
         )
-        return existing is not None
+        return "existing" if existing is not None else None
     except Exception:
         db_session.rollback()
         logger.exception("Could not request stop for run %s", run_id)
-        return False
+        return None
 
 
 def reopen_run_for_late_entry_fill(run_id: int) -> bool:
@@ -1591,6 +1728,10 @@ def realized_pnl_since(
     if cached is not None:
         return cached
 
+    # Read before the query: a run that finishes while this sum is in flight
+    # invalidates after its commit, and this total, which may leave that run
+    # out, is then returned to this tick but not cached for the next ones.
+    generation = _session_pnl_cache.generation
     try:
         query = db_session.query(SmStrategyRun.pnl_realized).filter(
             SmStrategyRun.strategy_id == strategy_id,
@@ -1599,7 +1740,7 @@ def realized_pnl_since(
         if exclude_run_id is not None:
             query = query.filter(SmStrategyRun.id != exclude_run_id)
         total = float(sum(float(row[0] or 0.0) for row in query.all()))
-        _session_pnl_cache[key] = total
+        _session_pnl_cache.fill(key, total, generation)
         return total
     except Exception:
         logger.exception("Could not total realized P&L for strategy %s", strategy_id)
@@ -2186,6 +2327,26 @@ def bind_order_acknowledgement(
             return "conflict"
 
     return "conflict"
+
+
+def first_dispatched_at(run_id: int) -> datetime | None:
+    """When the run's first order reached a broker (naive UTC), or None if none has.
+
+    An order counts once the broker gave it an id. Used to bind a run that sent
+    orders before it recorded its broker to the broker that took them.
+    """
+    try:
+        return (
+            db_session.query(func.min(SmStrategyOrder.placed_at))
+            .filter(
+                SmStrategyOrder.run_id == run_id,
+                SmStrategyOrder.broker_order_id.isnot(None),
+                SmStrategyOrder.broker_order_id != "",
+            )
+            .scalar()
+        )
+    finally:
+        db_session.remove()
 
 
 def list_orders(run_id: int) -> list[dict]:

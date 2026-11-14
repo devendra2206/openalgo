@@ -503,7 +503,7 @@ class FyersHSMWebSocket:
             # Store mapping
             self.subscriptions[topic_id] = topic_name
             self.logger.debug(f"Mapped topic_id {topic_id} -> {topic_name}")
-            self._token_last_seen[topic_name] = time.time()
+            self._stamp_token_seen(topic_name)
 
             # Parse based on topic type
             if topic_name.startswith("sf|"):
@@ -756,99 +756,58 @@ class FyersHSMWebSocket:
             field_count = struct.unpack("B", data[offset : offset + 1])[0]
             offset += 1
 
-            # Determine data type based on topic ID
-            if topic_id in self.subscriptions:
-                topic_name = self.subscriptions[topic_id]
-                self._token_last_seen[topic_name] = time.time()
-
-                if topic_name.startswith("sf|") and topic_id in self.scrips_data:
-                    # Update scrip data
-                    for index in range(field_count):
-                        if offset + 4 > len(data):
-                            break
-
-                        value = struct.unpack(">i", data[offset : offset + 4])[0]
-                        offset += 4
-
-                        if value != -2147483648 and index < len(self.DATA_FIELDS):
-                            old_value = self.scrips_data[topic_id].get(self.DATA_FIELDS[index])
-                            if old_value != value:
-                                self.scrips_data[topic_id][self.DATA_FIELDS[index]] = value
-
-                                # Send update to callback
-                                if self.on_message_callback:
-                                    update_data = self.scrips_data[topic_id].copy()
-                                    update_data["update_type"] = "live"
-                                    self.logger.debug(
-                                        f"Sending live update: {update_data.get('symbol', 'Unknown')} LTP={update_data.get('ltp', 'N/A')}"
-                                    )
-                                    self.on_message_callback(update_data)
-
-                elif topic_name.startswith("if|") and topic_id in self.index_data:
-                    # Update index data
-                    for index in range(field_count):
-                        if offset + 4 > len(data):
-                            break
-
-                        value = struct.unpack(">i", data[offset : offset + 4])[0]
-                        offset += 4
-
-                        if value != -2147483648 and index < len(self.INDEX_FIELDS):
-                            old_value = self.index_data[topic_id].get(self.INDEX_FIELDS[index])
-                            if old_value != value:
-                                self.index_data[topic_id][self.INDEX_FIELDS[index]] = value
-
-                                # Send update to callback
-                                if self.on_message_callback:
-                                    update_data = self.index_data[topic_id].copy()
-                                    update_data["update_type"] = "live"
-                                    self.on_message_callback(update_data)
-
-                elif topic_name.startswith("dp|") and topic_id in self.depth_data:
-                    # Update depth data
-                    for index in range(field_count):
-                        if offset + 4 > len(data):
-                            break
-
-                        value = struct.unpack(">i", data[offset : offset + 4])[0]
-                        offset += 4
-
-                        if value != -2147483648 and index < len(self.DEPTH_FIELDS):
-                            old_value = self.depth_data[topic_id].get(self.DEPTH_FIELDS[index])
-                            if old_value != value:
-                                self.depth_data[topic_id][self.DEPTH_FIELDS[index]] = value
-
-                                # Send update to callback
-                                if self.on_message_callback:
-                                    update_data = self.depth_data[topic_id].copy()
-                                    update_data["update_type"] = "live"
-                                    self.logger.debug(
-                                        f"Sending live depth update: {update_data.get('symbol', 'Unknown')}"
-                                    )
-                                    self.on_message_callback(update_data)
-                else:
-                    # TEMP-DEBUG (2026-07-30, PriceStream/NIFTY.NSE_INDEX
-                    # staleness investigation): topic_id IS a known
-                    # subscription (a frame for it genuinely arrived at the
-                    # wire), but none of the sf|/if|/dp| + snapshot-dict-
-                    # membership conditions matched -- meaning this token's
-                    # initial snapshot was never successfully parsed into
-                    # scrips_data/index_data/depth_data. Every update frame
-                    # for it from here on is silently dropped with NO log
-                    # anywhere in the previous code -- this is the exact
-                    # "ticks arrive at the wire but never reach anything
-                    # above this layer" mechanism the investigation is
-                    # trying to catch. Remove once root cause is
-                    # confirmed/fixed.
-                    self.logger.warning(
-                        f"[DEBUG-TEMP] update frame for known topic_id={topic_id} "
-                        f"(topic_name={topic_name}) has no matching snapshot data "
-                        f"structure -- initial snapshot for this token was likely "
-                        f"never parsed successfully. This update is being dropped."
-                    )
+            # Pick the stored state this topic updates
+            topic_name = self.subscriptions.get(topic_id, "")
+            if topic_name:
+                # Fork (150da4a3f): per-token last-seen stamp for
+                # _log_stale_tokens(), taken before any dispatch.
+                self._stamp_token_seen(topic_name)
+            if topic_name.startswith("sf|"):
+                store, fields = self.scrips_data, self.DATA_FIELDS
+            elif topic_name.startswith("if|"):
+                store, fields = self.index_data, self.INDEX_FIELDS
+            elif topic_name.startswith("dp|"):
+                store, fields = self.depth_data, self.DEPTH_FIELDS
             else:
-                # Skip unknown data
-                offset += field_count * 4
+                store, fields = None, ()
+
+            state = store.get(topic_id) if store is not None else None
+            if state is None:
+                if topic_name:
+                    # Fork (150da4a3f): a known subscription whose initial
+                    # snapshot was never parsed -- every update for it is
+                    # dropped here, so say so instead of dropping silently.
+                    self.logger.warning(
+                        f"Update frame for known topic_id={topic_id} "
+                        f"(topic_name={topic_name}) has no snapshot data; dropped."
+                    )
+                # Unknown topic, or no snapshot yet: skip its fields
+                return offset + field_count * 4
+
+            # An update frame is one incremental change to the scrip. Apply
+            # every field first and send the merged state once, as the
+            # official SDK does. Sending after each field published the new
+            # LTP with the previous tick's volume, bid and ask (issue #2318).
+            changed = False
+            for index in range(field_count):
+                if offset + 4 > len(data):
+                    break
+
+                value = struct.unpack(">i", data[offset : offset + 4])[0]
+                offset += 4
+
+                if value != -2147483648 and index < len(fields):
+                    if state.get(fields[index]) != value:
+                        state[fields[index]] = value
+                        changed = True
+
+            if changed and self.on_message_callback:
+                update_data = state.copy()
+                update_data["update_type"] = "live"
+                self.logger.debug(
+                    f"Sending live update: {update_data.get('symbol', 'Unknown')} LTP={update_data.get('ltp', 'N/A')}"
+                )
+                self.on_message_callback(update_data)
 
         except Exception as e:
             self.logger.error(f"Error parsing update data: {e}")
@@ -1132,6 +1091,13 @@ class FyersHSMWebSocket:
                 break
 
         self.logger.debug("HSM health check loop exited")
+
+    def _stamp_token_seen(self, topic_name: str) -> None:
+        """Fork diagnostic: when a frame for this HSM token was last parsed.
+        Tolerates a parser built without __init__ (upstream's own test
+        fixtures use __new__), so the diagnostic can never break parsing."""
+        seen = self.__dict__.setdefault("_token_last_seen", {})
+        seen[topic_name] = time.time()
 
     def _log_stale_tokens(self):
         """

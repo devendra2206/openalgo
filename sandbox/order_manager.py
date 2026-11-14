@@ -12,12 +12,14 @@ Features:
 
 import os
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
 from decimal import Decimal
 
 import pytz
+from sqlalchemy import null, update
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,11 +28,39 @@ from database.sandbox_db import SandboxOrders, SandboxPositions, SandboxTrades, 
 from database.symbol import SymToken
 from database.token_db import get_symbol_info
 from sandbox.fund_manager import FundManager
+from sandbox.position_locks import holds_position_lock
 from utils.constants import VALID_EXCHANGES
 from utils.logging import get_logger
 from utils.symbol_utils import is_future, is_option
 
 logger = get_logger(__name__)
+
+#: Statuses an order can still be modified or cancelled from. Both are
+#: conditional UPDATEs on this set, as the engine's fill claim is, so a fill,
+#: a cancel and a modify can never all act on the same resting order.
+_PENDING_STATUSES = ("open", "trigger pending")
+
+# The last order id this process issued, as its IST day and eight-digit
+# sequence. Process-wide, not per OrderManager: every request builds its own
+# manager, and the id has to be unique across all of them. The lock covers
+# only this bookkeeping; like the other sandbox locks it is green under
+# eventlet, where real threads reach sandbox code through run_on_hub.
+_order_id_lock = threading.Lock()
+_last_order_day = None
+_last_order_seq = -1
+
+
+def _order_position(manager, order_data, *args, **kwargs):
+    """The position an order acts on, or None when the order does not name one."""
+    try:
+        symbol = order_data["symbol"]
+        exchange = order_data["exchange"]
+        product = order_data["product"]
+    except (KeyError, TypeError):
+        return None
+    if not symbol or not isinstance(exchange, str) or not isinstance(product, str):
+        return None
+    return (manager.user_id, exchange, symbol, product)
 
 
 class OrderManager:
@@ -40,6 +70,10 @@ class OrderManager:
         self.user_id = user_id
         self.fund_manager = FundManager(user_id)
 
+    # Held from the first read of the position (the CNC sell check, the margin
+    # netting) through the order's commit and any immediate fill, so a second
+    # order on the same position decides on what this one left behind.
+    @holds_position_lock(_order_position)
     def place_order(self, order_data, prefetched_quote=None):
         """
         Place a new order in sandbox mode
@@ -550,11 +584,17 @@ class OrderManager:
                             400,
                         )
 
-                    # Block margin
-                    success, block_msg = self.fund_manager.block_margin(
+                    # Staged, not committed: the margin lands in the order's own
+                    # commit below, or not at all. block_margin committed here,
+                    # so anything failing before the order row was written (an
+                    # id clash on the insert, a database error) was rolled back
+                    # by the handler while the margin stayed blocked, with no
+                    # order to release it. The GTT paths stage the same way.
+                    success, block_msg = self.fund_manager.stage_margin_delta(
                         actual_margin_to_block, f"Order: {symbol} {action} {quantity}"
                     )
                     if not success:
+                        db_session.rollback()
                         return (
                             False,
                             {"status": "error", "message": block_msg, "mode": "analyze"},
@@ -606,7 +646,7 @@ class OrderManager:
                     filled_quantity=0,
                     pending_quantity=0,
                     rejection_reason=cnc_sell_rejection_reason,
-                    margin_blocked=Decimal("0"),  # No margin blocked for rejected orders
+                    margin_blocked=Decimal("0"),  # Rejected orders never release margin
                     # Deliberately NOT correlated to the GTT leg. The column is
                     # unique and recovery reads it as proof the GTT fired, so a
                     # rejected attempt claiming it would both mark the GTT
@@ -672,7 +712,13 @@ class OrderManager:
                 filled_quantity=0,
                 pending_quantity=quantity,
                 rejection_reason=None,
-                margin_blocked=actual_margin_to_block,  # Store exact margin blocked
+                # NULL is an explicit zero reservation; migrated legacy rows
+                # have 0.00 and still use the recalculation fallback.
+                # Use SQL NULL explicitly so the mapped Python default does not
+                # replace the zero-reservation sentinel with 0.00.
+                margin_blocked=(
+                    actual_margin_to_block if actual_margin_to_block > 0 else null()
+                ),
                 gtt_leg_id=order_data.get("gtt_leg_id"),
                 order_timestamp=datetime.now(pytz.timezone("Asia/Kolkata")),
             )
@@ -746,9 +792,7 @@ class OrderManager:
                         else:
                             # MARKET order: process normally (fills at bid/ask or LTP)
                             exec_engine._process_order(order, cached_quote)
-                            logger.info(
-                                f"Market order {orderid} executed immediately"
-                            )
+                            logger.info(f"Market order {orderid} executed immediately")
                     else:
                         logger.warning(
                             f"Could not fetch quote for {symbol} on {exchange}, order remains open"
@@ -766,13 +810,16 @@ class OrderManager:
             if order.order_status in ("open", "trigger pending"):
                 try:
                     from sandbox.websocket_execution_engine import (
-                        get_websocket_execution_engine,
                         is_websocket_execution_engine_running,
+                        peek_websocket_execution_engine,
                     )
 
                     if is_websocket_execution_engine_running():
-                        ws_engine = get_websocket_execution_engine()
-                        ws_engine.notify_order_placed(order)
+                        # peek: an engine stopped since the check is not
+                        # recreated just to be told about this order.
+                        ws_engine = peek_websocket_execution_engine()
+                        if ws_engine is not None:
+                            ws_engine.notify_order_placed(order)
                 except Exception as e:
                     logger.debug(f"WebSocket execution engine notification skipped: {e}")
 
@@ -824,12 +871,22 @@ class OrderManager:
                     400,
                 )
 
-            # Update order parameters
+            # Work out the new parameters. Nothing is written until all of them
+            # are valid, and then only while the order is still pending.
+            changes = {}
             if "quantity" in new_data:
                 new_quantity = int(new_data["quantity"])
                 # Validate lot size (from cache)
                 symbol_obj = get_symbol_info(order.symbol, order.exchange)
-                if symbol_obj and order.exchange in ["NFO", "BFO", "CDS", "BCD", "MCX", "NCDEX", "CRYPTO"]:
+                if symbol_obj and order.exchange in [
+                    "NFO",
+                    "BFO",
+                    "CDS",
+                    "BCD",
+                    "MCX",
+                    "NCDEX",
+                    "CRYPTO",
+                ]:
                     lot_size = symbol_obj.lotsize or 1
                     if new_quantity % lot_size != 0:
                         return (
@@ -841,8 +898,8 @@ class OrderManager:
                             },
                             400,
                         )
-                order.quantity = new_quantity
-                order.pending_quantity = new_quantity
+                changes["quantity"] = new_quantity
+                changes["pending_quantity"] = new_quantity
 
             # Only accept the fields that apply to this order's price_type:
             #   MARKET -> none, LIMIT -> price, SL -> price+trigger, SL-M -> trigger
@@ -860,7 +917,7 @@ class OrderManager:
                         },
                         400,
                     )
-                order.price = Decimal(str(new_data["price"]))
+                changes["price"] = Decimal(str(new_data["price"]))
 
             if "trigger_price" in new_data and new_data["trigger_price"]:
                 if not allows_trigger:
@@ -873,9 +930,37 @@ class OrderManager:
                         },
                         400,
                     )
-                order.trigger_price = Decimal(str(new_data["trigger_price"]))
+                changes["trigger_price"] = Decimal(str(new_data["trigger_price"]))
 
-            order.update_timestamp = datetime.now(pytz.timezone("Asia/Kolkata"))
+            # Write only what actually changes, as the ORM's flush did, and only
+            # while the order still rests: a fill or cancel that landed since it
+            # was read wins, instead of this write quietly changing the terms of
+            # an order that has already left the book.
+            values = {
+                name: value for name, value in changes.items() if value != getattr(order, name)
+            }
+            values["update_timestamp"] = datetime.now(pytz.timezone("Asia/Kolkata"))
+            modified = db_session.execute(
+                update(SandboxOrders)
+                .where(
+                    SandboxOrders.id == order.id,
+                    SandboxOrders.order_status.in_(_PENDING_STATUSES),
+                )
+                .values(**values),
+                execution_options={"synchronize_session": False},
+            )
+            if modified.rowcount != 1:
+                db_session.rollback()
+                db_session.refresh(order)
+                return (
+                    False,
+                    {
+                        "status": "error",
+                        "message": f"Cannot modify order in {order.order_status} status",
+                        "mode": "analyze",
+                    },
+                    400,
+                )
 
             db_session.commit()
 
@@ -941,22 +1026,47 @@ class OrderManager:
                     400,
                 )
 
-            # Update order status
-            order.order_status = "cancelled"
-            order.update_timestamp = datetime.now(pytz.timezone("Asia/Kolkata"))
+            # What to release is worked out before the status changes: the
+            # fallback below can fetch a quote, and the cancel itself holds the
+            # database's write lock until it commits.
+            release_amount = None
+            release_note = None
 
-            # Release blocked margin using the exact amount that was blocked
-            if (
-                hasattr(order, "margin_blocked")
-                and order.margin_blocked
-                and order.margin_blocked > 0
-            ):
-                self.fund_manager.release_margin(
-                    order.margin_blocked, 0, f"Order cancelled: {orderid}"
+            # New zero reservations are stored as NULL; old migrations used
+            # zero as the column default, so those rows still need fallback.
+            recorded_amount = getattr(order, "margin_blocked", None)
+            has_recorded_margin = hasattr(order, "margin_blocked") and (
+                recorded_amount is None or recorded_amount > 0
+            )
+
+            # Rows created before the NULL sentinel can still be recognized as
+            # no-margin closes while their position is open. Other legacy zeros
+            # use the recalculation fallback.
+            if not has_recorded_margin and recorded_amount == 0:
+                position = SandboxPositions.query.filter_by(
+                    user_id=self.user_id,
+                    symbol=order.symbol,
+                    exchange=order.exchange,
+                    product=order.product,
+                ).first()
+                has_recorded_margin = bool(
+                    position
+                    and position.quantity != 0
+                    and order.quantity <= abs(position.quantity)
+                    and (
+                        (position.quantity > 0 and order.action == "SELL")
+                        or (position.quantity < 0 and order.action == "BUY")
+                    )
                 )
-                logger.info(
-                    f"Released margin ₹{order.margin_blocked} for cancelled order {orderid}"
-                )
+
+            if has_recorded_margin:
+                if recorded_amount and recorded_amount > 0:
+                    release_amount = recorded_amount
+                    release_note = (
+                        f"Released margin ₹{recorded_amount} for cancelled order {orderid}"
+                    )
+                else:
+                    release_note = f"No margin to release for cancelled order {orderid}"
             else:
                 # Fallback for old orders without margin_blocked field
                 # Need to recalculate margin that was blocked based on order parameters
@@ -1010,18 +1120,67 @@ class OrderManager:
                                 order.action,
                             )
                             if margin_blocked:
-                                self.fund_manager.release_margin(
-                                    margin_blocked, 0, f"Order cancelled: {orderid}"
-                                )
-                                logger.info(
-                                    f"Released calculated margin ₹{margin_blocked} for cancelled order {orderid}"
-                                )
+                                release_amount = margin_blocked
+                                release_note = f"Released calculated margin ₹{margin_blocked} for cancelled order {orderid}"
                     else:
-                        logger.info(
-                            f"No margin to release for cancelled order {orderid} ({order.action} {order.product})"
-                        )
+                        release_note = f"No margin to release for cancelled order {orderid} ({order.action} {order.product})"
+
+            # The cancel is one conditional UPDATE: it happens only if the order
+            # still rests. Cancelling from a copy let two cancels (the user and
+            # the square-off job, cancel-all and a single cancel) both release
+            # the margin, and a cancel racing a fill release margin the new
+            # position still held.
+            cancelled = db_session.execute(
+                update(SandboxOrders)
+                .where(
+                    SandboxOrders.id == order.id,
+                    SandboxOrders.order_status.in_(_PENDING_STATUSES),
+                )
+                .values(
+                    order_status="cancelled",
+                    update_timestamp=datetime.now(pytz.timezone("Asia/Kolkata")),
+                ),
+                execution_options={"synchronize_session": False},
+            )
+            if cancelled.rowcount != 1:
+                db_session.rollback()
+                db_session.refresh(order)
+                return (
+                    False,
+                    {
+                        "status": "error",
+                        "message": f"Cannot cancel order in {order.order_status} status",
+                        "mode": "analyze",
+                    },
+                    400,
+                )
+
+            # Stage the release in the same transaction as the cancel claim.
+            # release_margin() commits or rolls back on its own, so calling it
+            # here could undo the claim and still let this method report 200.
+            if release_amount is not None:
+                released, reason = self.fund_manager.stage_release_margin(
+                    release_amount, 0, f"Order cancelled: {orderid}", log=False
+                )
+                if not released:
+                    db_session.rollback()
+                    return (
+                        False,
+                        {
+                            "status": "error",
+                            "message": (
+                                f"Cannot cancel order: {reason}. The order remains open; "
+                                "check its status before trying again."
+                            ),
+                            "mode": "analyze",
+                        },
+                        409,
+                    )
 
             db_session.commit()
+
+            if release_note:
+                logger.info(release_note)
 
             logger.info(f"Order cancelled: {orderid}")
 
@@ -1301,26 +1460,43 @@ class OrderManager:
 
     def _generate_order_id(self):
         """
-        Generate unique order ID in format: YYMMDD + 8-digit unique sequence
-        Example: 25100112345678 (Year 2025, Oct 1st, unique sequence)
+        Generate unique order ID in format: YYMMDD + 8-digit sequence
+        Example: 26101250400000 (Year 2026, Oct 12th, 14:00:00.000 IST)
 
-        Uses microsecond timestamp + random component to avoid race conditions
-        when multiple orders are placed in parallel.
+        The sequence is the millisecond of the IST day (at most 86,399,999, so
+        it fits in eight digits), raised to one past the last id this process
+        issued, so two orders in the same millisecond still differ. An id
+        already stored is skipped, which covers a restart and the random ids
+        the previous scheme issued earlier the same day.
+
+        The previous scheme combined the microsecond field with a random number
+        from 0 to 99. The hour, minute and second never reached the id, so every
+        order on a day drew from the same hundred million values, and a clash
+        failed the insert after the order's margin was already blocked.
         """
-        import random
+        global _last_order_day, _last_order_seq
 
         now = datetime.now(pytz.timezone("Asia/Kolkata"))
         date_prefix = now.strftime("%y%m%d")  # YYMMDD format
+        ms_of_day = (
+            now.hour * 3600 + now.minute * 60 + now.second
+        ) * 1000 + now.microsecond // 1000
 
-        # Use microseconds (0-999999) + random (0-99) for 8-digit unique sequence
-        # This avoids race conditions when parallel orders query count simultaneously
-        micro = now.microsecond
-        rand_suffix = random.randint(0, 99)
+        while True:
+            with _order_id_lock:
+                if _last_order_day != date_prefix:
+                    _last_order_day = date_prefix
+                    _last_order_seq = -1
+                _last_order_seq = max(ms_of_day, _last_order_seq + 1)
+                orderid = f"{date_prefix}{_last_order_seq:08d}"
 
-        # Combine: first 6 digits from microseconds, last 2 from random
-        sequence = f"{micro:06d}{rand_suffix:02d}"
-
-        return f"{date_prefix}{sequence}"
+            # Outside the lock: no other thread can be handed this id, and the
+            # lookup is the only I/O. The orderid column is uniquely indexed.
+            taken = (
+                db_session.query(SandboxOrders.id).filter(SandboxOrders.orderid == orderid).first()
+            )
+            if taken is None:
+                return orderid
 
     def _calculate_order_statistics(self, orders):
         """Calculate order statistics matching broker API format"""

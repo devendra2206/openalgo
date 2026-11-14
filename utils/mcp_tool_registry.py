@@ -30,6 +30,7 @@ Drift check:
 
 from __future__ import annotations
 
+import threading
 from typing import Callable, Iterable
 
 from utils.logging import get_logger
@@ -76,10 +77,16 @@ TOOL_SCOPES: dict[str, str] = {
     "get_funds": SCOPE_READ_ACCOUNT,
     "calculate_margin": SCOPE_READ_ACCOUNT,
     "analyzer_status": SCOPE_READ_ACCOUNT,
-    # send_telegram_alert is account-scoped because the receiving channel
-    # is the account owner's bot. No order placement, but it has a real
-    # external side effect.
+    # The alert tools are account-scoped because each delivers only to a
+    # destination the account owner set up: their own Telegram bot, or the
+    # Slack or Discord webhook they saved and switched on at /alerts. No
+    # order placement, but each has a real external side effect, which the
+    # read:account consent text names. The Slack and Discord channels may
+    # have other readers, which is why both refuse unless the owner has
+    # switched them on, and why the notify endpoint caps them at 30 a minute.
     "send_telegram_alert": SCOPE_READ_ACCOUNT,
+    "send_slack_alert": SCOPE_READ_ACCOUNT,
+    "send_discord_alert": SCOPE_READ_ACCOUNT,
     # ---- Market data ----
     "get_quote": SCOPE_READ_MARKET,
     "get_multi_quotes": SCOPE_READ_MARKET,
@@ -120,7 +127,7 @@ TOOL_SCOPES: dict[str, str] = {
 # Tools that change something but are deliberately not write-scoped.
 # Every entry is a tool a read-only token can still trigger, so each one
 # needs a justification next to its TOOL_SCOPES entry above.
-WRITE_SCOPE_EXCEPTIONS = {"send_telegram_alert"}
+WRITE_SCOPE_EXCEPTIONS = {"send_telegram_alert", "send_slack_alert", "send_discord_alert"}
 
 
 def required_scope(tool_name: str) -> str | None:
@@ -168,6 +175,15 @@ def list_tools_for_scopes(granted_scopes: Iterable[str]) -> list[str]:
     )
 
 
+#: Serialises the one-time load of mcp/mcpserver.py. Two first MCP requests
+#: arriving together (initialize and tools/list) used to execute the file
+#: twice, replacing sys.modules["openalgo_mcp_server"] under the first and
+#: building duplicate SDK clients and tool registrations. A plain stdlib lock,
+#: green under eventlet: only request code loads the module, and the load is
+#: file I/O and imports, which must not hold a real lock under the hub.
+_mcpserver_load_lock = threading.Lock()
+
+
 def _load_mcpserver_module():
     """Load ``mcp/mcpserver.py`` directly by file path.
 
@@ -175,15 +191,24 @@ def _load_mcpserver_module():
     ``__init__.py``) and the pip-installed ``mcp`` package shadows the
     name in normal imports. To reach our tool definitions we therefore
     resolve the file by path and load it through ``importlib.util``.
-    Cached on the function attribute so repeat calls are free.
+    Cached on the function attribute so repeat calls are free, and loaded
+    by exactly one caller.
     """
-    import importlib.util
-    import os
-    import sys
-
     cached = getattr(_load_mcpserver_module, "_module", None)
     if cached is not None:
         return cached
+    with _mcpserver_load_lock:
+        cached = getattr(_load_mcpserver_module, "_module", None)
+        if cached is not None:
+            return cached
+        return _load_mcpserver_module_locked()
+
+
+def _load_mcpserver_module_locked():
+    """The load behind _load_mcpserver_module. Call with its lock held."""
+    import importlib.util
+    import os
+    import sys
 
     # This file lives at <project>/utils/mcp_tool_registry.py; the MCP
     # entry point lives at <project>/mcp/mcpserver.py. Walk up + over.

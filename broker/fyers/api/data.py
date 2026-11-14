@@ -9,6 +9,7 @@ import pandas as pd
 
 from broker.fyers.api.rate_limiter import MAX_RETRIES, apply_rate_limit, retry_delay_from_headers
 from database.token_db import get_br_symbol, get_oa_symbol
+from utils.broker_backpressure import BrokerBusyError
 from utils.constants import FNO_EXCHANGES
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
@@ -77,6 +78,12 @@ def get_api_response(endpoint, auth, method="GET", payload="", _retry_count=0):
         logger.debug(f"API response: {json.dumps(response_data, indent=2)}")
         return response_data
 
+    except BrokerBusyError:
+        # Refused by the rate limiter under the gthread worker and never
+        # sent. Raise it with its sentence for the trader rather than fold it
+        # into an error body: a position read answered that way reads as no
+        # position, and a smart order would size itself against it.
+        raise
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 429 and _retry_count < MAX_RETRIES:
             delay = retry_delay_from_headers(e.response.headers, _retry_count)
@@ -176,6 +183,8 @@ class BrokerData:
                 "oi": int(depth_data.get("oi", 0)),
             }
 
+        except BrokerBusyError:
+            raise
         except Exception as e:
             logger.exception(f"Error fetching quotes for {exchange}:{symbol}")
             raise Exception(f"Error fetching quotes: {e}")
@@ -236,6 +245,8 @@ class BrokerData:
                 # Single batch processing
                 return self._process_quotes_batch(symbols, fetch_oi=fetch_oi)
 
+        except BrokerBusyError:
+            raise
         except Exception as e:
             logger.exception("Error fetching multiquotes")
             raise Exception(f"Error fetching multiquotes: {e}")
@@ -254,7 +265,14 @@ class BrokerData:
         Returns 0 on any error so a single bad symbol doesn't fail the batch.
         """
         encoded = urllib.parse.quote(br_symbol)
-        response = get_api_response(f"/data/depth?symbol={encoded}&ohlcv_flag=1", self.auth_token)
+        try:
+            response = get_api_response(
+                f"/data/depth?symbol={encoded}&ohlcv_flag=1", self.auth_token
+            )
+        except BrokerBusyError:
+            # As for any other failure here: the quote stands, its OI is 0.
+            logger.debug(f"Depth fetch for OI refused by the rate limiter for {br_symbol}")
+            return 0
 
         if response.get("s") != "ok":
             logger.debug(
@@ -456,159 +474,123 @@ class BrokerData:
             else:
                 chunk_days = 60  # For minute/hour data
 
-            # Process data in chunks
+            # Process data in chunks. Each chunk is requested once (#2422):
+            # get_api_response already retries HTTP 429 (honouring Retry-After)
+            # and the shared HTTP client resends a read after a dropped
+            # connection. Any other reply -- no_data, a bad symbol, a rejected
+            # token -- comes back the same when asked again, so retrying it
+            # only cost 2 + 4 + 6 + 1 s per chunk and used up the rate limit.
             current_start = start_dt
-            retry_count = 0
-            max_retries = 3
 
             while current_start <= end_dt:
-                try:
-                    # Calculate chunk end date
-                    current_end = min(current_start + pd.Timedelta(days=chunk_days - 1), end_dt)
+                # Calculate chunk end date
+                current_end = min(current_start + pd.Timedelta(days=chunk_days - 1), end_dt)
 
-                    # Format dates for API call
-                    chunk_start = current_start.strftime("%Y-%m-%d")
-                    chunk_end = current_end.strftime("%Y-%m-%d")
+                # Format dates for API call
+                chunk_start = current_start.strftime("%Y-%m-%d")
+                chunk_end = current_end.strftime("%Y-%m-%d")
 
-                    logger.debug(
-                        f"Fetching {resolution} data for {exchange}:{br_symbol} from {chunk_start} to {chunk_end}"
+                logger.debug(
+                    f"Fetching {resolution} data for {exchange}:{br_symbol} from {chunk_start} to {chunk_end}"
+                )
+
+                # URL encode the symbol to handle special characters
+                encoded_symbol = urllib.parse.quote(br_symbol)
+
+                # Determine if OI flag should be enabled based on exchange
+                # OI is only available for derivatives (NFO, BFO, MCX, CDS)
+                derivative_exchanges = ["NFO", "BFO", "MCX", "CDS"]
+                enable_oi = exchange in derivative_exchanges
+
+                # Construct endpoint with query parameters
+                endpoint = (
+                    f"/data/history?"
+                    f"symbol={encoded_symbol}&"
+                    f"resolution={resolution}&"
+                    f"date_format=1&"  # Keep epoch format
+                    f"range_from={chunk_start}&"
+                    f"range_to={chunk_end}&"
+                    f"cont_flag=1"
+                )  # For continuous data
+
+                # Add OI flag only for derivatives
+                if enable_oi:
+                    endpoint += "&oi_flag=1"
+
+                logger.debug(f"Making request to endpoint: {endpoint}")
+                response = get_api_response(endpoint, self.auth_token)
+                status = response.get("s")
+
+                if status == "no_data":
+                    # Nothing traded in this window: a weekend or holiday, or
+                    # dates before the symbol was listed. An empty chunk, not
+                    # a failure.
+                    logger.debug(f"No data available for period {chunk_start} to {chunk_end}")
+                    current_start = current_end + pd.Timedelta(days=1)
+                    continue
+
+                if status != "ok":
+                    # A failed chunk is reported, never skipped: skipping it
+                    # returned whatever the other chunks held (or nothing) as
+                    # a success, so a rejected token or a bad symbol read as
+                    # "no candles".
+                    reason = response.get("message") or "Fyers gave no reason"
+                    logger.error(
+                        f"Fyers history failed for {br_symbol} {resolution} "
+                        f"{chunk_start} to {chunk_end}: s={status!r} "
+                        f"code={response.get('code')!r} message={reason!r}"
+                    )
+                    raise Exception(
+                        f"Fyers did not return candles for {chunk_start} to {chunk_end}: {reason}"
                     )
 
-                    # URL encode the symbol to handle special characters
-                    encoded_symbol = urllib.parse.quote(br_symbol)
-
-                    # Determine if OI flag should be enabled based on exchange
-                    # OI is only available for derivatives (NFO, BFO, MCX, CDS)
-                    derivative_exchanges = ["NFO", "BFO", "MCX", "CDS"]
-                    enable_oi = exchange in derivative_exchanges
-
-                    # Construct endpoint with query parameters
-                    endpoint = (
-                        f"/data/history?"
-                        f"symbol={encoded_symbol}&"
-                        f"resolution={resolution}&"
-                        f"date_format=1&"  # Keep epoch format
-                        f"range_from={chunk_start}&"
-                        f"range_to={chunk_end}&"
-                        f"cont_flag=1"
-                    )  # For continuous data
-
-                    # Add OI flag only for derivatives
-                    if enable_oi:
-                        endpoint += "&oi_flag=1"
-
-                    logger.debug(f"Making request to endpoint: {endpoint}")
-                    response = get_api_response(endpoint, self.auth_token)
-
-                    if response.get("s") != "ok":
-                        error_msg = response.get("message", "Unknown error")
-                        # Log the full response, not just `message` -- Fyers
-                        # can return s="no_data"/other non-"ok" statuses with
-                        # an EMPTY message (seen in production, 2026-08-03:
-                        # NIFTY.NSE_INDEX history repeatedly came back with a
-                        # blank message while quotes/LTP for the same symbol
-                        # worked fine), leaving nothing to diagnose from
-                        # after the fact. `code`/`s` are the fields worth
-                        # having when `message` is blank.
-                        logger.error(
-                            f"Error for chunk {chunk_start} to {chunk_end} "
-                            f"({exchange}:{br_symbol}, resolution={resolution}): "
-                            f"s={response.get('s')!r} code={response.get('code')!r} "
-                            f"message={error_msg!r} full_response={response}"
-                        )
-
-                        if retry_count < max_retries:
-                            retry_count += 1
-                            logger.debug(f"Retrying... Attempt {retry_count} of {max_retries}")
-                            time.sleep(2 * retry_count)  # Exponential backoff
-                            continue
-
-                        # If max retries reached, move to next chunk
-                        retry_count = 0
-                        current_start = current_end + pd.Timedelta(days=1)
-                        time.sleep(1)
-                        continue
-
-                    # Reset retry count on success
-                    retry_count = 0
-
-                    # Get candles from response
-                    candles = response.get("candles", [])
-                    if candles:
-                        # Handle dynamic column count based on whether OI is enabled
-                        if enable_oi and len(candles[0]) == 7:
-                            # Derivatives with OI: [timestamp, open, high, low, close, volume, oi]
-                            df = pd.DataFrame(
-                                candles,
-                                columns=[
-                                    "timestamp",
-                                    "open",
-                                    "high",
-                                    "low",
-                                    "close",
-                                    "volume",
-                                    "oi",
-                                ],
-                            )
-                        else:
-                            # Equity without OI: [timestamp, open, high, low, close, volume]
-                            df = pd.DataFrame(
-                                candles,
-                                columns=["timestamp", "open", "high", "low", "close", "volume"],
-                            )
-                            # Add zero OI column for consistency
-                            df["oi"] = 0
-
-                        dfs.append(df)
-                        logger.debug(
-                            f"Got {len(candles)} candles for period {chunk_start} to {chunk_end}"
+                # Get candles from response
+                candles = response.get("candles", [])
+                if candles:
+                    # Handle dynamic column count based on whether OI is enabled
+                    if enable_oi and len(candles[0]) == 7:
+                        # Derivatives with OI: [timestamp, open, high, low, close, volume, oi]
+                        df = pd.DataFrame(
+                            candles,
+                            columns=["timestamp", "open", "high", "low", "close", "volume", "oi"],
                         )
                     else:
-                        # Was logger.debug (invisible at normal log levels) --
-                        # this is a genuinely successful Fyers response
-                        # (s="ok") with zero candles, a DIFFERENT case from
-                        # the s!="ok" error branch above. Confirmed in
-                        # production 2026-08-03: NIFTY.NSE_INDEX history
-                        # requests came back "ok" with empty candles while a
-                        # manual request for the identical symbol/exchange/
-                        # resolution/date-range, made moments apart,
-                        # returned real data -- with this at debug level,
-                        # that was completely invisible in the logs; only
-                        # the downstream "history() returned no data"
-                        # symptom in the calling strategy/service was ever
-                        # seen. Raised to warning so the next occurrence is
-                        # actually visible without enabling debug logging.
-                        logger.warning(
-                            f"No candles for period {chunk_start} to {chunk_end} "
-                            f"({exchange}:{br_symbol}, resolution={resolution}) -- "
-                            f"Fyers responded s={response.get('s')!r} (a successful "
-                            f"status) but with an empty candles list."
+                        # Equity without OI: [timestamp, open, high, low, close, volume]
+                        df = pd.DataFrame(
+                            candles,
+                            columns=["timestamp", "open", "high", "low", "close", "volume"],
                         )
+                        # Add zero OI column for consistency
+                        df["oi"] = 0
 
-                    # No inter-chunk sleep here: get_api_response already paces
-                    # every Fyers call through the process-wide apply_rate_limit
-                    # (125ms spacing) and honours Retry-After on 429s. The old
-                    # unconditional 0.5s sleep ran even after the LAST chunk,
-                    # putting a half-second floor under every history request --
-                    # a single-chunk intraday fetch spent 500ms sleeping on
-                    # 184ms of actual HTTP.
+                    dfs.append(df)
+                    logger.debug(
+                        f"Got {len(candles)} candles for period {chunk_start} to {chunk_end}"
+                    )
+                else:
+                    # Fork (6ad5eb871): warning, not debug. A successful Fyers
+                    # response (s="ok") with zero candles is a different case
+                    # from s="no_data" above. Seen in production 2026-08-03:
+                    # NIFTY.NSE_INDEX history came back "ok" with empty candles
+                    # while a manual request moments later returned real data;
+                    # at debug level that was invisible in the logs.
+                    logger.warning(
+                        f"No candles for period {chunk_start} to {chunk_end} "
+                        f"({exchange}:{br_symbol}, resolution={resolution}) -- "
+                        f"Fyers responded s={status!r} (a successful "
+                        f"status) but with an empty candles list."
+                    )
 
-                    # Move to next chunk
-                    current_start = current_end + pd.Timedelta(days=1)
+                # No inter-chunk sleep here: get_api_response already paces
+                # every Fyers call through the process-wide apply_rate_limit
+                # (125ms spacing) and honours Retry-After on 429s. The old
+                # unconditional 0.5s sleep ran even after the LAST chunk,
+                # putting a half-second floor under every history request --
+                # a single-chunk intraday fetch spent 500ms sleeping on
+                # 184ms of actual HTTP.
 
-                except Exception as e:
-                    logger.error(f"Error fetching chunk {chunk_start} to {chunk_end}: {e}")
-                    if retry_count < max_retries:
-                        retry_count += 1
-                        logger.debug(f"Retrying... Attempt {retry_count} of {max_retries}")
-                        time.sleep(2 * retry_count)
-                        continue
-
-                    # If max retries reached, move to next chunk
-                    retry_count = 0
-                    current_start = current_end + pd.Timedelta(days=1)
-                    time.sleep(1)
-                    continue
+                # Move to next chunk
+                current_start = current_end + pd.Timedelta(days=1)
 
             # If no data was found, return empty DataFrame
             if not dfs:
@@ -626,6 +608,8 @@ class BrokerData:
             logger.info(f"Successfully collected data: {len(final_df)} total candles")
             return final_df
 
+        except BrokerBusyError:
+            raise
         except Exception as e:
             error_msg = f"Error fetching historical data for {exchange}:{symbol}"
             logger.exception(error_msg)
@@ -764,6 +748,8 @@ class BrokerData:
                 "oi": int(depth_data.get("oi", 0)),
             }
 
+        except BrokerBusyError:
+            raise
         except Exception as e:
             logger.exception(f"Error fetching market depth for {exchange}:{symbol}")
             raise Exception(f"Error fetching market depth: {e}")

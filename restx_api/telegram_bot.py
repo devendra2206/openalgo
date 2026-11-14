@@ -154,12 +154,24 @@ class TelegramBotConfig(Resource):
                     rate_limit = int(data["rate_limit_per_minute"])
                     if not 1 <= rate_limit <= 120:
                         return make_response(
-                            jsonify({"status": "error", "message": "rate_limit_per_minute must be between 1 and 120"}), 400
+                            jsonify(
+                                {
+                                    "status": "error",
+                                    "message": "rate_limit_per_minute must be between 1 and 120",
+                                }
+                            ),
+                            400,
                         )
                     config_update["rate_limit_per_minute"] = rate_limit
                 except (TypeError, ValueError):
                     return make_response(
-                        jsonify({"status": "error", "message": "rate_limit_per_minute must be an integer"}), 400
+                        jsonify(
+                            {
+                                "status": "error",
+                                "message": "rate_limit_per_minute must be an integer",
+                            }
+                        ),
+                        400,
                     )
 
             success = update_bot_config(config_update)
@@ -204,9 +216,10 @@ class StartBot(Resource):
                     jsonify({"status": "error", "message": "Bot token not configured"}), 400
                 )
 
-            # Initialize bot. initialize_bot_sync() picks the right path for the
-            # running server (synchronous under eventlet, threaded async on the
-            # dev server), which is what the /telegram UI uses.
+            # Validate and store the token: one bounded getMe request, the same
+            # in every runtime and the same call the /telegram UI makes. It
+            # leaves a running bot running, and start_bot below refuses a
+            # second one.
             success, message = telegram_bot_service.initialize_bot_sync(token=config["bot_token"])
 
             if not success:
@@ -409,7 +422,6 @@ class BroadcastMessage(Resource):
                 )
 
             message = data.get("message")
-            filters = data.get("filters", {})
 
             if not message or not isinstance(message, str):
                 return make_response(
@@ -418,7 +430,10 @@ class BroadcastMessage(Resource):
 
             if len(message) > 4096:
                 return make_response(
-                    jsonify({"status": "error", "message": "Message must not exceed 4096 characters"}), 400
+                    jsonify(
+                        {"status": "error", "message": "Message must not exceed 4096 characters"}
+                    ),
+                    400,
                 )
 
             # Check if broadcast is enabled
@@ -559,9 +574,7 @@ class SendNotification(Resource):
             else:
                 # Async: fire-and-forget (default, fast path)
                 alert_executor.submit(telegram_alert.send_alert_sync, telegram_id, message)
-                logger.info(
-                    f"Telegram notification queued for user {username} (ID: {telegram_id})"
-                )
+                logger.info(f"Telegram notification queued for user {username} (ID: {telegram_id})")
                 return make_response(
                     jsonify({"status": "success", "message": "Notification queued for delivery"}),
                     200,

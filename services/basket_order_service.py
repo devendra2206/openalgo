@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
 from events import AnalyzerErrorEvent, BasketCompletedEvent, OrderFailedEvent
+from utils.broker_backpressure import BrokerBusyError
 from utils.constants import (
     REQUIRED_ORDER_FIELDS,
     VALID_ACTIONS,
@@ -15,6 +16,7 @@ from utils.constants import (
     VALID_PRODUCT_TYPES,
 )
 from utils.event_bus import bus
+from utils.httpx_client import UNANSWERED_ORDER_MESSAGE, watch_for_unanswered_writes
 from utils.logging import get_logger
 
 # Initialize logger
@@ -133,9 +135,11 @@ def place_single_order(
     Returns:
         Order result dictionary
     """
+    unanswered: list[str] = []
     try:
         # Place the order
-        res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
+        with watch_for_unanswered_writes() as unanswered:
+            res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
 
         if res.status == 200:
             # No per-order event emission - a summary event is emitted at the end of all orders.
@@ -154,14 +158,28 @@ def place_single_order(
                 if isinstance(response_data, dict)
                 else "Failed to place order"
             )
+            if unanswered:
+                message = UNANSWERED_ORDER_MESSAGE
             return {"symbol": order_data["symbol"], "status": "error", "message": message}
 
+    except BrokerBusyError as e:
+        # Refused before it was sent: the broker's request queue was longer
+        # than a caller may wait under the gthread worker. Never raised under
+        # eventlet or the development server.
+        logger.warning(f"Basket leg {order_data.get('symbol', 'Unknown')} not sent: {e}")
+        return {
+            "symbol": order_data.get("symbol", "Unknown"),
+            "status": "error",
+            "message": str(e),
+        }
     except Exception as e:
         logger.exception(f"Error placing order for {order_data.get('symbol', 'Unknown')}: {e}")
         return {
             "symbol": order_data.get("symbol", "Unknown"),
             "status": "error",
-            "message": "Failed to place order due to internal error",
+            "message": UNANSWERED_ORDER_MESSAGE
+            if unanswered
+            else "Failed to place order due to internal error",
         }
 
 

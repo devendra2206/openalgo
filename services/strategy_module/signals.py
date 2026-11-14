@@ -42,10 +42,25 @@ from typing import Any
 import pytz
 
 from database import strategy_module_db as store
-from services.strategy_module import order_dispatch, session, state
+from services.strategy_module import broker_binding, order_dispatch, session, state
+from utils.keyed_locks import KeyedLocks
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+#: One lock per strategy, held while its day's run is found or opened.
+#:
+#: Two alerts fired on the same bar close (long_entry on one leg, short_entry
+#: on its hedge) both find no run for the day. The conditional UPDATE in
+#: claim_strategy_for_run lets only one of them open it, and the other used to
+#: read the strategy back before the winner had linked the run, answer "This
+#: strategy is already running" and never place its leg, leaving the other
+#: side unhedged. Holding this across the whole of _day_run makes the second
+#: alert wait the few milliseconds it takes and then join the run the first
+#: one opened. Stdlib per-key locks: only request handlers reach here, and the
+#: holder does database work (and, rolling a stale day, broker exits). The
+#: registry holds only the strategies being opened right now.
+_day_run_locks = KeyedLocks(name="signal-day-run")
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -196,6 +211,15 @@ def _leg_id_of(leg: dict) -> Any:
 def _day_run(strategy: Any) -> tuple[int | None, str | None]:
     """The run this signal belongs to, opening one if the day has none.
 
+    Serialised per strategy; see ``_day_run_locks``.
+    """
+    with _day_run_locks.hold(int(strategy.id)):
+        return _day_run_locked(strategy)
+
+
+def _day_run_locked(strategy: Any) -> tuple[int | None, str | None]:
+    """The body of _day_run. The caller holds this strategy's day-run lock.
+
     A signal strategy has one run per trading day rather than one per start and
     stop: there is no start. The first signal of the day opens it and the
     scheduler's square-off closes it.
@@ -236,6 +260,7 @@ def _day_run(strategy: Any) -> tuple[int | None, str | None]:
     mode = "live" if live_enabled else "sandbox"
     api_key = _api_key_for(user_id)
     broker = ""
+    broker_account = None
     if mode == "live" and api_key:
         try:
             from database.auth_db import get_auth_token_broker
@@ -243,6 +268,11 @@ def _day_run(strategy: Any) -> tuple[int | None, str | None]:
             _token, broker = get_auth_token_broker(api_key)
         except Exception:
             logger.exception("Could not read the broker for a signal run")
+        # The day's orders are held to this broker and, when the session names
+        # one, this account. With no broker logged in yet the run records its
+        # mode, and its first Live order binds it (broker_binding).
+        if broker:
+            broker_account = order_dispatch.session_account(user_id)
 
     if not store.claim_strategy_for_run(strategy_id):
         # Something else opened one between the read above and here.
@@ -256,6 +286,7 @@ def _day_run(strategy: Any) -> tuple[int | None, str | None]:
         mode=mode,
         broker=broker or mode,
         trigger_source="webhook",
+        broker_account=broker_account,
     )
     if not run:
         store.release_strategy(strategy_id)
@@ -264,7 +295,12 @@ def _day_run(strategy: Any) -> tuple[int | None, str | None]:
     # Store calls commit and synchronous order replay removes scoped sessions.
     # Never retain an ORM row beyond the boundary that created it.
     new_run_id = int(run.id)
+    # State before the link, never after it. Once the strategy row names this
+    # run, any reader may act on it, and a run id with no state behind it
+    # answers "No active run" to the signal that reads it.
+    state.init_run_state(new_run_id, strategy_id, [])
     if not store.set_strategy_status(strategy_id, "running", new_run_id):
+        state.clear_run_state(new_run_id)
         cleaned = store.finish_unlinked_run_and_release_claim(
             new_run_id,
             strategy_id,
@@ -278,7 +314,6 @@ def _day_run(strategy: Any) -> tuple[int | None, str | None]:
                 strategy_id,
             )
         return None, "Could not link the new signal run; no order was placed"
-    state.init_run_state(new_run_id, strategy_id, [])
     store.record_event(
         strategy_id,
         user_id,
@@ -694,6 +729,12 @@ def _place(
 
     run = store.get_run(run_id)
     mode = str(run.mode) if run else "sandbox"
+    # The run's broker, not the session's: a signal for a run that started on
+    # one broker is refused while OpenAlgo is logged in to another, and its
+    # claim is released below like any other refusal.
+    binding = (
+        broker_binding.for_run(run_id, api_key=api_key, user_id=user_id) if mode == "live" else None
+    )
 
     action = (
         order_dispatch.exit_action(position) if exiting else ("BUY" if position == "B" else "SELL")
@@ -811,7 +852,7 @@ def _place(
             severity="critical",
         )
 
-    result = order_dispatch.dispatch_order(mode=mode, api_key=api_key, order=order)
+    result = order_dispatch.dispatch_order(mode=mode, api_key=api_key, order=order, binding=binding)
 
     if row_id is not None:
         from services.strategy_module.engine import _record_acknowledgement

@@ -100,11 +100,13 @@ _HHMM = re.compile(r"^(\d{1,2}):(\d{2})$")
 
 # The scheduler singleton and the lock that guards creating and tearing it down.
 #
-# A plain threading.Lock is correct here: under eventlet every caller is a
-# greenlet (a request handler, boot, or an APScheduler worker, all of which are
-# green once the stdlib is patched), so no real thread ever touches it and the
-# cross-world hazard in CLAUDE.md does not apply. The critical section is
-# in-memory bookkeeping only.
+# A plain threading.Lock is correct here in both runtimes. Under the gthread
+# worker (and the development server) the callers (request handlers, boot and
+# APScheduler's workers) are real threads running in parallel, and the lock
+# excludes for real. Under eventlet every one of them is a greenlet once the
+# stdlib is patched, the lock is green, and no real thread ever touches it, so
+# the cross-world hazard in CLAUDE.md does not apply. The critical section is
+# in-memory bookkeeping only, so no caller waits on another's I/O.
 _scheduler: BackgroundScheduler | None = None
 _lock = threading.Lock()
 
@@ -144,7 +146,7 @@ def start(paused: bool = False) -> BackgroundScheduler:
             replace_existing=True,
         )
         _scheduler.start(paused=paused)
-        logger.info("Strategy module scheduler started (timezone %s, paused=%s)", IST, paused)
+        logger.debug("Strategy module scheduler started (timezone %s, paused=%s)", IST, paused)
         return _scheduler
 
 
@@ -460,7 +462,7 @@ def sync_all_jobs() -> dict[str, int]:
             if _remove_job(scheduler, job.id):
                 orphans += 1
 
-    logger.info(
+    logger.debug(
         "Strategy module schedule rebuilt: %d strategies, %d jobs, %d orphans removed",
         len(seen),
         len(installed),

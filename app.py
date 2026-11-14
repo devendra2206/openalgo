@@ -49,12 +49,14 @@ from flask_wtf.csrf import CSRFProtect  # Import CSRF protection
 
 from blueprints.admin import admin_bp  # Import the admin blueprint
 from blueprints.agent import agent_bp  # Import the agent blueprint
+from blueprints.alert_channels import alert_channels_bp  # Alert channels (/alerts page)
 from blueprints.alerts import alerts_bp  # Import the chart alert log blueprint
 from blueprints.analyzer import analyzer_bp  # Import the analyzer blueprint
 from blueprints.apikey import api_key_bp
 from blueprints.arbitrage import arbitrage_bp  # Import the Arbitrage blueprint
 from blueprints.auth import auth_bp
 from blueprints.brlogin import brlogin_bp
+from blueprints.broker_config import broker_config_bp  # Broker Configuration and Select Broker
 from blueprints.broker_credentials import (
     broker_credentials_bp,  # Import the broker credentials blueprint
 )
@@ -104,6 +106,7 @@ from blueprints.straddle_chart import straddle_bp  # Import the straddle chart b
 from blueprints.strategy_chart import strategy_chart_bp  # Import the strategy chart blueprint
 from blueprints.strategy_module import strategy_module_bp  # Multi-leg options strategies with RMS
 from blueprints.strategy_portfolio import strategy_portfolio_bp  # Strategy Builder portfolio
+from blueprints.strike_profile import strike_profile_bp  # Import the Strike Profile blueprint
 from blueprints.system_permissions import (
     system_permissions_bp,  # Import the system permissions blueprint
 )
@@ -118,11 +121,13 @@ from cors import init_cors
 from csp import apply_csp_middleware  # Import the CSP middleware
 from database.action_center_db import init_db as ensure_action_center_tables_exists
 from database.agent_db import init_db as ensure_agent_tables_exists
+from database.alert_channels_db import init_db as ensure_alert_channel_tables_exists
 from database.alert_log_db import init_db as ensure_alert_log_tables_exists
 from database.analyzer_db import init_db as ensure_analyzer_tables_exists
 from database.apilog_db import init_db as ensure_api_log_tables_exists
 from database.apscheduler_jobstore_db import ensure_jobstore_tables_exist
 from database.auth_db import init_db as ensure_auth_tables_exists
+from database.broker_keys_db import ensure_broker_keys_tables_exists
 from database.chartink_db import init_db as ensure_chartink_tables_exists
 from database.flow_db import init_db as ensure_flow_tables_exists
 from database.historify_db import init_database as ensure_historify_tables_exists
@@ -335,6 +340,7 @@ def create_app():
     app.register_blueprint(scalping_bp)  # Register Scalping terminal blueprint
     app.register_blueprint(watchlist_bp)  # Register charting watchlist blueprint
     app.register_blueprint(alerts_bp)  # Register chart alert log blueprint
+    app.register_blueprint(alert_channels_bp)  # Register alert channels (/alerts page)
     app.register_blueprint(oitracker_bp)  # Register OI tracker blueprint
     app.register_blueprint(gamma_density_bp)  # Register Gamma Density blueprint
     app.register_blueprint(straddle_bp)  # Register straddle chart blueprint
@@ -342,12 +348,14 @@ def create_app():
     app.register_blueprint(custom_straddle_bp)  # Register custom straddle blueprint
     app.register_blueprint(vol_surface_bp)  # Register vol surface blueprint
     app.register_blueprint(gex_bp)  # Register GEX blueprint
+    app.register_blueprint(strike_profile_bp)  # Register Strike Profile blueprint
     app.register_blueprint(ivsmile_bp)  # Register IV Smile blueprint
     app.register_blueprint(oiprofile_bp)  # Register OI Profile blueprint
     app.register_blueprint(arbitrage_bp)  # Register Arbitrage blueprint
     app.register_blueprint(flow_bp)  # Register Flow blueprint
     app.register_blueprint(agent_bp)  # Register Agent blueprint
     app.register_blueprint(broker_credentials_bp)  # Register Broker credentials blueprint
+    app.register_blueprint(broker_config_bp)  # Broker Configuration and Select Broker
     app.register_blueprint(system_permissions_bp)  # Register System permissions blueprint
     app.register_blueprint(strategy_portfolio_bp)  # Register Strategy Portfolio blueprint
     app.register_blueprint(postback_bp)  # Register broker postback (order-update webhook) blueprint
@@ -539,6 +547,23 @@ def create_app():
         # Wait up to 30s for DB init (typically ~3.5s)
         if hasattr(app, "db_ready") and not app.db_ready.is_set():
             app.db_ready.wait(timeout=30)
+
+    @app.before_request
+    def drop_ended_sessions():
+        """Clear a session a logout elsewhere ended, or a broker-less one past the rollover.
+
+        Runs ahead of every check below, so no route sees a sign-in that has
+        ended. Clearing only: a logout that ended it already revoked the broker
+        token, and a broker-less sign-in holds no token.
+        """
+        from flask import request
+
+        if request.path.startswith("/static/") or request.path.startswith("/assets/"):
+            return
+
+        from utils.session import end_session_if_signed_out
+
+        end_session_if_signed_out()
 
     @app.before_request
     def check_session_expiry():
@@ -774,6 +799,9 @@ def setup_environment(app):
 
             db_init_functions = [
                 ("Auth DB", ensure_auth_tables_exists),
+                # After Auth DB: it puts the logged-in broker's keys back in
+                # place, reading the stored session from the auth table.
+                ("Broker Keys DB", ensure_broker_keys_tables_exists),
                 ("User DB", ensure_user_tables_exists),
                 ("Master Contract DB", ensure_master_contract_tables_exists),
                 ("API Log DB", ensure_api_log_tables_exists),
@@ -793,6 +821,7 @@ def setup_environment(app):
                 ("Scalping DB", ensure_scalping_tables_exists),
                 ("Watchlist DB", ensure_watchlist_tables_exists),
                 ("Alert Log DB", ensure_alert_log_tables_exists),
+                ("Alert Channels DB", ensure_alert_channel_tables_exists),
                 ("Leverage DB", ensure_leverage_tables_exists),
                 ("Strategy Portfolio DB", ensure_strategy_portfolio_tables_exists),
                 ("Agent DB", ensure_agent_tables_exists),
@@ -805,7 +834,7 @@ def setup_environment(app):
             ]
 
             db_init_start = time.time()
-            # max_workers=1 on purpose: 14 of the 20 functions above target the
+            # max_workers=1 on purpose: most of the functions above target the
             # same file (openalgo.db), and SQLite permits one writer per file,
             # so running them concurrently made them contend for the write lock
             # rather than progress in parallel - the "database is locked" seen
@@ -1020,53 +1049,26 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Error checking analyzer mode on startup: {e}")
 
-            # Auto-start Telegram bot if it was active (after DB tables exist)
+            # Auto-start Telegram bot if it was active (after DB tables exist).
+            # initialize_bot_sync is the one entry point: which validation path
+            # it takes for this runtime is the service's decision, so this
+            # block no longer inspects the runtime or builds an event loop.
             try:
-                import sys
-
                 bot_config = get_bot_config()
                 if bot_config.get("is_active") and bot_config.get("bot_token"):
                     logger.debug("Auto-starting Telegram bot (background)...")
 
-                    if "eventlet" in sys.modules:
-                        success, message = telegram_bot_service.initialize_bot_sync(
-                            token=bot_config["bot_token"]
-                        )
+                    success, message = telegram_bot_service.initialize_bot_sync(
+                        token=bot_config["bot_token"]
+                    )
+                    if success:
+                        success, message = telegram_bot_service.start_bot()
                         if success:
-                            success, message = telegram_bot_service.start_bot()
-                            if success:
-                                logger.debug(f"Telegram bot auto-started successfully: {message}")
-                            else:
-                                logger.error(f"Failed to auto-start Telegram bot: {message}")
+                            logger.debug(f"Telegram bot auto-started successfully: {message}")
                         else:
-                            logger.error(f"Failed to initialize Telegram bot: {message}")
+                            logger.error(f"Failed to auto-start Telegram bot: {message}")
                     else:
-                        import asyncio
-
-                        try:
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
-                            try:
-                                success, message = loop.run_until_complete(
-                                    telegram_bot_service.initialize_bot(
-                                        token=bot_config["bot_token"]
-                                    )
-                                )
-                            finally:
-                                loop.close()
-
-                            if success:
-                                success, message = telegram_bot_service.start_bot()
-                                if success:
-                                    logger.debug(
-                                        f"Telegram bot auto-started successfully: {message}"
-                                    )
-                                else:
-                                    logger.error(f"Failed to auto-start Telegram bot: {message}")
-                            else:
-                                logger.error(f"Failed to initialize Telegram bot: {message}")
-                        except Exception as e:
-                            logger.error(f"Error in Telegram bot startup: {e}")
+                        logger.error(f"Failed to initialize Telegram bot: {message}")
             except Exception as e:
                 logger.error(f"Error auto-starting Telegram bot: {e}")
 
@@ -1077,6 +1079,14 @@ app = create_app()
 
 # Explicitly call the setup environment function
 setup_environment(app)
+
+# Under eventlet, start the green thread that runs calls real OS threads hand
+# to the hub (utils.real_threading.run_on_hub). This runs at import, on the
+# hub's own thread, which is what it must be started from. A no-op under the
+# gthread worker and the dev server, where nothing needs marshalling.
+from utils.real_threading import start_hub_worker
+
+start_hub_worker()
 
 # Restore caches from database in background (not needed until first trade/lookup)
 import threading
@@ -1119,26 +1129,24 @@ def shutdown_database_sessions(exception=None):
     remove_all_scoped_sessions()
 
 
-# Integrate the WebSocket proxy server with the Flask app
-# Check if running in Docker (standalone mode) or local (integrated mode)
-# Docker is detected by checking for /.dockerenv file or APP_MODE override
-is_docker = (
-    os.path.exists("/.dockerenv")
-    or os.environ.get("APP_MODE", "").strip().strip("'\"") == "standalone"
-)
 
-if is_docker:
-    logger.debug(
-        "Running in Docker/standalone mode - WebSocket server started separately by start.sh"
-    )
-else:
-    # Under gunicorn+eventlet, start_websocket_proxy() spawns a child *process*
-    # (not a thread) so the WS asyncio loop never shares an eventlet hub with
-    # gunicorn — closes the greenlet.error cross-thread crash class entirely
-    # (including GitHub issue #1421). Under the dev server (no eventlet) it
-    # still uses a real OS thread, as before.
-    logger.debug("Starting WebSocket proxy")
-    start_websocket_proxy(app)
+# Integrate the WebSocket proxy server with the Flask app. Where it runs is
+# decided in one place, websocket_proxy.app_integration.resolve_proxy_mode():
+# a child *process* under gunicorn with either worker (so the proxy's asyncio
+# loop never shares an eventlet hub, issue #1421, and under gthread stays out
+# of the process that places orders), a real OS thread on the dev server, and
+# nothing here under Docker, where start.sh runs it. Under eventlet that is
+# exactly what this block used to decide itself.
+logger.debug("Starting WebSocket proxy")
+start_websocket_proxy(app)
+
+# Under the gthread worker, end Socket.IO sessions as soon as gunicorn starts
+# its graceful stop: each open session holds a worker thread, and a thread
+# still held when the window closes turns the stop into a kill. A no-op under
+# eventlet and on the dev server.
+from utils.shutdown import start_drain_watcher
+
+start_drain_watcher()
 
 # strategy_reporting: a dedicated subprocess for the /python page's PnL/
 # error/pending-action/force-exit/trade-history traffic, structurally

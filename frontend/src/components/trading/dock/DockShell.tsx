@@ -9,10 +9,11 @@
  * books and Escape can find the dock by where focus is.
  */
 
-import { ChevronDown } from 'lucide-react'
 import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
+import { ChromeIcon } from '@/lib/trading/glyphs'
 import { cn } from '@/lib/utils'
-import { RAIL_BTN, RailTip } from '../railStyles'
+import { RAIL_BTN } from '../railStyles'
+import { Tip } from '../Tip'
 import {
   clampDockHeight,
   DOCK_MIN_HEIGHT,
@@ -214,17 +215,16 @@ export function DockShell({ tab, onTabChange, counts, header, children }: Props)
         {open && (
           <>
             <div className="flex min-w-0 flex-1 items-center justify-end gap-2">{header}</div>
-            <div className="group relative">
+            <Tip side="left" tip={{ title: 'Collapse', chord: 'Esc', sub: 'Back to the strip' }}>
               <button
                 type="button"
                 onClick={() => onTabChange(null)}
                 className={cn(RAIL_BTN, 'h-7 w-7')}
                 aria-label="Collapse trading dock"
               >
-                <ChevronDown className="h-4 w-4" />
+                <ChromeIcon id="chevron-down" />
               </button>
-              <RailTip text="Collapse" chord="Esc" side="left" />
-            </div>
+            </Tip>
           </>
         )}
       </div>

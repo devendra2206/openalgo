@@ -176,7 +176,7 @@ Time: 14:23:45
 #### Requirements for Receiving Alerts
 
 1. WhatsApp device must be paired in OpenAlgo (`/whatsapp` page in the web UI).
-2. The OpenAlgo server must have rebooted at least once since pairing OR the bot must be currently connected (auto-reconnects on every boot from the encrypted session blob).
+2. The bot must be **Connected**. Pairing starts it; if it was stopped, start it from `/whatsapp`. A server restart also attempts to reconnect from the saved session.
 3. Orders must be placed through the OpenAlgo API (REST `/api/v1/*`, the Python SDK, or any tool that ultimately hits the API).
 
 ### Sending Messages via API
@@ -253,6 +253,8 @@ curl -X POST http://127.0.0.1:5000/api/v1/whatsapp/notify \
 ```
 
 The API refuses with HTTP 409 rather than silently queueing — a trader expects an alert to either deliver or fail loudly, not appear later out of nowhere.
+
+When WhatsApp has logged the paired device out, the same 409 carries the cause instead: `"WhatsApp logged this device out, so alerts cannot be sent. Pair it again from the /whatsapp page in OpenAlgo."` The status and the HTTP code do not change.
 
 #### Recipient Forms
 
@@ -369,13 +371,13 @@ Per-user notification toggles (`order_notifications`, `trade_notifications`, `pn
 
 2. **`services/whatsapp_alert_service.py`** — `WhatsAppAlertService`
 
-   * Outbound notifier. Formats order/position/batch events into plain-text WhatsApp messages with LIVE / ANALYZE mode prefix.
+   * Outbound notifier. Formats order/position/batch events into plain-text WhatsApp messages with LIVE / ANALYZE mode prefix, using the alert formatter it shares with Slack and Discord (`services/alerts/formatting.py`).
    * Single-user owner resolution: matches the event's `api_key` → username via `auth_db.get_username_by_apikey`, then checks against `whatsapp_config.owner_username` captured at pair time. If matched, fires a self-send through wars's single-arg `send("text")` form (no need to know own JID — wars knows its own identity internally).
 
-3. **`subscribers/whatsapp_subscriber.py`** — Event-bus subscriber
+3. **`services/alerts/channels/whatsapp.py`**: the WhatsApp alert channel
 
-   * Registered alongside `telegram_subscriber` in `subscribers/__init__.register_all()` on all 13 order/position/batch topics.
-   * Mirrors the Telegram convention: failure events (`order.failed`, `order.modify_failed`, `order.cancel_failed`, `analyzer.error`) are silently dropped.
+   * `subscribers/alert_subscriber.py` raises one `alert.raised` event per successful order/position/batch/GTT event, and this channel passes it to `whatsapp_alert_service.send_order_alert` when WhatsApp is on and the event group is routed to it on `/alerts`.
+   * Failure events (`order.failed`, `order.modify_failed`, `order.cancel_failed`, `analyzer.error`) raise no alert, as on every channel.
 
 4. **`database/whatsapp_db.py`** — SQLAlchemy models
 
@@ -399,6 +401,16 @@ Per-user notification toggles (`order_notifications`, `trade_notifications`, `pn
    * Background thread spawned in `_init_databases_and_schedulers` after DB init completes
    * If `whatsapp_config.is_paired` is true, loads the encrypted blob and starts the worker thread without operator intervention
 
+9. **Session kept current**: `WhatsAppBotService._save_session`
+
+   * The running client keeps changing its session (keys and device state) after pairing, in a private file of its own. A restart restores what the database holds, and a restart that restored the snapshot taken at pairing was logged out by WhatsApp.
+   * So the bot thread snapshots the live session and writes it back (`whatsapp_db.refresh_session_blob`) 60 seconds after each login, every 5 minutes after that, and once more when the bot stops, including on a normal server stop. Only changed bytes are written, only while the device is logged in, and never over a session that was unlinked or replaced by a new pairing in the meantime.
+   * With wars 0.1.4, `_export_live_session` copies a file-backed live session in a short-lived subprocess. Calling `export_session()` in the running client's process mixes two SQLite libraries and can remove the live client's write-ahead-log files, causing later sends and saves to fail. Keep the subprocess snapshot path when maintaining this code. Clients without a session file use their own export method.
+
+10. **Logged out by WhatsApp**: wars reports whatsapp-rust's `LoggedOut` event through `on_disconnect`
+
+   * WhatsApp does not take a logged-out device back, so the stored session is cleared (`whatsapp_db.clear_rejected_session`) and the device shows as not paired. The server log, the `/whatsapp` page, `/api/v1/whatsapp/notify` and Flow's WhatsApp node all say the device was logged out and must be paired again.
+
 #### Event Flow
 
 ```
@@ -412,8 +424,11 @@ bus.publish(OrderPlacedEvent(api_key, ...))
         │
         ├──> log_subscriber          (writes to log/orders.jsonl)
         ├──> socketio_subscriber     (emits order_event for the dashboard)
-        ├──> telegram_subscriber     (queues telegram_alert)
-        └──> whatsapp_subscriber     (queues whatsapp_alert)
+        └──> alert_subscriber        (publishes alert.raised, then delivers it)
+                  ├──> Telegram channel   (telegram_alert_service)
+                  ├──> Slack channel      (webhook)
+                  ├──> Discord channel    (webhook)
+                  └──> WhatsApp channel   (the chain below is WhatsApp's own)
                   │
                   ▼
         whatsapp_alert_service.send_order_alert
@@ -449,6 +464,10 @@ bus.publish(OrderPlacedEvent(api_key, ...))
 2. Check that you have an OpenAlgo API key generated at `/apikey` (slash-commands need it for SDK calls).
 3. Confirm the order actually flowed through `/api/v1/placeorder` (or the SDK / a strategy / any other API path). Orders placed directly via a broker website do NOT trigger event-bus events.
 4. Check the server logs for lines like `WhatsApp alert queued for owner user=<username> type=placeorder`. If present, the alert was dispatched.
+
+#### "WhatsApp logged this device out" (HTTP 409)
+
+WhatsApp ended the linked device's session: it was removed under **Linked devices** on your phone, or WhatsApp refused its login. OpenAlgo has cleared the session it can no longer use. Open `/whatsapp` and pair the device again.
 
 #### "WhatsApp is not paired or not connected" (HTTP 409)
 

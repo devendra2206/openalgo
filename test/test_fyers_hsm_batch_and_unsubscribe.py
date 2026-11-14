@@ -84,9 +84,9 @@ def test_flush_issues_one_call_per_symbol_not_one_combined_call(ws_adapter):
     call listing all 3 together -- that's the condition that let two
     strategies' resubscribes for two different symbols get silently mixed
     into a single Fyers request."""
-    ws_adapter._enqueue_hsm_subscribe("SymbolUpdate", "NSE_INDEX", "NIFTY", lambda d: None)
-    ws_adapter._enqueue_hsm_subscribe("SymbolUpdate", "BFO", "SENSEX06AUG2677500CE", lambda d: None)
-    ws_adapter._enqueue_hsm_subscribe("SymbolUpdate", "NFO", "NIFTY04AUG2624200PE", lambda d: None)
+    ws_adapter._enqueue_hsm_subscribe("SymbolUpdate", "NSE_INDEX", "NIFTY", lambda d: None, 2)
+    ws_adapter._enqueue_hsm_subscribe("SymbolUpdate", "BFO", "SENSEX06AUG2677500CE", lambda d: None, 2)
+    ws_adapter._enqueue_hsm_subscribe("SymbolUpdate", "NFO", "NIFTY04AUG2624200PE", lambda d: None, 2)
 
     ws_adapter._flush_hsm_batch()
 
@@ -103,8 +103,8 @@ def test_flush_groups_by_data_type_separately(ws_adapter):
     """A Quote subscribe and a Depth subscribe queued together must still go
     to their respective subscribe_quote/subscribe_depth methods, each as its
     own single-symbol call."""
-    ws_adapter._enqueue_hsm_subscribe("SymbolUpdate", "NSE", "TCS", lambda d: None)
-    ws_adapter._enqueue_hsm_subscribe("DepthUpdate", "NSE", "TCS", lambda d: None)
+    ws_adapter._enqueue_hsm_subscribe("SymbolUpdate", "NSE", "TCS", lambda d: None, 2)
+    ws_adapter._enqueue_hsm_subscribe("DepthUpdate", "NSE", "TCS", lambda d: None, 3)
 
     ws_adapter._flush_hsm_batch()
 
@@ -122,24 +122,24 @@ def test_flush_dedupes_same_symbol_last_writer_wins(ws_adapter):
     second_cb_called = []
 
     ws_adapter._enqueue_hsm_subscribe(
-        "SymbolUpdate", "NSE_INDEX", "NIFTY", lambda d: first_cb_called.append(d)
+        "SymbolUpdate", "NSE_INDEX", "NIFTY", lambda d: first_cb_called.append(d), 2
     )
     ws_adapter._enqueue_hsm_subscribe(
-        "SymbolUpdate", "NSE_INDEX", "NIFTY", lambda d: second_cb_called.append(d)
+        "SymbolUpdate", "NSE_INDEX", "NIFTY", lambda d: second_cb_called.append(d), 2
     )
 
     ws_adapter._flush_hsm_batch()
 
     assert len(ws_adapter.fyers_adapter.quote_calls) == 1
     # The registry should hold the LAST callback registered for this key.
-    registered_cb = ws_adapter._hsm_callback_registry["SymbolUpdate_NSE_INDEX:NIFTY"]
+    registered_cb = ws_adapter._hsm_callback_registry[(2, "NSE_INDEX:NIFTY")]
     registered_cb({"exchange": "NSE_INDEX", "symbol": "NIFTY"})
     assert second_cb_called and not first_cb_called
 
 
 def test_flush_skips_when_not_connected(ws_adapter):
     ws_adapter.connected = False
-    ws_adapter._enqueue_hsm_subscribe("SymbolUpdate", "NSE_INDEX", "NIFTY", lambda d: None)
+    ws_adapter._enqueue_hsm_subscribe("SymbolUpdate", "NSE_INDEX", "NIFTY", lambda d: None, 2)
 
     ws_adapter._flush_hsm_batch()
 

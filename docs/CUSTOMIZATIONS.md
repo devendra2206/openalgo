@@ -111,6 +111,84 @@ git push origin custom-strategies
 ```
 
 **Sync log:**
+- **2026-11-14**: 411 commits from upstream. Merge-base was the previous
+  upstream tip (`e78f2edee`), so ancestry was correct and `frontend/dist/`
+  merged with **no** conflicts (taken as `main`'s copy, verified identical).
+  16 real conflicts, all read and resolved by hand:
+  - `subscribers/telegram_subscriber.py` / `whatsapp_subscriber.py` --
+    **deleted upstream**, replaced by one alert router and an `/alerts` page
+    (`subscribers/alert_subscriber.py`, `services/alerts/`). The fork's
+    behaviour (141d29558) is ported, not dropped:
+    `services/alerts/settings.py` `defaults()` gives Telegram and WhatsApp
+    **no success groups** (`_FORK_NO_SUCCESS_ALERTS_BY_DEFAULT`), and the new
+    fork-only `subscribers/telegram_failure_subscriber.py` (registered in
+    `subscribers/__init__.py`) sends `order.failed` / `order.modify_failed` /
+    `order.cancel_failed` through `send_failure_alert()`. It obeys the
+    `/alerts` Telegram on/off switch. Groups can now be switched on per
+    channel from `/alerts`. `test/test_telegram_failure_alerts.py` rewritten
+    for the new modules; one upstream test in `test/test_alerts_routing.py`
+    changed to the fork default.
+  - `blueprints/python_strategy.py` -- kept both import/global blocks; the
+    start job keeps upstream's `_run_scheduled_start` wrapper plus the fork's
+    `second=` stagger; the restore pass keeps upstream's
+    `_start_unless_stopped_by_trader` / `MANUAL_STOP_REFUSAL` /
+    `_mark_restart_failed` logic plus the fork's decide-once list and 5s
+    stagger between restarts.
+  - `broker/shoonya/api/data.py` -- upstream added gthread support
+    (`_use_async`, `_quote_pool`). `use_async` is still asked at call time
+    (`_use_async()`, not the import-time `USE_ASYNC`); under gthread the
+    upstream thread pool runs, under eventlet the fork's `eventlet.GreenPool`.
+  - `utils/httpx_client.py` -- took upstream's rewrite (`_BrokerClient`,
+    gthread pool timeout), re-applied `http2_enabled = False` unconditionally.
+  - `services/place_order_service.py` -- fork's multi-key rejection message
+    plus upstream's `UNANSWERED_ORDER_MESSAGE` override.
+  - `services/option_chain_service.py` -- kept the fork's structure
+    (upstream only reflowed one log line).
+  - `broker/fyers/api/data.py` -- took upstream's no-retry history loop
+    (it already logs `s`/`code`/`message`), re-added the fork's warning for
+    an `s="ok"` reply with empty candles.
+  - `broker/fyers/streaming/fyers_adapter.py` -- took upstream's strict
+    HSM-topic-only routing (supersedes the fork's fuzzy-match removal).
+    `fyers_hsm_websocket.py` -- took upstream's merged-update parser,
+    re-added the fork's `_token_last_seen` stamp and the "known topic, no
+    snapshot" warning. `fyers_websocket_adapter.py` -- kept the fork's
+    reconnect-thread fields and one-subscribe-call-per-symbol flush on top of
+    upstream's (mode, symbol) callback registry.
+  - `broker/tradesmart/api/*` -- no fork commits (stale inherited content);
+    took upstream.
+  - `install/install-multi.sh` -- upstream re-indented the .env block; the
+    fork's `STRATEGY_REPORTING_PORT` / `ZMQ_REPORTING_PORT` lines re-added.
+  - `frontend/src/api/python-strategy.ts`, `PythonStrategyIndex.tsx` --
+    import lists merged. `npm ci && npm run build` (tsc + vite) passes.
+
+  Fixes the new upstream gates and tests required (no conflict marked them):
+  - `fyers_hsm_websocket.py`: the fork's `_token_last_seen` stamp moved into
+    `_stamp_token_seen()`, which tolerates a parser built with `__new__`
+    (upstream's test fixtures); before that every snapshot frame errored there.
+  - `test/test_fyers_hsm_batch_and_unsubscribe.py`: `_enqueue_hsm_subscribe`
+    now takes a `mode`, and the registry is keyed `(mode, full_symbol)`.
+    `test/test_fyers_adapter_on_message_matching.py`: the two tests that
+    expected original_symbol / name-overlap routing now assert the tick is
+    dropped (upstream routes by HSM topic only).
+  - Upstream's gthread gates: `strategy_reporting/broadcast_bridge.py` asks
+    `runtime.is_monkey_patched()` at call time instead of
+    `"eventlet" in sys.modules` at import, and imports eventlet only on that
+    branch. `test/test_gthread_foundation_runtime.py` carries a narrow fork
+    allowlist for the two `import eventlet` sites that need an eventlet API
+    (Shoonya GreenPool, the bridge). The restore pass's `sleep(5)` stagger is
+    recorded in `scripts/gthread_sleep_reviewed.txt`.
+
+  Tests: every file that failed in the full run was re-run on fresh test
+  databases against a clean worktree of `main`. The same 78 fail on pristine
+  `main` (Windows/env: installer, openscript, tradesmart limiter, telegram
+  async, `test_position_read_failure.py` KeyError 'sahi', ...). The only
+  extra failures on this branch are the 4
+  `test_subscribe_reads_depth_under_either_key_before_defaulting` cases; their
+  fixture fix is the local, deliberately uncommitted edit of
+  `test/test_websocket_unsubscribe_contract.py`. **Run the strategy-module
+  tests without `-n`/xdist, or on a fresh `db/openalgo-test.db`**: workers
+  sharing that file produce ~300 false "strategy named ... already exists"
+  failures. `strategies/test`: 280 pass, 1 pre-existing failure.
 - **2026-09-26**: 310 commits from upstream; 212 conflicts, only 27 outside
   `frontend/dist/`. **Root cause of that unusual volume: `711221cb1`
   ("chore: merge upstream/main...", 2026-09-03) has only ONE parent** — it

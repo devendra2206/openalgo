@@ -171,9 +171,16 @@ def _isolated_token_dir(tmp_path, monkeypatch):
     that should not happen at all.
 
     Points the module at a temporary directory for every test in this file, and
-    puts it back afterwards.
+    puts it back afterwards. The stored copy in `ag_secret` is shut out as well:
+    `ensure_ready` rebuilds the file from that row when the file is missing, and
+    the test database is shared by the whole suite and survives between runs,
+    so a credential another test stored there would answer the gate here.
     """
+    from database import agent_db
+
     monkeypatch.setenv("CHATGPT_TOKEN_DIR", str(tmp_path / "chatgpt"))
+    monkeypatch.setattr(agent_db, "get_secret", lambda name: None)
+    monkeypatch.setattr(agent_db, "set_secret", lambda name, value: (True, None))
     chatgpt_oauth.configure_token_dir(tmp_path / "chatgpt")
     yield
     chatgpt_oauth.configure_token_dir(None)
@@ -209,7 +216,12 @@ class TestTheProviderAsksForNoKey:
         """This agent is entirely tool driven, so the check is load bearing."""
         models = catalog.list_models("chatgpt")
         assert models, "the chatgpt provider offers no models"
-        assert all(model.supports_function_calling for model in models)
+        # Except a model whose LiteLLM entry does not say, which the picker
+        # shows as "tool support unknown": `gpt-rosalind-discovery` carries no
+        # capability flags at all. None may read as unable.
+        assert not [model.id for model in models if model.supports_function_calling is False]
+        unknown = {model.id for model in models if model.supports_function_calling is None}
+        assert unknown <= {"chatgpt/gpt-rosalind-discovery"}
 
     @pytest.mark.parametrize("name", [SHARED_NAME, SUBSCRIPTION_ONLY])
     def test_a_subscription_row_saves_without_a_key(self, name):

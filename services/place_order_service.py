@@ -6,6 +6,7 @@ from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
 from events import AnalyzerErrorEvent, OrderFailedEvent, OrderPlacedEvent
 from restx_api.schemas import OrderSchema
+from utils.broker_backpressure import BrokerBusyError
 from utils.constants import (
     REQUIRED_ORDER_FIELDS,
     VALID_ACTIONS,
@@ -14,6 +15,7 @@ from utils.constants import (
     VALID_PRODUCT_TYPES,
 )
 from utils.event_bus import bus
+from utils.httpx_client import UNANSWERED_ORDER_MESSAGE, watch_for_unanswered_writes
 from utils.logging import get_logger
 
 # Initialize logger
@@ -216,13 +218,36 @@ def place_order_with_auth(
         )
         return False, error_response, 404
 
+    unanswered: list[str] = []
     try:
-        res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
+        with watch_for_unanswered_writes() as unanswered:
+            res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
+    except BrokerBusyError as e:
+        # Refused before it was sent: the broker's request queue was longer
+        # than a caller may wait under the gthread worker. Never raised under
+        # eventlet or the development server.
+        logger.warning(f"Order not sent, broker busy: {e}")
+        error_response = {"status": "error", "message": str(e)}
+        bus.publish(
+            OrderFailedEvent(
+                mode="live",
+                api_type="placeorder",
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=api_key,
+                symbol=order_data.get("symbol", ""),
+                exchange=order_data.get("exchange", ""),
+                error_message=str(e),
+            )
+        )
+        return False, error_response, 429
     except Exception as e:
         logger.exception(f"Error in broker_module.place_order_api: {e}")
         error_response = {
             "status": "error",
-            "message": "Failed to place order due to internal error",
+            "message": UNANSWERED_ORDER_MESSAGE
+            if unanswered
+            else "Failed to place order due to internal error",
         }
         bus.publish(
             OrderFailedEvent(
@@ -236,7 +261,7 @@ def place_order_with_auth(
                 error_message=str(e),
             )
         )
-        return False, error_response, 500
+        return False, error_response, 502 if unanswered else 500
 
     # res.status is the raw HTTP status code the broker adapter set (see
     # e.g. broker/shoonya/api/order_api.py's `response.status =
@@ -295,6 +320,9 @@ def place_order_with_auth(
                 or response_data.get("error")
                 or message
             )
+        if unanswered:
+            # The broker caught the lost response itself and reported a failure.
+            message = UNANSWERED_ORDER_MESSAGE
         error_response = {"status": "error", "message": message}
         bus.publish(
             OrderFailedEvent(
@@ -308,6 +336,8 @@ def place_order_with_auth(
                 error_message=message,
             )
         )
+        if unanswered:
+            return False, error_response, 502
         return False, error_response, res.status if res.status != 200 else 500
 
 

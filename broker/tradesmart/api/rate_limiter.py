@@ -1,13 +1,18 @@
 """Shared rate limiting and retry helpers for all TradeSmart (Noren) API calls.
 
-TradeSmart bills every data call against ONE per-user budget with two rolling
-windows, 10/sec and 120/min. An earlier revision assumed /GetQuotes had been
-raised to 100/sec and was exempt from the per-minute allowance; live logs
-disproved both -- a single option-chain request tripped
-"Order Recieved 11 in a current second exceeds Limit 10 for user" and
-"Order Recieved 121 in a current minute exceeds Limit 120 for user", both on
-/GetQuotes. There is no separate quote budget: every endpoint (quotes,
-history, orders, funds, margin) draws from the same counter.
+Two budgets, because quotes and everything else are metered differently.
+
+**Quotes** (``/GetQuotes``) are allowed 100 requests per second with no
+per-minute ceiling, so they get their own bucket and are paced on the
+per-second window alone.
+
+**Everything else** -- orders, funds, margin, history -- shares ONE per-user
+budget with two rolling windows: 10 requests per second and 120 requests per
+minute. The backend rejects the offender with ``stat=Not_Ok`` and an emsg
+naming the breached window, e.g.::
+
+    Invalid Input :  Order Recieved 11 in a current second exceeds Limit 10 for user
+    Invalid Input :  Order Recieved 121 in a current minute exceeds Limit 120 for user
 
 State is module level, exactly as in ``broker.fyers.api.rate_limiter`` and for
 the same reason: services construct a fresh ``BrokerData(auth_token)`` per
@@ -15,23 +20,46 @@ request (see ``services/option_chain_service.py``,
 ``services/oi_tracker_service.py``), so any pacing state kept on ``self`` is
 discarded on every call and paces nothing against concurrent requests.
 
-The gate is burst-friendly, modelled on ``broker.flattrade.api.data``: it
-reserves the earliest slot that satisfies both rolling windows rather than
+Each gate is burst-friendly, modelled on ``broker.flattrade.api.data``: it
+reserves the earliest slot that satisfies its rolling window(s) rather than
 spacing every call by a fixed interval, so a batch goes out at once and only
 the call past the ceiling waits. The slot is reserved under the lock and slept
 for outside it -- holding a lock across ``time.sleep`` would serialise every
 waiter behind the sleeper and turn the allowance back into a queue.
+
+How far ahead a slot may be booked. Under eventlet and the dev server there is
+no limit, as before: past the per-minute ceiling the next caller sleeps until a
+slot frees up, up to a minute. Under the gthread worker that sleep would hold
+one of a fixed number of request threads, so a caller whose slot is further
+away than ``utils.broker_backpressure.max_queue_wait("data")`` is refused with
+BrokerBusyError instead, and books nothing. Every caller of this module is a
+market-data or history request; order placement does not go through it.
 """
 
+import math
 import threading
 import time
 from collections import deque
 
-# Broker ceilings are 10/sec and 120/min per user, shared across every
-# endpoint. We run under both as margin for clock skew between our rolling
-# windows and however Noren measures theirs.
+from utils.broker_backpressure import BrokerBusyError, max_queue_wait
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+# Broker ceilings for the general budget are 10/sec and 120/min per user. We run
+# under both as margin for clock skew between our rolling windows and however
+# Noren measures theirs, and because order/fund/margin calls from other modules
+# share the same quota.
 TRADESMART_MAX_PER_SECOND = 8
 TRADESMART_MAX_PER_MINUTE = 110
+
+# Quotes are metered separately at 100/sec with no per-minute ceiling. Same
+# clock-skew margin as above; ``None`` disables the per-minute window entirely.
+TRADESMART_QUOTE_MAX_PER_SECOND = 90
+TRADESMART_QUOTE_MAX_PER_MINUTE = None
+
+# Endpoints billed against the quote budget rather than the general one.
+QUOTE_ENDPOINTS = frozenset({"/GetQuotes"})
 
 MAX_RETRIES = 3
 BASE_BACKOFF = 2.0  # seconds; exponential when the broker reports a limit hit
@@ -39,9 +67,12 @@ BASE_BACKOFF = 2.0  # seconds; exponential when the broker reports a limit hit
 _lock = threading.Lock()
 _reserved_call_times: deque = deque()
 
+_quote_lock = threading.Lock()
+_reserved_quote_times: deque = deque()
 
-def _reserve_slot() -> float:
-    """Reserve the earliest slot satisfying both rolling windows.
+
+def _reserve_slot(lock, reserved, max_per_second, max_per_minute) -> float:
+    """Reserve the earliest slot satisfying the bucket's rolling window(s).
 
     Returns the seconds the caller must sleep before issuing its request.
 
@@ -55,32 +86,84 @@ def _reserve_slot() -> float:
       - 60s after the Mth-most-recent reservation when the per-minute window is
         full;
 
-    whichever is latest.
+    whichever is latest. ``max_per_minute=None`` means the bucket has no
+    per-minute ceiling, in which case only the per-second window constrains the
+    slot and entries older than a second are purged.
+
+    Args:
+        lock: the bucket's lock, held only while reserving (never across sleep).
+        reserved: the bucket's deque of reserved timestamps.
+        max_per_second: per-second ceiling.
+        max_per_minute: per-minute ceiling, or ``None`` for no such window.
+
+    Raises:
+        BrokerBusyError: Only under the gthread worker, when the slot is further
+            away than the data ceiling. Nothing is booked.
     """
-    with _lock:
+    # Entries older than the widest window can no longer constrain any future
+    # slot, so that horizon is how far back the deque needs to reach.
+    horizon = 60.0 if max_per_minute is not None else 1.0
+    ceiling = max_queue_wait("data")
+
+    with lock:
         now = time.time()
-        while _reserved_call_times and _reserved_call_times[0] <= now - 60.0:
-            _reserved_call_times.popleft()
+        while reserved and reserved[0] <= now - horizon:
+            reserved.popleft()
 
         slot = now
-        if len(_reserved_call_times) >= TRADESMART_MAX_PER_SECOND:
-            slot = max(slot, _reserved_call_times[-TRADESMART_MAX_PER_SECOND] + 1.0)
-        if len(_reserved_call_times) >= TRADESMART_MAX_PER_MINUTE:
-            slot = max(slot, _reserved_call_times[-TRADESMART_MAX_PER_MINUTE] + 60.0)
+        if len(reserved) >= max_per_second:
+            slot = max(slot, reserved[-max_per_second] + 1.0)
+        if max_per_minute is not None and len(reserved) >= max_per_minute:
+            slot = max(slot, reserved[-max_per_minute] + 60.0)
 
-        _reserved_call_times.append(slot)
-        return slot - now
+        wait = slot - now
+        refused = ceiling is not None and wait > ceiling
+        if not refused:
+            reserved.append(slot)
+
+    if refused:
+        logger.warning(
+            f"TradeSmart pacing refused a request whose turn was {wait:.1f}s away "
+            f"(limit {ceiling:.0f}s under gthread)"
+        )
+        raise _busy_error(wait)
+    return wait
+
+
+def _busy_error(wait: float) -> BrokerBusyError:
+    """The refusal for a request whose turn would come ``wait`` seconds from now."""
+    seconds = max(1, math.ceil(wait))
+    return BrokerBusyError(
+        "TradeSmart allows only so many requests each second and each minute, and "
+        "OpenAlgo has already used that allowance for now. This request was not "
+        f"sent. Try again in about {seconds} seconds.",
+        retry_after=wait,
+    )
 
 
 def apply_rate_limit(endpoint: str | None = None) -> None:
     """Block until it is safe to issue another TradeSmart call.
 
     Args:
-        endpoint: Noren path, e.g. ``"/GetQuotes"``. Unused -- kept so call
-            sites can still say which endpoint they're pacing -- every
-            endpoint bills against the same shared 10/sec + 120/min budget.
+        endpoint: Noren path, e.g. ``"/GetQuotes"``. Quote endpoints are paced
+            against their own 100/sec budget; every other endpoint bills
+            against the shared 10/sec + 120/min per-user budget.
     """
-    sleep_time = _reserve_slot()
+    if endpoint in QUOTE_ENDPOINTS:
+        sleep_time = _reserve_slot(
+            _quote_lock,
+            _reserved_quote_times,
+            TRADESMART_QUOTE_MAX_PER_SECOND,
+            TRADESMART_QUOTE_MAX_PER_MINUTE,
+        )
+    else:
+        sleep_time = _reserve_slot(
+            _lock,
+            _reserved_call_times,
+            TRADESMART_MAX_PER_SECOND,
+            TRADESMART_MAX_PER_MINUTE,
+        )
+
     if sleep_time > 0:
         time.sleep(sleep_time)
 

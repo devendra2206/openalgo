@@ -46,18 +46,12 @@ case.
 
 import json
 import os
-import sys
 import threading as _stdlib_threading
 
+from utils import runtime
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
-
-_EVENTLET_ACTIVE = "eventlet" in sys.modules
-
-if _EVENTLET_ACTIVE:
-    import eventlet
-    import eventlet.tpool
 
 _bridge_thread = None
 _bridge_started = False
@@ -171,6 +165,8 @@ def _bridge_loop_eventlet_green():
     a background native thread, result handed back to the calling
     greenlet). See this module's docstring for the production incident
     this fixes."""
+    import eventlet.tpool  # only ever reached on the eventlet path
+
     socket = _open_socket()
     while True:
         try:
@@ -189,7 +185,12 @@ def start_broadcast_bridge():
         return
     _bridge_started = True
 
-    if _EVENTLET_ACTIVE:
+    # Asked at call time through utils.runtime (upstream's rule): "eventlet"
+    # in sys.modules is the wrong question, and under the gthread worker the
+    # primitives are real, so the plain-thread path is the right one there.
+    if runtime.is_monkey_patched():
+        import eventlet
+
         eventlet.spawn(_bridge_loop_eventlet_green)
     else:
         _bridge_thread = _stdlib_threading.Thread(

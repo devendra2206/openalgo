@@ -1,9 +1,12 @@
 import http.client
 import json
 import os
+import secrets
 import threading
 import time
 import urllib.parse
+
+import httpx
 
 from broker.zerodha.mapping.mcx_contract_size import (
     McxQuantityError,
@@ -18,8 +21,14 @@ from broker.zerodha.mapping.transform_data import (
 )
 from database.auth_db import get_auth_token
 from database.token_db import get_br_symbol, get_oa_symbol
-from utils.httpx_client import get_httpx_client
+from utils.httpx_client import get_httpx_client, request_may_have_been_sent
 from utils.logging import get_logger
+from utils.position_read import (
+    PositionReadError,
+    read_position_book,
+    refuse_smart_order_on_read_failure,
+)
+from utils.smart_order_guard import PositionBookCache, SymbolLocks
 
 logger = get_logger(__name__)
 
@@ -100,47 +109,48 @@ def get_holdings(auth):
 # --- Per-Symbol Smart Order Lock ---
 # Ensures only one smart order per symbol executes at a time.
 # Others queue and execute sequentially, each getting a fresh position book.
-_symbol_locks = {}          # {symbol_key: threading.Lock}
-_symbol_locks_lock = threading.Lock()
+# The registry forgets a symbol once nobody holds or waits on it, and under the
+# gthread worker a wait is bounded (utils/smart_order_guard.py).
+_SMART_ORDER_LOCKS = SymbolLocks()
 
 # --- Position Book Cache ---
 # Caches get_positions() for 1 second. Invalidated after each smart order placement.
-_position_cache = {}        # {auth_token: {"data": ..., "timestamp": ...}}
-_position_cache_lock = threading.Lock()
-_POSITION_CACHE_TTL = 1.0   # seconds
+# A fetch still in flight when an order invalidates the cache is returned to its
+# own caller but never cached, so the next order cannot read the book from
+# before the previous fill (utils/smart_order_guard.py).
+_POSITION_BOOK = PositionBookCache()
 
 
 def _get_symbol_lock(symbol, exchange, product):
-    """Get or create a per-symbol lock for serializing smart orders."""
-    key = f"{symbol}:{exchange}:{product}"
-    with _symbol_locks_lock:
-        if key not in _symbol_locks:
-            _symbol_locks[key] = threading.Lock()
-        return _symbol_locks[key]
+    """Hold the smart order lock for one symbol, as a context manager.
+
+    Yields True while holding it. Yields False when the wait ran out, which
+    happens only under the gthread worker; the caller must then return
+    ``SymbolLocks.busy(symbol)`` without placing an order.
+    """
+    return _SMART_ORDER_LOCKS.hold(symbol, exchange, product)
+
+
+def _position_book_ok(positions_data):
+    """Kite wraps a position book it read as {"status": "success", ...}."""
+    return isinstance(positions_data, dict) and positions_data.get("status") == "success"
 
 
 def _get_cached_positions(auth):
     """Get positions from cache if fresh, otherwise fetch from broker API."""
-    with _position_cache_lock:
-        now = time.monotonic()
-        cached = _position_cache.get(auth)
-        if cached and (now - cached["timestamp"]) < _POSITION_CACHE_TTL:
-            logger.debug("Position book served from cache")
-            return cached["data"]
-
-    # Cache miss or expired — fetch from broker
-    positions_data = get_positions(auth)
-
-    with _position_cache_lock:
-        _position_cache[auth] = {"data": positions_data, "timestamp": time.monotonic()}
-
-    return positions_data
+    return _POSITION_BOOK.get(
+        auth,
+        lambda: read_position_book("zerodha", lambda: get_positions(auth), _position_book_ok),
+    )
 
 
 def _invalidate_position_cache(auth):
-    """Invalidate the position cache so the next queued order fetches fresh data."""
-    with _position_cache_lock:
-        _position_cache.pop(auth, None)
+    """Invalidate the position cache so the next queued order fetches fresh data.
+
+    Also stops a fetch that started before this order from caching the book
+    it read.
+    """
+    _POSITION_BOOK.invalidate(auth)
 
 
 def get_open_position(tradingsymbol, exchange, product, auth):
@@ -200,6 +210,39 @@ class _RejectedResponse:
         self.status_code = status
 
 
+class _RecoveredOrderResponse:
+    """Response-shaped success for an order found after its POST reply was lost."""
+
+    status = 200
+    status_code = 200
+
+
+def _recover_order_by_tag(auth, tag, timeout_seconds=2.0):
+    """Look for a just-accepted order in Kite's order book, without resending it."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            order_book = get_order_book(auth)
+            if order_book.get("status") == "success":
+                for order in order_book.get("data", []):
+                    if order.get("tag") == tag and order.get("order_id"):
+                        order_id = order["order_id"]
+                        logger.warning(
+                            "Recovered Kite order %s from the order book after its POST response was lost",
+                            order_id,
+                        )
+                        return order_id
+        except Exception:
+            # The original POST outcome remains ambiguous; keep checking briefly,
+            # then let the service return its explicit may-have-been-placed result.
+            logger.warning("Could not read Kite's order book while recovering tag %s", tag)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(0.25, remaining))
+
+
 def place_order_api(data, auth):
     AUTH_TOKEN = auth
 
@@ -207,7 +250,8 @@ def place_order_api(data, auth):
     data["apikey"] = BROKER_API_KEY
     # token = get_token(data['symbol'], data['exchange'])
     try:
-        newdata = transform_data(data)
+        tag = f"openalgo{secrets.token_hex(6)}"
+        newdata = transform_data(data, tag=tag)
     except McxQuantityError as exc:
         logger.info(f"Rejected order before sending to Kite: {exc}")
         return _RejectedResponse(), {"status": "error", "message": str(exc)}, None
@@ -244,9 +288,20 @@ def place_order_api(data, auth):
     }
 
     # Make the request using the shared client
-    response = client.post(
-        "https://api.kite.trade/orders/regular", headers=headers, content=payload_encoded
-    )
+    try:
+        response = client.post(
+            "https://api.kite.trade/orders/regular", headers=headers, content=payload_encoded
+        )
+    except httpx.TransportError as exc:
+        if request_may_have_been_sent(exc):
+            recovered_order_id = _recover_order_by_tag(AUTH_TOKEN, tag)
+            if recovered_order_id:
+                response_data = {
+                    "status": "success",
+                    "data": {"order_id": recovered_order_id},
+                }
+                return _RecoveredOrderResponse(), response_data, recovered_order_id
+        raise
 
     # Log raw response
     logger.debug(f"Zerodha raw response: status={response.status_code}, body={response.text}")
@@ -268,6 +323,7 @@ def place_order_api(data, auth):
     return response, response_data, orderid
 
 
+@refuse_smart_order_on_read_failure
 def place_smartorder_api(data, auth):
     AUTH_TOKEN = auth
 
@@ -288,9 +344,9 @@ def place_smartorder_api(data, auth):
 
         # Per-symbol lock: only one smart order per symbol executes at a time.
         # Queued orders wait, then get fresh position data after cache invalidation.
-        symbol_lock = _get_symbol_lock(symbol, exchange, product)
-
-        with symbol_lock:
+        with _get_symbol_lock(symbol, exchange, product) as symbol_lock:
+            if not symbol_lock:
+                return SymbolLocks.busy(symbol)
             position_size = int(data.get("position_size", "0"))
 
             # Get current open position for the symbol
@@ -349,6 +405,8 @@ def place_smartorder_api(data, auth):
         # service to read .status from.
         logger.info(f"Rejected smart order before sending to Kite: {exc}")
         return _RejectedResponse(), {"status": "error", "message": str(exc)}, None
+    except PositionReadError:
+        raise
     except Exception as e:
         error_msg = f"Error in place_smartorder_api: {e}"
         logger.exception(error_msg)

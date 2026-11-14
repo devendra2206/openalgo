@@ -944,7 +944,7 @@ def test_the_endpoints_own_poll_interval_is_a_floor_not_a_suggestion(token_dir, 
     assert elapsed >= 0.4, f"the endpoint asked for 0.4s between polls, waited {elapsed:.2f}s"
 
 
-def test_no_combination_of_intervals_produces_a_poll_loop_with_no_wait(token_dir, bits):
+def test_no_combination_of_intervals_produces_a_poll_loop_with_no_wait(token_dir, secrets, bits):
     """A zero wait is a hot loop against someone else's auth host, on a real OS
     thread, for a quarter of an hour: a burnt core and a rate limit.
 
@@ -1246,7 +1246,12 @@ def test_the_subscription_models_are_offered_by_the_catalogue():
     for name in chatgpt_models.SUPPLEMENTAL:
         assert f"chatgpt/{name}" in ids, name
     assert len(models) >= 10
-    assert all(model.supports_function_calling for model in models)
+    # LiteLLM lists `gpt-rosalind-discovery` with no capability flags at all, so
+    # the picker shows it as "tool support unknown". No plan model may read as
+    # unable to call tools, and no other may lose its answer.
+    assert not [model.id for model in models if model.supports_function_calling is False]
+    unknown = {model.id for model in models if model.supports_function_calling is None}
+    assert unknown <= {"chatgpt/gpt-rosalind-discovery"}
     assert all(model.input_price_per_million is None for model in models)
 
 

@@ -18,6 +18,9 @@ from database.auth_db import get_auth_token
 from database.token_db import get_br_symbol, get_symbol, get_token
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
+from utils.position_read import read_position_book, refuse_smart_order_on_read_failure
+from utils.smart_order_guard import PositionBookCache, SymbolLocks
+from utils.thread_safe_cache import LockedTTLCache
 
 logger = get_logger(__name__)
 
@@ -138,6 +141,100 @@ def _backfill_ltp(response, auth_token):
         logger.warning(f"Could not backfill LTP for positions: {e}")
 
 
+# Holdings averagePrice by exchangeIdentifier, per session, for valuing an
+# overnight cash-segment position at its cost (_backfill_carry_cost). Holdings
+# are re-read at most every five minutes: the positions book is polled by the
+# page and by every smart order, and a carried leg's cost does not move intraday.
+_HOLDING_COST_TTL_SECONDS = 300
+_holding_cost_cache = LockedTTLCache(maxsize=8, ttl=_HOLDING_COST_TTL_SECONDS)
+
+# Cash segments, the only ones Holdings covers. A carried F&O leg has no cost
+# basis anywhere in Kotak's API (its SDK says so: "F&O: no Holdings
+# averagePrice exists -- previous close (cfBuyAmt/cfSellAmt) is the only cost
+# basis the API exposes"), so it keeps the carry-forward valuation (#2271).
+_HOLDING_SEGMENTS = ("nse_cm", "bse_cm")
+
+
+def _holding_costs(auth_token):
+    """Holdings averagePrice keyed by exchangeIdentifier, cached per session.
+
+    Returns:
+        dict[str, float]: Average price per exchange token. Empty when the
+        holdings call fails or returns nothing usable; a failure is not cached,
+        so the next positions read tries again.
+    """
+    session_key = auth_token.split(":::")[1] if ":::" in auth_token else auth_token
+    cached = _holding_cost_cache.get(session_key)
+    if cached is not None:
+        return cached
+
+    holdings = get_holdings(auth_token)
+    rows = holdings.get("data") if isinstance(holdings, dict) else None
+    if not isinstance(rows, list):
+        return {}
+
+    costs = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        token = str(row.get("exchangeIdentifier") or "").strip()
+        try:
+            price = float(row.get("averagePrice") or 0)
+        except (TypeError, ValueError):
+            continue
+        if token and price > 0:
+            costs[token] = price
+    _holding_cost_cache[session_key] = costs
+    return costs
+
+
+def _backfill_carry_cost(response, auth_token):
+    """Stamp a carried cash-segment position with what it actually cost.
+
+    Kotak values every overnight leg at the previous day's settlement price
+    (cfBuyAmt/cfSellAmt), so without its cost the average and P&L of a
+    delivery position carried overnight measure from yesterday's close. The
+    cost is in Holdings: Kotak's Positions docs say the Neo app "sources that
+    from Holdings' averagePrice instead, matched on positions.tok ==
+    holdings.exchangeIdentifier", and its SDK's P&L code does the same.
+
+    Stamps a "_holding_avg" scratch field for transform_positions_data, which
+    prefers upldPrc when Kotak sends one. Holdings is read only when a carried
+    cash row needs it, and best-effort: any failure leaves the rows on the
+    carry-forward valuation, flagged as such, exactly as before.
+    """
+    try:
+        positions = response.get("data")
+        if not positions:
+            return
+
+        def needs_cost(position):
+            if position.get("exSeg") not in _HOLDING_SEGMENTS:
+                return False
+            if not str(position.get("tok") or "").strip():
+                return False
+            try:
+                carried = float(position.get("cfBuyQty") or 0) or float(
+                    position.get("cfSellQty") or 0
+                )
+                uploaded = float(position.get("upldPrc") or 0)
+            except (TypeError, ValueError):
+                return False
+            return bool(carried) and uploaded <= 0
+
+        carried = [p for p in positions if isinstance(p, dict) and needs_cost(p)]
+        if not carried:
+            return
+
+        costs = _holding_costs(auth_token)
+        for position in carried:
+            cost = costs.get(str(position.get("tok")).strip())
+            if cost:
+                position["_holding_avg"] = cost
+    except Exception as e:
+        logger.warning(f"Could not read holdings cost for carried positions: {e}")
+
+
 def get_positions(auth_token):
     response = get_api_response("/quick/user/positions", auth_token)
     if not isinstance(response, dict):
@@ -157,6 +254,7 @@ def get_positions(auth_token):
             f"Kotak returned a positions payload that is not an object: {type(response).__name__}"
         )
     _backfill_ltp(response, auth_token)
+    _backfill_carry_cost(response, auth_token)
     return response
 
 
@@ -167,46 +265,53 @@ def get_holdings(auth_token):
 # --- Per-Symbol Smart Order Lock ---
 # Ensures only one smart order per symbol executes at a time.
 # Others queue and execute sequentially, each getting a fresh position book.
-_symbol_locks = {}          # {symbol_key: threading.Lock}
-_symbol_locks_lock = threading.Lock()
+# The registry forgets a symbol once nobody holds or waits on it, and under the
+# gthread worker a wait is bounded (utils/smart_order_guard.py).
+_SMART_ORDER_LOCKS = SymbolLocks()
 
 # --- Position Book Cache ---
 # Caches get_positions() for 1 second. Invalidated after each smart order placement.
-_position_cache = {}        # {auth_token: {"data": ..., "timestamp": ...}}
-_position_cache_lock = threading.Lock()
-_POSITION_CACHE_TTL = 1.0   # seconds
+# A fetch still in flight when an order invalidates the cache is returned to its
+# own caller but never cached, so the next order cannot read the book from
+# before the previous fill (utils/smart_order_guard.py).
+_POSITION_BOOK = PositionBookCache()
 
 
 def _get_symbol_lock(symbol, exchange, product):
-    """Get or create a per-symbol lock for serializing smart orders."""
-    key = f"{symbol}:{exchange}:{product}"
-    with _symbol_locks_lock:
-        if key not in _symbol_locks:
-            _symbol_locks[key] = threading.Lock()
-        return _symbol_locks[key]
+    """Hold the smart order lock for one symbol, as a context manager.
+
+    Yields True while holding it. Yields False when the wait ran out, which
+    happens only under the gthread worker; the caller must then return
+    ``SymbolLocks.busy(symbol)`` without placing an order.
+    """
+    return _SMART_ORDER_LOCKS.hold(symbol, exchange, product)
+
+
+def _position_book_ok(positions_data):
+    """Kotak marks a read that worked with stat "Ok".
+
+    Its failures say "Not_Ok", and a rejected session answers with no stat.
+    """
+    if not isinstance(positions_data, dict):
+        return False
+    return str(positions_data.get("stat", "")).lower() == "ok"
 
 
 def _get_cached_positions(auth):
     """Get positions from cache if fresh, otherwise fetch from broker API."""
-    with _position_cache_lock:
-        now = time.monotonic()
-        cached = _position_cache.get(auth)
-        if cached and (now - cached["timestamp"]) < _POSITION_CACHE_TTL:
-            return cached["data"]
-
-    # Cache miss or expired - fetch from broker
-    positions_data = get_positions(auth)
-
-    with _position_cache_lock:
-        _position_cache[auth] = {"data": positions_data, "timestamp": time.monotonic()}
-
-    return positions_data
+    return _POSITION_BOOK.get(
+        auth,
+        lambda: read_position_book("kotak", lambda: get_positions(auth), _position_book_ok),
+    )
 
 
 def _invalidate_position_cache(auth):
-    """Invalidate the position cache so the next queued order fetches fresh data."""
-    with _position_cache_lock:
-        _position_cache.pop(auth, None)
+    """Invalidate the position cache so the next queued order fetches fresh data.
+
+    Also stops a fetch that started before this order from caching the book
+    it read.
+    """
+    _POSITION_BOOK.invalidate(auth)
 
 
 
@@ -287,6 +392,7 @@ def place_order_api(data, auth_token):
         return None, {"stat": "NotOk", "error": str(e)}, None
 
 
+@refuse_smart_order_on_read_failure
 def place_smartorder_api(data, auth_token):
     # If no API call is made in this function then res will return None
     res = None
@@ -297,9 +403,9 @@ def place_smartorder_api(data, auth_token):
     product = data.get("product")
 
     # Per-symbol lock: serialize smart orders per symbol
-    symbol_lock = _get_symbol_lock(symbol, exchange, product)
-
-    with symbol_lock:
+    with _get_symbol_lock(symbol, exchange, product) as symbol_lock:
+        if not symbol_lock:
+            return SymbolLocks.busy(symbol)
         return _place_smartorder_locked_kotak(data, auth_token, symbol, exchange, product)
 
 

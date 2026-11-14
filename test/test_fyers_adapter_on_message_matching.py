@@ -86,27 +86,25 @@ def test_hsm_token_exact_match_still_delivers(adapter):
     assert calls[0]["exchange"] == "NSE"
 
 
-def test_original_symbol_exact_match_still_delivers(adapter):
-    """The original_symbol exact-match path is untouched by the fix."""
+def test_original_symbol_alone_no_longer_routes_a_tick(adapter):
+    """Upstream (2026-11 merge) routes by HSM topic only; the old
+    original_symbol / symbol-name fallbacks were removed because they could
+    hand one scrip's tick to another symbol. A tick with no mapped HSM token
+    is dropped -- the same safety this fork's fix aimed at, made stricter."""
     calls = _register(adapter, "TCS", "NSE")
-    full_symbol = "NSE:TCS"
 
-    adapter._on_message({"type": "sf", "original_symbol": full_symbol, "symbol": "TCS-EQ"})
+    adapter._on_message({"type": "sf", "original_symbol": "NSE:TCS", "symbol": "TCS-EQ"})
 
-    assert len(calls) == 1
-    assert calls[0]["symbol"] == "TCS"
+    assert calls == []
 
 
-def test_fuzzy_symbol_name_match_still_requires_real_textual_overlap(adapter):
-    """The fuzzy-by-symbol-name fallback stays -- it's still gated on an
-    actual substring relationship, unlike the removed single-subscription
-    guess. Confirms it still fires for a genuinely related fyers_symbol."""
+def test_symbol_name_overlap_no_longer_routes_a_tick(adapter):
+    """The fuzzy symbol-name fallback is gone too (upstream, 2026-11)."""
     calls = _register(adapter, "INFY", "NSE")
 
     adapter._on_message({"type": "sf", "symbol": "INFY-EQ"})
 
-    assert len(calls) == 1
-    assert calls[0]["symbol"] == "INFY"
+    assert calls == []
 
 
 def test_two_active_subscriptions_unmatched_tick_is_dropped(adapter):
