@@ -709,6 +709,27 @@ covered.
 
 ---
 
+## `install/update-custom.sh`: last step prunes database backups (2026-11-14)
+
+Upstream's `update.sh` copies every database into `db/backup_YYYYmmdd_HHMMSS`
+on each run and never removes one. On the production server 90 of them had
+reached ~33 GB of a 72 GB disk (the live databases were 1.2 GB).
+
+The wrapper's last step, `[6/6]`, now runs after everything else, including
+the restart reminder. It deletes backup folders older than 7 days
+(`BACKUP_KEEP_DAYS`).
+- The age is read from the timestamp in the folder name, not from file times.
+- The newest timestamped backup (the one this run just made) is always kept,
+  whatever its age.
+- A `backup_*` folder whose name does not match `backup_YYYYmmdd_HHMMSS` is
+  never touched.
+
+It prints how many folders it removed and kept, then the disk usage. Tested
+on fake folders for three cases: a mix of old and recent backups; only old
+ones, where the newest is kept; and none at all.
+
+---
+
 ## `services/option_chain_service.py` (+27 / -12 lines)
 
 Predates this session's Force Exit/PnL work (from an earlier customization

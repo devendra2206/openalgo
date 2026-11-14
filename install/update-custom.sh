@@ -15,7 +15,9 @@
 #      the live strategies/scripts/ directory (that directory has its own
 #      nested .gitignore -- *.py is intentionally untracked there upstream,
 #      so a plain `git pull` never touches the actual running scripts).
-#   3. A reminder to restart each running strategy from the /python UI --
+#   3. Pruning db/backup_* folders older than 7 days (update.sh makes one per
+#      run and never removes any; 90 of them reached ~33 GB by 2026-11-14).
+#   4. A reminder to restart each running strategy from the /python UI --
 #      not automatable from here, since those endpoints are session-cookie
 #      authenticated (browser login), not API-key authenticated.
 #
@@ -40,11 +42,11 @@ LIVE_SCRIPTS_DIR="$OPENALGO_PATH/strategies/scripts"
 WEB_USER="www-data"
 WEB_GROUP="www-data"
 
-echo -e "${BLUE}=== [1/5] Running official OpenAlgo update.sh ===${NC}"
+echo -e "${BLUE}=== [1/6] Running official OpenAlgo update.sh ===${NC}"
 sudo "$OPENALGO_PATH/install/update.sh"
 
 echo ""
-echo -e "${BLUE}=== [2/5] Rebuilding frontend ===${NC}"
+echo -e "${BLUE}=== [2/6] Rebuilding frontend ===${NC}"
 if ! command -v npm >/dev/null 2>&1; then
     echo -e "${RED}  npm not found -- cannot rebuild frontend/dist.${NC}"
     echo -e "${YELLOW}  Install Node.js (see frontend/package.json 'engines'), then re-run this script.${NC}"
@@ -60,7 +62,7 @@ else
 fi
 
 echo ""
-echo -e "${BLUE}=== [3/5] Deploying tracked strategy scripts ===${NC}"
+echo -e "${BLUE}=== [3/6] Deploying tracked strategy scripts ===${NC}"
 if [ -d "$DEPLOYED_SCRIPTS_DIR" ]; then
     deployed_count=0
     for f in "$DEPLOYED_SCRIPTS_DIR"/*.py; do
@@ -80,7 +82,7 @@ else
 fi
 
 echo ""
-echo -e "${BLUE}=== [4/5] Patching nginx for the strategy_reporting subprocess ===${NC}"
+echo -e "${BLUE}=== [4/6] Patching nginx for the strategy_reporting subprocess ===${NC}"
 # Idempotent: adds a "location /python { proxy_pass http://127.0.0.1:8766; ... }"
 # block (see install/install.sh's own template for the canonical version) so
 # the whole /python surface routes to the dedicated strategy_reporting
@@ -174,7 +176,7 @@ PYEOF
 fi
 
 echo ""
-echo -e "${BLUE}=== [5/5] Manual step required ===${NC}"
+echo -e "${BLUE}=== [5/6] Manual step required ===${NC}"
 echo -e "${YELLOW}"
 echo "update.sh restarted the Flask app/service -- it does NOT restart the"
 echo "individual strategy subprocesses, which only pick up the deployed"
@@ -185,5 +187,33 @@ echo "script changed above: Stop, then Start. Safe to do without disturbing"
 echo "open positions (see docs/CUSTOMIZATIONS.md -- resumability guarantees"
 echo "for mid-day restarts)."
 echo -e "${NC}"
+
+echo ""
+echo -e "${BLUE}=== [6/6] Pruning database backups older than 7 days ===${NC}"
+# update.sh copies every database into db/backup_YYYYmmdd_HHMMSS on each run
+# and never removes one, so the folder grew to ~33 GB (90 copies) by
+# 2026-11-14. Keep the last 7 days, and always the newest backup (the one
+# this run just made), whatever its age. The age comes from the folder's own
+# timestamp in its name, not from file times; a folder whose name does not
+# match that pattern is never touched.
+DB_DIR="$OPENALGO_PATH/db"
+BACKUP_KEEP_DAYS=7
+CUTOFF=$(date -d "$BACKUP_KEEP_DAYS days ago" +%Y%m%d_%H%M%S)
+NEWEST_BACKUP=$(ls -d "$DB_DIR"/backup_* 2>/dev/null | grep -E '/backup_[0-9]{8}_[0-9]{6}$' | sort | tail -1 || true)
+pruned=0
+kept=0
+for d in "$DB_DIR"/backup_*; do
+    [ -d "$d" ] || continue
+    stamp="${d##*/backup_}"
+    if [[ "$stamp" =~ ^[0-9]{8}_[0-9]{6}$ ]] && [[ "$stamp" < "$CUTOFF" ]] && [ "$d" != "$NEWEST_BACKUP" ]; then
+        sudo rm -rf -- "$d"
+        pruned=$((pruned + 1))
+    else
+        kept=$((kept + 1))
+    fi
+done
+echo -e "${GREEN}  Removed $pruned old backup(s), kept $kept (last $BACKUP_KEEP_DAYS days, plus the newest).${NC}"
+df -h "$OPENALGO_PATH" | tail -1 | awk '{print "  Disk: "$3" used of "$2" ("$5")"}'
+echo ""
 
 echo -e "${GREEN}Custom update complete.${NC}"
