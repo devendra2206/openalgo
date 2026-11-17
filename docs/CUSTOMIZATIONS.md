@@ -2423,3 +2423,68 @@ boundary is still 09:15. First decision of the day: 11:17 for 2h
 (11:15 close + 2 min settle), 10:17 for RSI 1h; the restart path waits the
 same way. The hedge roll already waited. Test:
 `test/test_leaps_first_decision_time.py`.
+
+## Both LEAPS strategies: option chains on a 60s client, hedge lookups retried (2026-11-17)
+
+Live on 17-Nov-2026 10:30 (LEAPS RSI): RSI 64.0 qualified a PE entry and the
+main strike (25000PE, 29DEC26) was found, then the hedge's optionchain()
+(30 strikes each side, with quotes, about 10s on Shoonya) timed out on the
+12s client. The strategy correctly refused to sell naked, but a failed hedge
+lookup was not retried, so the entry waited for the next candle.
+
+Same fix as `Nifty_OI_Positional_MonthlySell_1` (2026-11-05), in both
+`Nifty_LEAPS_OptionsSell_1` and `Nifty_LEAPS_HAMACD_2h_1`:
+- `Environment.chain_timeout = 60.0` and `Broker.connect_chain_client()`:
+  every optionchain() call (main strike scan, hedge at entry, hedge at the
+  monthly roll) goes through `StrategyEngine.chain_client`. Orders, quotes
+  and history keep 12s / 3s.
+- `StrategyEngine._select_hedge_with_retry()`: the hedge is retried every
+  `main_strike_retry_interval_sec` (60s) for up to
+  `main_strike_retry_window_sec` (600s), as the main strike already was.
+  Used at entry and at the hedge roll. A Force Exit stops it at once. No
+  hedge after the window still means no entry (never naked), and now also
+  sends a Telegram error.
+- Described in each script's module docstring and printed in the startup
+  banner.
+
+Test: `test/test_leaps_chain_timeout_retry.py` (16 cases, both scripts);
+removing the retry or setting the timeout back to 12s fails it.
+
+**Quarterly expiry table corrected (author's choice, 2026-11-17).** The
+module docstrings said "Oct 21 onward -> March", one month earlier than the
+code and the backtest, which roll on the 20th of the month before the expiry
+month. The code is kept; the tables now read: Nov 21 - Feb 20 -> Mar,
+Feb 21 - May 20 -> Jun, May 21 - Aug 20 -> Sep, Aug 21 - Nov 20 -> Dec.
+
+## Both LEAPS strategies: the monthly hedge roll buys the new hedge first (2026-11-17)
+
+Author: "buy new hedge first then close existing". The roll used to SELL the
+old hedge first and then look for the new one, so a failure after the sale
+(expiry lookup, no candidate, BUY rejected) left the short unhedged.
+
+`_do_hedge_roll()` now: looks up the new hedge (60s chain client, retried for
+600s) -> records `state.pending_roll` -> BUY -> only once FILLED,
+`_complete_roll()` makes it the position's hedge and moves the old one to
+`state.leftover_hedges` -> `_sell_leftover_hedges()` sells it.
+- Any failure before the new hedge fills keeps the OLD hedge and sends a
+  Telegram alert. Never unhedged.
+- A BUY resting at the broker stays in `state.pending_roll` and is settled by
+  `_settle_roll_and_leftovers()` (dispatched every cycle, throttled to
+  `leftover_hedge_retry_gap_sec` = 60s, also during an error state and Force
+  Exit, which cancels a resting roll BUY). A pending roll with no order id
+  (crash between record and placeorder) is never guessed at: alert and stop.
+- An old hedge whose SELL fails is retried every 60s, one Telegram per day;
+  an expired one is booked at 0. Shown as `LEAPS_HEDGE_OLD` in the P&L rows
+  until sold, and resubscribed on restart. Force Exit is not complete while
+  one is unsold or a roll BUY is pending.
+- `pending_roll` and `leftover_hedges` are on `StrategyState`, not the
+  position, and persist in the state file, so a position that closes
+  mid-roll cannot drop them. If the position closed before a resting BUY
+  filled, the new hedge itself is sold as a leftover.
+- An already-unhedged position now gets a hedge at the roll (it used to skip).
+
+Test: `test/test_leaps_hedge_roll_new_first.py` (40 cases, both scripts:
+order sequence, no hedge found, BUY rejected / not placed / resting then
+filled, old SELL failing and retried, Force Exit waiting, unhedged position,
+state persistence). Removing the Force Exit guard fails it; the pre-change
+roll fails it.
